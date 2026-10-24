@@ -72,5 +72,10 @@
     },
     "basic-ftp": ">=6.2.1 <7",
     "handlebars": ">=4.7.10 <5"
+  },
+  "allowScripts": {
+    "@parcel/watcher@2.6.0": true,
+    "esbuild@0.28.2": true,
+    "unrs-resolver@1.12.2": true
   }
 }
