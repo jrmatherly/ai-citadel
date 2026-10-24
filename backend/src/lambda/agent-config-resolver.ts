@@ -1,0 +1,1995 @@
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  ScanCommand,
+  DeleteCommand,
+  UpdateCommand,
+} from "@aws-sdk/lib-dynamodb";
+import {
+  RegistryService,
+  RegistryRecordStatusValues,
+} from "../services/registry-service";
+import type {
+  AgentInvocationProtocol,
+  AgentCustomMetadata,
+  AgentInvocationBlock,
+  AgentOrigin,
+  RegistryRecord,
+  ListResourcesOptions,
+  ListPendingApprovalsOptions,
+} from "../services/registry-service";
+import {
+  extractOrgFromEvent,
+  isAdminFromEvent,
+  hasRoleFromEvent,
+  assertRowOrg,
+} from "../utils/auth-event";
+import { assertProjectOrgAccess } from "../utils/project-org-access";
+import { extractUserIdFromEvent } from "../utils/auth";
+import { isRecordVisible, viewerFromEvent } from "../utils/record-visibility";
+import { getGovernanceEnforce } from "../utils/governance-flag";
+import { publishEvent } from "../utils/events";
+import { normaliseTags } from "../utils/tag-policy";
+import { enforceTagPolicy } from "./tag-policy-check";
+import {
+  computeTrustPath,
+  isCrossAccountRoleArn,
+  assumeAnalysisRoleClient,
+} from "../utils/trust-path";
+import { resolveKind } from "../utils/citadel-kind";
+import {
+  CloudWatchClient,
+  PutMetricDataCommand,
+} from "@aws-sdk/client-cloudwatch";
+
+/** Trust-path summary persisted into governanceAttestation by the activation path. */
+interface TrustPathAttestationSummary {
+  checkedAt: string;
+  clean: boolean;
+  findings: string[];
+  /**
+   * Phase-2 marker: `true` when `invocation.roleArn` was detected as
+   * cross-account and the same-account {@link computeTrustPath} check was
+   * therefore skipped. Additive/optional so same-account summaries serialize
+   * byte-identically to Phase-1.
+   */
+  crossAccount?: boolean;
+}
+
+/**
+ * The registry-service governanceAttestation shape augmented with the additive
+ * `trustPath` summary stamped by the lazy activation-time IAM trust-path check.
+ * Declared locally (NOT in registry-service) so that module stays unchanged;
+ * the extra field is serialized verbatim via serializeCustomMetadata.
+ */
+type GovernanceAttestationWithTrustPath = NonNullable<
+  AgentCustomMetadata["governanceAttestation"]
+> & {
+  trustPath?: TrustPathAttestationSummary;
+};
+
+const client = new DynamoDBClient({});
+const docClient = DynamoDBDocumentClient.from(client);
+
+const AGENT_CONFIG_TABLE = process.env.AGENT_CONFIG_TABLE!;
+
+/**
+ * Role required, in addition to admin, to delete an agent config or publish
+ * its manifest (decision 31ee5b5d). Mirrors agent-code-resolver.ts's
+ * REQUIRED_WRITE_ROLE: destructive/publishing agent-lifecycle mutations are
+ * architect-reserved, the same trust tier used for comparable mutations
+ * elsewhere in this codebase (agent-import-resolver.ts gates import/attest/
+ * activate/gateway-publish on isAdminFromEvent || hasRoleFromEvent(event,
+ * 'architect')). NOT applied to activate/update/create — those remain
+ * org-membership-gated only, per the same decision.
+ */
+const REQUIRED_WRITE_ROLE = "architect";
+
+// ---------------------------------------------------------------------------
+// Feature flag + Registry Service initialization (task 6.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true when the Registry feature flag is enabled.
+ * Defaults to false if the environment variable is missing or unreadable.
+ */
+export function isRegistryEnabled(): boolean {
+  try {
+    return process.env.REGISTRY_ENABLED === "true";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns true when the list-from-projection optimisation is enabled.
+ * When enabled, listAgentConfigsRegistry reads from the DynamoDB cache
+ * table's projection rows instead of the N+1 Registry path, falling back
+ * to the Registry when the projection is empty.
+ */
+export function isListFromProjection(): boolean {
+  try {
+    return process.env.LIST_FROM_PROJECTION === "true";
+  } catch {
+    return false;
+  }
+}
+
+/** Lazily-initialised RegistryService singleton (created on first use). */
+let registryServiceInstance: RegistryService | null = null;
+
+/**
+ * Returns the shared RegistryService instance, creating it on first call.
+ * Only call this when `isRegistryEnabled()` is true — the function reads
+ * REGISTRY_ID from the environment and will throw if it is missing.
+ */
+export function getRegistryService(): RegistryService {
+  if (!registryServiceInstance) {
+    const registryId = process.env.REGISTRY_ID;
+    if (!registryId) {
+      throw new Error(
+        "REGISTRY_ID environment variable is required when REGISTRY_ENABLED is true",
+      );
+    }
+    registryServiceInstance = new RegistryService({
+      registryId,
+      region: process.env.AWS_REGION || "us-east-1",
+    });
+  }
+  return registryServiceInstance;
+}
+
+/**
+ * Resets the cached RegistryService instance.
+ * Exposed for testing so that tests can clear state between runs.
+ * @internal
+ */
+export function _resetRegistryService(): void {
+  registryServiceInstance = null;
+}
+
+/**
+ * Minimal slice of the Lambda Context this resolver consumes. The runtime
+ * always invokes `handler(event, context)`; declaring the parameter keeps
+ * unit-test invocations (which omit it) compiling while letting the list
+ * path thread the remaining-time budget into the Registry N+1 fetch.
+ */
+export interface LambdaContextLike {
+  getRemainingTimeInMillis?: () => number;
+}
+
+/**
+ * Builds listResources options carrying the Lambda remaining-time budget so
+ * a large registry returns a partial list instead of timing out (live
+ * incident: 340 records × sequential GETs > 30s).
+ */
+function budgetOptionsFrom(
+  context?: LambdaContextLike,
+): ListResourcesOptions | undefined {
+  const getRemainingTimeInMillis = context?.getRemainingTimeInMillis;
+  if (typeof getRemainingTimeInMillis !== "function") return undefined;
+  return { getRemainingTimeMs: () => getRemainingTimeInMillis.call(context) };
+}
+
+interface AgentConfig {
+  agentId: string;
+  /** Human-readable agent name (Registry top-level or legacy config.name). */
+  name?: string;
+  orgId: string;
+  config: string | Record<string, unknown>;
+  /** Human-readable description surfaced from the Registry record. */
+  description?: string;
+  state: "active" | "inactive" | "maintenance" | "pending" | string;
+  categories?: string[] | string;
+  createdAt?: string;
+  updatedAt?: string;
+  /** Raw Registry status (CIT-043 visibility filtering). */
+  registryStatus?: string;
+  /**
+   * Back-pointer to the Registry recordId carried on DynamoDB cache rows
+   * that mirror a registry record (set by syncNameKeyedRow). Absent on
+   * true legacy rows and on registry-mapped rows.
+   */
+  registryRecordId?: string;
+  /** AppSync caller identity who created this record (CIT-043 ownership). */
+  createdBy?: string;
+  /** Admin who approved/rejected this record. Absent on legacy records. */
+  decidedBy?: string;
+  /** ISO timestamp of the approval/rejection decision. Absent on legacy records. */
+  decidedAt?: string;
+  /** Reason supplied when this record was rejected. Absent on legacy records. */
+  statusReason?: string;
+  /** User-supplied resource tags (CIT-042). */
+  tags?: Record<string, string>;
+}
+
+/** Merged create/update mutation input (config required only on create). */
+interface AgentConfigMutationInput {
+  agentId: string;
+  config?: string | Record<string, unknown>;
+  state?: string;
+  categories?: string[] | string;
+  icon?: string;
+  appId?: string;
+  tags?: unknown;
+}
+
+/** Minimal slice of the AppSync event needed for org/admin extraction. */
+type OrgScopedEvent = { identity?: Record<string, unknown> };
+
+/** AppSync event shape as dispatched to this resolver's handler. */
+interface AgentConfigResolverEvent extends OrgScopedEvent {
+  info: { fieldName: string };
+  arguments: Record<string, unknown>;
+}
+
+/** Loose manifest shape as parsed from AWSJSON; validated at runtime. */
+export interface RawAgentManifest {
+  name?: unknown;
+  description?: unknown;
+  version?: unknown;
+}
+
+/**
+ * Parses a mutation input's `config` field when it arrives as a string,
+ * enforcing that it is valid JSON that decodes to an object (not a bare
+ * string/number/array/null). Objects pass through untouched. Shared by every
+ * create/update/import write path in this file so a prose (non-JSON) config
+ * is rejected uniformly with the same message, following this file's
+ * existing `ValidationError: <message>` convention (see
+ * `Cannot determine caller organization`-style throws above).
+ */
+function parseConfigOrThrow(
+  config: string | Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (typeof config !== "string") {
+    return config;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(config);
+  } catch {
+    throw new Error("ValidationError: config must be valid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("ValidationError: config must be valid JSON");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+export const handler = async (
+  event: AgentConfigResolverEvent,
+  context?: LambdaContextLike,
+) => {
+  console.log("Event:", JSON.stringify(event, null, 2));
+
+  const fieldName = event.info.fieldName;
+
+  try {
+    const registryEnabled = isRegistryEnabled();
+
+    switch (fieldName) {
+      case "listAgentConfigs":
+        return registryEnabled
+          ? await listAgentConfigsRegistry(event, context)
+          : await listAgentConfigs();
+
+      case "getAgentConfig":
+        return registryEnabled
+          ? await getAgentConfigRegistry(
+              event.arguments.agentId as string,
+              event,
+            )
+          : await getAgentConfig(event.arguments.agentId as string);
+
+      case "createAgentConfig":
+        return registryEnabled
+          ? await createAgentConfigRegistry(
+              event.arguments.input as AgentConfigMutationInput,
+              event,
+            )
+          : await createAgentConfig(
+              event.arguments.input as AgentConfigMutationInput,
+            );
+
+      case "updateAgentConfig":
+        return registryEnabled
+          ? await updateAgentConfigRegistry(
+              event.arguments.input as AgentConfigMutationInput,
+              event,
+            )
+          : await updateAgentConfig(
+              event.arguments.input as AgentConfigMutationInput,
+            );
+
+      case "deleteAgentConfig":
+        return registryEnabled
+          ? await deleteAgentConfigRegistry(
+              event.arguments.agentId as string,
+              event,
+            )
+          : await deleteAgentConfig(event.arguments.agentId as string);
+
+      case "publishAgentManifest":
+        return registryEnabled
+          ? await publishAgentManifestRegistry(
+              event.arguments.agentId as string,
+              event.arguments.manifest as string,
+              event,
+            )
+          : await publishAgentManifest(
+              event.arguments.agentId as string,
+              event.arguments.manifest as string,
+            );
+
+      case "searchAgentConfigs":
+        return await searchAgentConfigsRegistry(
+          event.arguments.query as string,
+          event,
+        );
+
+      case "listPendingApprovals":
+        return await listPendingApprovalsHandler(event);
+
+      case "activateProjectAgents": {
+        const projectId = event.arguments.projectId as string;
+        await assertProjectOrgAccess(projectId, event);
+        return await activateProjectAgents(projectId);
+      }
+
+      default:
+        throw new Error(`Unknown field: ${fieldName}`);
+    }
+  } catch (error) {
+    console.error("Error:", error);
+    throw error;
+  }
+};
+
+/**
+ * Registry-first get: checks Registry for the agent, falls back to DynamoDB
+ * if not found or if Registry is unavailable. Returns null when neither
+ * source has the record.
+ *
+ * Error handling per design:
+ * - Registry returns null (404) → fall back to DynamoDB
+ * - Registry throws (unavailable / transient error) → log warning, fall
+ *   back to DynamoDB so get queries can degrade gracefully
+ */
+export async function getAgentConfigRegistry(
+  agentId: string,
+  event?: OrgScopedEvent,
+): Promise<AgentConfig | null> {
+  const registryService = getRegistryService();
+  const callerOrgId =
+    event !== undefined ? await extractOrgFromEvent(event) : null;
+  const admin = event !== undefined ? isAdminFromEvent(event) : false;
+  try {
+    const record = await registryService.getResource("agent", agentId);
+    if (record) {
+      // Kind guard: non-agent records (apps, tools) are not agent configs.
+      const kind = resolveKind(record);
+      if (kind !== "agent") {
+        return null;
+      }
+      const mapped = registryService.mapToAgentConfig(record);
+      // Cross-org access is reported as not-found (404-style, not 403) so we
+      // don't leak existence to other orgs. Admins bypass.
+      if (!admin && mapped.orgId && mapped.orgId !== callerOrgId) {
+        return null;
+      }
+      return mapped;
+    }
+  } catch (err) {
+    console.warn(
+      `Registry getResource failed for agent ${agentId}, falling back to DynamoDB:`,
+      err,
+    );
+  }
+  // Fallback to DynamoDB for legacy records (or on Registry error)
+  const legacy = await getAgentConfig(agentId);
+  if (!legacy) return null;
+  if (!admin && legacy.orgId && legacy.orgId !== callerOrgId) {
+    return null;
+  }
+  return legacy;
+}
+
+// ---------------------------------------------------------------------------
+// Projection read helpers (CIT-244 PR3)
+// ---------------------------------------------------------------------------
+
+const cwClient = new CloudWatchClient({});
+
+/**
+ * Extracts the config-payload `name` from an AgentConfig's config field.
+ * Shared by both the projection and registry list paths for dedup.
+ */
+function extractAgentName(c: AgentConfig): string | undefined {
+  if (!c.config) return undefined;
+  try {
+    const parsed =
+      typeof c.config === "string" ? JSON.parse(c.config) : c.config;
+    const name = parsed?.name;
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Emits a ListSource metric to CloudWatch for observability. Best-effort:
+ * metric failures never propagate to the caller.
+ */
+function emitListSourceMetric(
+  source: "projection" | "registry",
+  count: number,
+): void {
+  cwClient
+    .send(
+      new PutMetricDataCommand({
+        Namespace: "Citadel/Resolvers",
+        MetricData: [
+          {
+            MetricName: "ListSource",
+            Dimensions: [
+              { Name: "Kind", Value: "agent" },
+              { Name: "Source", Value: source },
+            ],
+            Value: count,
+            Unit: "Count",
+            Timestamp: new Date(),
+          },
+        ],
+      }),
+    )
+    .catch((err) => {
+      console.error("emitListSourceMetric: best-effort metric failed:", err);
+    });
+  console.info(
+    JSON.stringify({ msg: "list_source", kind: "agent", source, count }),
+  );
+}
+
+/**
+ * Scans the agents cache table for projection rows (attribute_exists(projectionVersion)
+ * AND citadelKind = 'agent'), applies org + visibility filters, and maps
+ * to the AgentConfig API shape. Returns an empty array when no projection
+ * rows exist.
+ */
+async function listAgentConfigsFromProjection(
+  callerOrgId: string | null,
+  admin: boolean,
+  viewer: {
+    isAdmin: boolean;
+    roles: string[];
+    orgId: string | null;
+    userId: string | null;
+  },
+): Promise<AgentConfig[]> {
+  try {
+    const result = await docClient.send(
+      new ScanCommand({
+        TableName: AGENT_CONFIG_TABLE,
+        FilterExpression: "attribute_exists(#pv) AND #ck = :ck",
+        ExpressionAttributeNames: {
+          "#pv": "projectionVersion",
+          "#ck": "citadelKind",
+        },
+        ExpressionAttributeValues: {
+          ":ck": "agent",
+        },
+      }),
+    );
+    const items = result.Items || [];
+    if (items.length === 0) return [];
+
+    // Map DynamoDB items to AgentConfig shape and apply the same filters
+    // as the registry path.
+    const configs: AgentConfig[] = items.map((item) => ({
+      agentId: item.agentId,
+      name: typeof item.name === "string" ? item.name : undefined,
+      orgId: item.orgId ?? "",
+      config: toAwsJsonConfig(item.config, item.agentId),
+      description:
+        typeof item.description === "string" ? item.description : undefined,
+      state: item.state || "active",
+      categories: item.categories || [],
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      registryStatus:
+        typeof item.registryStatus === "string"
+          ? item.registryStatus
+          : undefined,
+      registryRecordId:
+        typeof item.registryRecordId === "string"
+          ? item.registryRecordId
+          : undefined,
+      createdBy:
+        typeof item.createdBy === "string" ? item.createdBy : undefined,
+      decidedBy:
+        typeof item.decidedBy === "string" ? item.decidedBy : undefined,
+      decidedAt:
+        typeof item.decidedAt === "string" ? item.decidedAt : undefined,
+      statusReason:
+        typeof item.statusReason === "string" ? item.statusReason : undefined,
+      tags: item.tags ?? undefined,
+    }));
+
+    return configs.filter((a) => {
+      if (!admin && a.orgId !== callerOrgId && a.orgId !== "") return false;
+      return isRecordVisible(viewer, {
+        status: a.registryStatus ?? undefined,
+        orgId: a.orgId,
+        createdBy: a.createdBy,
+      });
+    });
+  } catch (err) {
+    console.error(
+      "listAgentConfigsFromProjection: scan failed, will fall back to registry:",
+      err,
+    );
+    return [];
+  }
+}
+
+/**
+ * Dual-source list: fetches agent configs from both Registry and DynamoDB,
+ * merges them with Registry records taking precedence on duplicate agentIds.
+ *
+ * Results are filtered to the caller's organization unless the caller is a
+ * group admin (`cognito:groups` includes `admin`), in which case the full
+ * list (across all orgs) is returned — matching the "All Organizations" admin UX. Agents with an
+ * empty orgId ('') are system-shared (e.g. seeded demo agents) and are
+ * visible to every org-scoped caller. A non-admin caller without an orgId
+ * receives an empty list with a warning, so anonymous / api-key callers
+ * never see cross-tenant data.
+ */
+export async function listAgentConfigsRegistry(
+  event?: OrgScopedEvent,
+  context?: LambdaContextLike,
+): Promise<AgentConfig[]> {
+  const callerOrgId =
+    event !== undefined ? await extractOrgFromEvent(event) : null;
+  const admin = event !== undefined ? isAdminFromEvent(event) : false;
+
+  if (!admin && !callerOrgId) {
+    console.warn(
+      "listAgentConfigsRegistry: no caller orgId and not admin; returning empty list",
+    );
+    return [];
+  }
+
+  // Build a Viewer for CIT-043 record-level visibility filtering.
+  const viewer =
+    event !== undefined
+      ? await viewerFromEvent(event)
+      : { isAdmin: false, roles: [], orgId: null, userId: null };
+
+  // ─── Projection read path (CIT-244) ────────────────────────────────────
+  // When the LIST_FROM_PROJECTION flag is on, scan the cache table for
+  // projection rows (those with projectionVersion set and citadelKind='agent')
+  // instead of issuing N+1 Registry GetRegistryRecord calls.
+  if (isListFromProjection()) {
+    const projectionConfigs = await listAgentConfigsFromProjection(
+      callerOrgId,
+      admin,
+      viewer,
+    );
+    if (projectionConfigs.length > 0) {
+      // Merge legacy rows that have no registryRecordId (genuinely local-only)
+      const allDynamoConfigs = await listAgentConfigs();
+      const dynamoConfigs = allDynamoConfigs.filter((a) => {
+        if (!admin && a.orgId !== callerOrgId && a.orgId !== "") return false;
+        return isRecordVisible(viewer, {
+          status: a.registryStatus,
+          orgId: a.orgId,
+          createdBy: a.createdBy,
+        });
+      });
+
+      const projectionIds = new Set(projectionConfigs.map((c) => c.agentId));
+      const projectionNames = new Set(
+        projectionConfigs
+          .map(extractAgentName)
+          .filter((n): n is string => typeof n === "string" && n.length > 0),
+      );
+
+      const legacyOnly = dynamoConfigs.filter((c) => {
+        if (projectionIds.has(c.agentId)) return false;
+        if (c.registryRecordId) return false;
+        const n = extractAgentName(c);
+        if (n && projectionNames.has(n)) return false;
+        return true;
+      });
+
+      const result = [...projectionConfigs, ...legacyOnly];
+      emitListSourceMetric("projection", result.length);
+      return result;
+    }
+    // Projection returned 0 rows → fall through to registry path
+  }
+
+  // ─── Registry N+1 read path (original) ─────────────────────────────────
+
+  // 1. Fetch Registry records and map to AgentConfig
+  const registryService = getRegistryService();
+  const budgetOptions = budgetOptionsFrom(context);
+  const registryRecords = budgetOptions
+    ? await registryService.listResources("agent", budgetOptions)
+    : await registryService.listResources("agent");
+  // Kind gate: exclude app and tool records from the agent-config list.
+  const agentOnlyRecords = registryRecords.filter((r) => {
+    const kind = resolveKind(r);
+    return kind === "agent";
+  });
+  const allRegistryConfigs = agentOnlyRecords.map((record) =>
+    registryService.mapToAgentConfig(record),
+  );
+  // Org filter (existing) + status/ownership visibility (CIT-043).
+  const registryConfigs = allRegistryConfigs.filter((a) => {
+    if (!admin && a.orgId !== callerOrgId && a.orgId !== "") return false;
+    return isRecordVisible(viewer, {
+      status: a.registryStatus ?? undefined,
+      orgId: a.orgId,
+      createdBy: a.createdBy,
+    });
+  });
+
+  // 2. Fetch DynamoDB legacy records — apply isRecordVisible for items that
+  //    carry registryStatus (none do today, but items without it stay visible
+  //    per policy: legacy records predate governance).
+  const allDynamoConfigs = await listAgentConfigs();
+  const dynamoConfigs = allDynamoConfigs.filter((a) => {
+    if (!admin && a.orgId !== callerOrgId && a.orgId !== "") return false;
+    return isRecordVisible(viewer, {
+      status: a.registryStatus,
+      orgId: a.orgId,
+      createdBy: a.createdBy,
+    });
+  });
+
+  // 3. Build dedup sets from Registry so the merge step can identify
+  //    DynamoDB cache rows that duplicate registry records. Three signals:
+  //    (a) config-payload name (the stable human identifier shared by both
+  //        representations), (b) registry recordId (12-char IDs that may
+  //        appear as agentId on cache rows written by registry-sync), and
+  //    (c) registryRecordId back-pointer on name-keyed cache rows written
+  //        by syncNameKeyedRow.
+  const registryNames = new Set(
+    registryConfigs
+      .map(extractAgentName)
+      .filter((n): n is string => typeof n === "string" && n.length > 0),
+  );
+  const registryRecordIds = new Set(registryConfigs.map((c) => c.agentId));
+
+  // 4. Filter DynamoDB records to genuinely-legacy rows only.
+  //    A cache row is NOT legacy if:
+  //    - its agentId equals a registry recordId (recordId-keyed mirror), OR
+  //    - it carries a registryRecordId back-pointer (name-keyed mirror), OR
+  //    - its config-payload name matches a registry agent's name.
+  //    Dedup by agentId AND by name to prevent any remaining duplicates.
+  const seenAgentIds = new Set<string>();
+  const seenNames = new Set<string>();
+  const legacyOnly = dynamoConfigs.filter((c) => {
+    // Skip recordId-keyed mirror rows.
+    if (registryRecordIds.has(c.agentId)) return false;
+    // Skip name-keyed rows that back-point to a registry record.
+    if (c.registryRecordId) return false;
+    // Skip rows whose config name matches a registry agent.
+    const n = extractAgentName(c);
+    if (n && registryNames.has(n)) return false;
+    // Dedup within legacy results by agentId.
+    if (seenAgentIds.has(c.agentId)) return false;
+    seenAgentIds.add(c.agentId);
+    // Dedup within legacy results by name.
+    if (n) {
+      if (seenNames.has(n)) return false;
+      seenNames.add(n);
+    }
+    return true;
+  });
+
+  // 5. Return merged list
+  const merged = [...registryConfigs, ...legacyOnly];
+  emitListSourceMetric("registry", merged.length);
+  return merged;
+}
+
+/**
+ * Registry-backed create: serializes custom metadata and creates a Registry
+ * resource. Returns the mapped AgentConfig.
+ *
+ * The caller's organization is pulled from the AppSync event (JWT
+ * `custom:organization` claim) and stored inside customMetadata. Input
+ * payloads never carry orgId — per D1(a) the backend is the sole source
+ * of truth for tenant assignment.
+ */
+export async function createAgentConfigRegistry(
+  input: AgentConfigMutationInput,
+  event?: OrgScopedEvent,
+): Promise<AgentConfig> {
+  const registryService = getRegistryService();
+
+  const orgId = await extractOrgFromEvent(event);
+  if (!orgId) {
+    throw new Error("Cannot determine caller organization");
+  }
+
+  // CIT-042 tag-policy enforcement: validate tags BEFORE the registry write.
+  const normalisedTags =
+    input.tags !== undefined ? normaliseTags(input.tags) : undefined;
+  if (normalisedTags !== undefined) {
+    await enforceTagPolicy({
+      orgId,
+      tags: normalisedTags,
+      action: "createAgent",
+      subjectId: input.agentId,
+    });
+  }
+
+  const parsedConfig = parseConfigOrThrow(input.config) ?? {};
+  const config: string =
+    typeof input.config === "string"
+      ? input.config
+      : JSON.stringify(parsedConfig);
+
+  const customMetadata = registryService.serializeCustomMetadata({
+    citadelKind: "agent" as const,
+    categories: input.categories || [],
+    icon: input.icon || "",
+    state: input.state || "active",
+    appId: input.appId || undefined,
+    orgId,
+    createdBy: extractUserIdFromEvent(event),
+    ...(normalisedTags !== undefined ? { tags: normalisedTags } : {}),
+  } as AgentCustomMetadata);
+
+  const record = await registryService.createResource("agent", input.agentId, {
+    name: (parsedConfig.name as string | undefined) || input.agentId,
+    description: config,
+    customMetadata,
+  });
+
+  // If an initial state is provided, update the status accordingly. A newly
+  // created record always starts DRAFT; requesting 'inactive' here throws
+  // (via toRegistryStatus, decision 3d5843e9/finding 462c17ad) — a
+  // just-created record cannot be "deactivated". The only non-activation
+  // initial state that reaches the registry is 'maintenance' (deprecate
+  // intent -> DEPRECATED).
+  if (input.state) {
+    const registryStatus = registryService.toRegistryStatus(input.state);
+    // DRAFT -> APPROVED is rejected by the registry directly; the sanctioned
+    // path for activation is SubmitRegistryRecordForApproval, which
+    // auto-advances to APPROVED when the registry has autoApproval, else
+    // lands on PENDING_APPROVAL (finding adde5b79).
+    if (registryStatus === RegistryRecordStatusValues.APPROVED) {
+      await registryService.submitForApproval(input.agentId);
+    } else {
+      await registryService.updateResourceStatus(
+        "agent",
+        input.agentId,
+        registryStatus,
+      );
+    }
+    // Re-fetch after status transition so the returned state reflects the
+    // post-SubmitForApproval record (PENDING_APPROVAL or APPROVED) rather
+    // than the stale DRAFT snapshot from createResource above.
+    const refreshed = await registryService.getResource("agent", input.agentId);
+    return registryService.mapToAgentConfig(refreshed ?? record);
+  }
+
+  return registryService.mapToAgentConfig(record);
+}
+
+/**
+ * Governance activation gate for imported agents (US-IMP governance retrofit).
+ *
+ * Applied at the APPROVED (activation) transition for an IMPORTED, not-yet-
+ * attested Registry record. An imported record is one whose deserialized
+ * customMetadata carries a `governanceAttestation` block (stamped by the import
+ * resolver); non-imported agents never have it, so the gate is a pure no-op for
+ * them.
+ *
+ * Trigger — ALL of:
+ *   (i)   target status is APPROVED  → enforced by the CALL-SITE (this helper is
+ *         only invoked on the APPROVED transition), so it assumes (i) holds.
+ *   (ii)  record is imported          → `governanceAttestation` present.
+ *   (iii) not yet attested            → `governanceAttestation.status !== 'attested'`.
+ *
+ * On trigger:
+ *   - strict              → THROW before the caller writes APPROVED status.
+ *   - shadow | permissive → best-effort "would-block" telemetry event, then
+ *                           return so the caller proceeds with activation.
+ *
+ * When NOT triggered (no attestation, or already attested) this returns
+ * immediately WITHOUT reading the governance flag or emitting any event, so the
+ * behaviour of every non-imported / already-attested activation is byte-
+ * identical to the pre-gate code path.
+ *
+ * `getGovernanceEnforce` fails open to 'shadow' internally on a read
+ * failure (never throws) — and this gate only blocks when mode ===
+ * 'strict', so a defaulted 'shadow' behaves identically to a configured
+ * 'shadow' or the historical 'permissive' default here: no new blocking.
+ * See `backend/src/utils/governance-flag.ts`'s module doc for why the
+ * fallback was moved from 'permissive' to 'shadow' (visibility, not
+ * enforcement, was the defect being fixed) and why 'strict' was
+ * deliberately NOT chosen as the fallback (it would have newly blocked
+ * this exact gate during a transient SSM outage).
+ */
+async function enforceImportActivationGate(
+  registryService: RegistryService,
+  agentId: string,
+  customDescriptorContent: string | undefined,
+): Promise<void> {
+  const meta = registryService.deserializeCustomMetadata<{
+    governanceAttestation?: { status: "pending" | "attested" };
+  }>(customDescriptorContent ?? null, { governanceAttestation: undefined });
+
+  const attestation = meta.governanceAttestation;
+  // (ii) not imported, or (iii) already attested → no-op.
+  if (!attestation || attestation.status === "attested") {
+    return;
+  }
+
+  const mode = await getGovernanceEnforce(process.env.ENVIRONMENT || "unknown");
+  if (mode === "strict") {
+    throw new Error(
+      `Activation blocked: governance attestation pending for imported agent ${agentId}`,
+    );
+  }
+
+  // shadow | permissive → emit best-effort telemetry that the gate WOULD have
+  // blocked this activation, then proceed. A telemetry outage must never fail
+  // (or alter the result of) the activation, so the emit is swallowed on error.
+  try {
+    await publishEvent({
+      eventType: "agent.import.activation_gate",
+      projectId: "",
+      agentId,
+      payload: {
+        agentId,
+        attestationStatus: attestation.status,
+        mode,
+        wouldBlock: true,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error(
+      `agent-config-resolver: best-effort activation-gate event for ${agentId} failed (swallowed):`,
+      err,
+    );
+  }
+}
+
+/**
+ * Registry-backed update: updates the Registry resource with new metadata.
+ * If state is being changed, also updates the Registry status via toRegistryStatus.
+ * Returns the mapped AgentConfig.
+ *
+ * orgId is never changed by an update: we preserve existingMeta.orgId when
+ * present, and fall back to the caller's JWT org for legacy records that
+ * predate Phase-2a. Input payloads never carry orgId.
+ */
+export async function updateAgentConfigRegistry(
+  input: AgentConfigMutationInput,
+  event?: OrgScopedEvent,
+): Promise<AgentConfig> {
+  const registryService = getRegistryService();
+
+  // Fetch existing record to merge with
+  const existing = await registryService.getResource("agent", input.agentId);
+  if (!existing) {
+    throw new Error(`Agent config not found: ${input.agentId}`);
+  }
+
+  // Decision 3d5843e9 (supersedes a3fb5542; finding 462c17ad): the AWS
+  // registry rejects DRAFT as an UpdateRegistryRecordStatus target, so the
+  // Catalog Deactivate action ('inactive') can no longer be honoured for a
+  // registry-backed record — silently substituting a different transition
+  // (e.g. deprecate) would surprise a caller who explicitly asked to
+  // deactivate (reversible) rather than deprecate (irreversible). Fail with
+  // a structured, actionable error BEFORE any registry call. The deprecate
+  // intent is expressed via `state: "maintenance"` (see desiredRegistryStatus
+  // below) — the one AgentState enum value not already claimed by
+  // active/inactive and not sent by any current frontend write path — and is
+  // routed through the same validated REGISTRY_TRANSITIONS gate used for
+  // every other transition.
+  if (input.state === "inactive") {
+    throw new Error(
+      "ValidationError: Deactivation is not supported for registry records; use Deprecate (irreversible)",
+    );
+  }
+
+  const existingMeta = registryService.deserializeCustomMetadata<{
+    categories: string[];
+    icon: string;
+    state: string;
+    appId?: string;
+    manifest?: Record<string, unknown>;
+    orgId?: string;
+    tags?: Record<string, string>;
+  }>(existing.customDescriptorContent ?? null, {
+    categories: [],
+    icon: "",
+    state: "active",
+    appId: undefined,
+    manifest: undefined,
+    orgId: undefined,
+    tags: undefined,
+  });
+
+  // Tenancy reconciliation BEFORE any mutation (finding 1fcfd11e): compare the
+  // caller's org against the EXISTING record's orgId via assertRowOrg (admin
+  // bypass). A record with NO orgId is a legacy record predating Phase-2a —
+  // assertRowOrg's row shape only carries `orgId` when present, so we pass
+  // `existingMeta.orgId` verbatim and let a missing orgId fall through to the
+  // caller-org fallback below (see "falls back to caller JWT org when legacy
+  // record is missing orgId"), rather than fail-closed on it: fail-closing on
+  // every org-less legacy record would newly block the documented fallback
+  // behaviour this function already relies on. A record that DOES carry an
+  // orgId differing from the caller's IS rejected, fail-closed, same as every
+  // other assertRowOrg call site in this file.
+  if (typeof existingMeta.orgId === "string" && existingMeta.orgId.length > 0) {
+    await assertRowOrg({ orgId: existingMeta.orgId }, event);
+  } else if (!isAdminFromEvent(event)) {
+    const callerOrgId = await extractOrgFromEvent(event);
+    if (!callerOrgId) {
+      throw new Error(
+        `Access denied: cannot determine caller organization for agent ${input.agentId}`,
+      );
+    }
+  }
+
+  // CIT-042 tag-policy enforcement: validate tags ONLY when input.tags is
+  // present (decision ad393b11). Update without tags → skip enforcement.
+  if (input.tags !== undefined) {
+    // Derive orgId for enforcement: prefer the existing record's orgId; fall
+    // back to the caller's JWT org for legacy records.
+    const enforcementOrg =
+      typeof existingMeta.orgId === "string" && existingMeta.orgId.length > 0
+        ? existingMeta.orgId
+        : ((await extractOrgFromEvent(event)) ?? undefined);
+    if (enforcementOrg) {
+      await enforceTagPolicy({
+        orgId: enforcementOrg,
+        tags: normaliseTags(input.tags),
+        action: "updateAgent",
+        subjectId: input.agentId,
+      });
+    }
+  }
+
+  // Merge config. `input.config` is validated here (create/update write path);
+  // `existing.description` (legacy free-text description) is intentionally
+  // NOT re-validated — a state-only toggle with no input.config must not
+  // start throwing on a pre-existing malformed legacy record.
+  if (input.config !== undefined) {
+    parseConfigOrThrow(input.config);
+  }
+  const newConfig = input.config
+    ? typeof input.config === "string"
+      ? input.config
+      : JSON.stringify(input.config)
+    : existing.description;
+
+  // Parse the merged config to extract the agent's display name. Some legacy
+  // records carry a free-text description rather than a JSON blob in the
+  // description field — for those records we fall back to {} and reuse the
+  // existing record's name. Never throw here: a state-only toggle (e.g. the
+  // Activate / Deactivate button) has no input.config and must not blow up
+  // on a malformed legacy description.
+  let parsedNewConfig: Record<string, unknown> = {};
+  if (newConfig && typeof newConfig === "string") {
+    try {
+      parsedNewConfig = JSON.parse(newConfig);
+    } catch {
+      parsedNewConfig = {};
+    }
+  } else if (newConfig && typeof newConfig === "object") {
+    parsedNewConfig = newConfig;
+  }
+
+  // Preserve existing orgId; fall back to caller for legacy records.
+  // Never derive orgId from input — that field is backend-owned.
+  const preservedOrgId =
+    existingMeta.orgId ??
+    (event !== undefined
+      ? ((await extractOrgFromEvent(event)) ?? undefined)
+      : undefined);
+
+  // Desired Registry status computed up-front: the lazy trust-path attestation
+  // below only fires on the APPROVED (activation) transition, and the gate
+  // further down consumes the same value.
+  const desiredRegistryStatus = input.state
+    ? registryService.toRegistryStatus(input.state)
+    : undefined;
+
+  // US-IMP lazy IAM trust-path attestation. On the APPROVED activation of an
+  // IMPORTED (governanceAttestation present), still-'pending' record whose
+  // invocation.roleArn is set, inspect that role's IAM trust path in-process
+  // and — when it is clean — auto-attest so the activation gate passes in this
+  // same request. Best-effort: any failure (unresolvable / cross-account role,
+  // IAM denial) is logged and swallowed, leaving the attestation 'pending' so
+  // the gate governs unchanged. Roleless-imported and non-imported records
+  // never reach computeTrustPath, so their behaviour is byte-identical.
+  const importView = registryService.deserializeCustomMetadata<{
+    governanceAttestation?: GovernanceAttestationWithTrustPath;
+    invocation?: AgentInvocationBlock;
+    origin?: AgentOrigin;
+  }>(existing.customDescriptorContent ?? null, {
+    governanceAttestation: undefined,
+    invocation: undefined,
+    origin: undefined,
+  });
+
+  let importAttestationToPersist:
+    GovernanceAttestationWithTrustPath | undefined;
+  let gateContentOverride: string | undefined;
+  const existingAttestation = importView.governanceAttestation;
+  const invocationRoleArn = importView.invocation?.roleArn;
+  if (
+    input.state &&
+    desiredRegistryStatus === RegistryRecordStatusValues.APPROVED &&
+    desiredRegistryStatus !== existing.status &&
+    existingAttestation &&
+    existingAttestation.status === "pending" &&
+    typeof invocationRoleArn === "string" &&
+    invocationRoleArn.length > 0
+  ) {
+    // Phase-2 cross-account awareness. When invocation.roleArn lives in a
+    // DIFFERENT account than this deployment (ACCOUNT_ID), the same-account,
+    // in-process computeTrustPath cannot introspect it — its GetRole runs in the
+    // home account and would just fail. Detection is best-effort: when
+    // ACCOUNT_ID is not configured (or the role ARN account is unparseable)
+    // isCrossAccountRoleArn returns false and the same-account branch below runs
+    // byte-identically to Phase-1, so same-account behaviour is unchanged.
+    if (isCrossAccountRoleArn(invocationRoleArn, process.env.ACCOUNT_ID)) {
+      // Phase-2 cross-account FULL introspection. When the operator supplied a
+      // READ-ONLY analysisRoleArn in the TARGET account, assume it
+      // (externalId-gated) to obtain a cross-account IAM client and run the SAME
+      // trust-path check there — then behave exactly like the same-account
+      // success path (auto-attest clean / pending+findings). With NO
+      // analysisRoleArn, keep the original 276ea59 manual-attestation finding.
+      // Either way the summary carries crossAccount:true. BEST-EFFORT: any
+      // assume / introspection failure records a finding and leaves the
+      // attestation 'pending' so the gate governs — activation is NEVER crashed,
+      // and the temporary credentials never reach this scope (the helper
+      // encapsulates them) so they cannot be logged.
+      const analysisRoleArn = importView.invocation?.analysisRoleArn;
+      if (typeof analysisRoleArn === "string" && analysisRoleArn.length > 0) {
+        try {
+          const crossAccountIamClient = await assumeAnalysisRoleClient(
+            analysisRoleArn,
+            importView.invocation?.externalId,
+          );
+          const tp = await computeTrustPath(invocationRoleArn, {
+            iamClient: crossAccountIamClient,
+          });
+          const summary: TrustPathAttestationSummary = {
+            checkedAt: new Date().toISOString(),
+            clean: tp.clean,
+            crossAccount: true,
+            findings: tp.findings,
+          };
+          importAttestationToPersist = tp.clean
+            ? {
+                ...existingAttestation,
+                status: "attested",
+                attestedBy: "system:trust-path",
+                attestedAt: summary.checkedAt,
+                trustPath: summary,
+              }
+            : { ...existingAttestation, trustPath: summary };
+        } catch (err) {
+          // Best-effort: never log credentials (none reach this scope — the
+          // helper owns the STS temp creds). Record a finding and leave
+          // 'pending' for the gate / manual attestation.
+          console.error(
+            `agent-config-resolver: cross-account analysis-role trust-path for ` +
+              `${input.agentId} failed (best-effort, leaving 'pending'):`,
+            err instanceof Error ? err.message : String(err),
+          );
+          const summary: TrustPathAttestationSummary = {
+            checkedAt: new Date().toISOString(),
+            clean: false,
+            crossAccount: true,
+            findings: [
+              "cross-account analysis-role assume failed; manual attestation required",
+            ],
+          };
+          importAttestationToPersist = {
+            ...existingAttestation,
+            trustPath: summary,
+          };
+        }
+      } else {
+        const summary: TrustPathAttestationSummary = {
+          checkedAt: new Date().toISOString(),
+          clean: false,
+          crossAccount: true,
+          findings: [
+            "cross-account-role: automated trust-path unavailable; manual attestation required",
+          ],
+        };
+        importAttestationToPersist = {
+          ...existingAttestation,
+          trustPath: summary,
+        };
+      }
+    } else {
+      try {
+        const tp = await computeTrustPath(invocationRoleArn);
+        const summary: TrustPathAttestationSummary = {
+          checkedAt: new Date().toISOString(),
+          clean: tp.clean,
+          findings: tp.findings,
+        };
+        importAttestationToPersist = tp.clean
+          ? {
+              ...existingAttestation,
+              status: "attested",
+              attestedBy: "system:trust-path",
+              attestedAt: summary.checkedAt,
+              trustPath: summary,
+            }
+          : { ...existingAttestation, trustPath: summary };
+      } catch (err) {
+        // Best-effort: leave the attestation 'pending' and let the gate govern.
+        console.error(
+          `agent-config-resolver: trust-path attestation for ${input.agentId} failed ` +
+            `(best-effort, leaving 'pending'):`,
+          err,
+        );
+      }
+    }
+  }
+
+  // Merge custom metadata. The 6-field base is byte-identical to the pre-US-IMP
+  // path; the imported governance blocks (invocation / origin /
+  // governanceAttestation) are folded back in ONLY when the trust-path
+  // attestation actually ran, so every non-imported / roleless / non-activation
+  // update persists exactly the same metadata as before.
+  const baseMeta = {
+    categories:
+      input.categories !== undefined
+        ? input.categories
+        : existingMeta.categories,
+    icon: input.icon !== undefined ? input.icon : existingMeta.icon,
+    state: input.state || existingMeta.state,
+    appId: input.appId !== undefined ? input.appId : existingMeta.appId,
+    manifest: existingMeta.manifest,
+    orgId: preservedOrgId,
+    tags:
+      input.tags !== undefined ? normaliseTags(input.tags) : existingMeta.tags,
+  };
+  const updatedMeta = registryService.serializeCustomMetadata(
+    (importAttestationToPersist
+      ? {
+          ...baseMeta,
+          invocation: importView.invocation,
+          origin: importView.origin,
+          governanceAttestation: importAttestationToPersist,
+        }
+      : baseMeta) as AgentCustomMetadata,
+  );
+  if (importAttestationToPersist) {
+    // The gate reads attestation status from this content; hand it the freshly
+    // attested view so a same-request auto-attest lets activation proceed.
+    gateContentOverride = updatedMeta;
+  }
+
+  // Status transition BEFORE metadata write (finding adde5b79 ordering
+  // requirement): if the transition below fails, updateResource (metadata)
+  // never runs, so a failed activation leaves no partial metadata drift.
+  // Gate on the actual Registry status, not the metadata — customMetadata.state
+  // can drift out of sync with record.status (e.g. when deserialize falls back
+  // to its 'active' default for records missing the field). The user-facing
+  // state is derived from record.status via toInternalState, so that's what
+  // must change for the toggle to actually take effect.
+  if (
+    input.state &&
+    desiredRegistryStatus &&
+    desiredRegistryStatus !== existing.status
+  ) {
+    // Governance activation gate (US-IMP): runs ONLY on the APPROVED transition
+    // for an imported, unattested record. A no-op for every other record and
+    // transition, so all non-activation / non-imported update paths are
+    // unchanged. In strict mode it throws here, BEFORE any status write.
+    // When the lazy trust-path auto-attested above, gateContentOverride carries
+    // the attested metadata so this gate sees 'attested' and is a no-op.
+    if (desiredRegistryStatus === RegistryRecordStatusValues.APPROVED) {
+      await enforceImportActivationGate(
+        registryService,
+        input.agentId,
+        gateContentOverride ?? existing.customDescriptorContent ?? undefined,
+      );
+    }
+
+    // Activation (-> APPROVED) must go through SubmitRegistryRecordForApproval,
+    // never a direct UpdateRegistryRecordStatus(APPROVED) — the AWS registry
+    // rejects DRAFT -> APPROVED (finding adde5b79). DRAFT submits directly.
+    // Decision 3d5843e9 (finding 462c17ad): a REJECTED record can no longer
+    // be resubmitted via the removed REJECTED -> DRAFT step added in #182 —
+    // UpdateRegistryRecordStatus rejects DRAFT as a target outright, so that
+    // step always failed at the registry call. Fail closed with a structured
+    // error instead. APPROVED is already active and is a no-op handled by
+    // the outer `desiredRegistryStatus !== existing.status` guard above.
+    // Every other transition (e.g. -> DEPRECATED) is unaffected and keeps
+    // using updateResourceStatus directly.
+    if (desiredRegistryStatus === RegistryRecordStatusValues.APPROVED) {
+      if (existing.status === RegistryRecordStatusValues.REJECTED) {
+        throw new Error(
+          "ValidationError: Rejected records cannot be resubmitted; create a new record",
+        );
+      }
+      await registryService.submitForApproval(input.agentId);
+    } else {
+      // Route through the validated-transition gate: pass existing.status as
+      // currentStatus so registry-service.updateResourceStatus enforces
+      // REGISTRY_TRANSITIONS (decision 3d5843e9) instead of silently
+      // coercing an unvalidated transition. The only non-APPROVED target
+      // reachable here is DEPRECATED (deprecate intent, state:"maintenance"
+      // — see toRegistryStatus); 'inactive' is rejected above before this
+      // block is ever reached.
+      await registryService.updateResourceStatus(
+        "agent",
+        input.agentId,
+        desiredRegistryStatus,
+        undefined,
+        existing.status,
+      );
+    }
+
+    // Status transition succeeded — now write metadata, then re-fetch so the
+    // returned state reflects the post-transition record.
+    //
+    // Exception: after submitForApproval (APPROVED path) with NO content fields
+    // in the input AND no governance attestation to persist, skip the
+    // UpdateRegistryRecord. The registry treats any content write as an edit
+    // and demotes PENDING_APPROVAL → DRAFT, defeating the submit. Non-submit
+    // transitions (e.g. DEPRECATED via updateResourceStatus) are safe because
+    // those statuses are not demoted by a content write.
+    const wasSubmit =
+      desiredRegistryStatus === RegistryRecordStatusValues.APPROVED;
+    const hasContentFields =
+      input.config !== undefined ||
+      input.categories !== undefined ||
+      input.icon !== undefined ||
+      input.appId !== undefined ||
+      input.tags !== undefined;
+    const hasPendingAttestation = importAttestationToPersist !== undefined;
+
+    if (!wasSubmit || hasContentFields || hasPendingAttestation) {
+      const record = await registryService.updateResource(
+        "agent",
+        input.agentId,
+        {
+          name: (parsedNewConfig.name as string | undefined) || existing.name,
+          description: newConfig,
+          customMetadata: updatedMeta,
+        },
+      );
+      const refreshed = await registryService.getResource(
+        "agent",
+        input.agentId,
+      );
+      return registryService.mapToAgentConfig(refreshed ?? record);
+    }
+
+    // Submit-only (no content, no attestation): re-fetch the post-submit
+    // record directly.
+    const refreshed = await registryService.getResource("agent", input.agentId);
+    return registryService.mapToAgentConfig(refreshed ?? existing);
+  }
+
+  const record = await registryService.updateResource("agent", input.agentId, {
+    name: (parsedNewConfig.name as string | undefined) || existing.name,
+    description: newConfig,
+    customMetadata: updatedMeta,
+  });
+
+  // updateResource now returns the settled status (decision b9910580): GA
+  // demotes APPROVED/REJECTED -> DRAFT on any content edit. Surface this
+  // loss via a log line rather than hiding it or auto-resubmitting — the
+  // GraphQL AgentConfig type has no message/warnings field to carry it, so
+  // registryStatus (already returned below) is the client-visible signal.
+  // Compared against the raw string values (not the RegistryRecordStatusValues
+  // import) so this check degrades gracefully in tests that stub the module
+  // without the enum.
+  if (
+    (existing.status === "APPROVED" || existing.status === "REJECTED") &&
+    record.status === "DRAFT"
+  ) {
+    console.info(
+      "approval invalidated by content edit",
+      JSON.stringify({
+        agentId: input.agentId,
+        from: existing.status,
+        to: record.status,
+      }),
+    );
+  }
+
+  return registryService.mapToAgentConfig(record);
+}
+
+/**
+ * Registry-backed delete: deletes the resource from the Registry.
+ * Returns success/failure object matching the existing shape.
+ *
+ * Fetch-then-verify, fail-closed (finding 1fcfd11e): loads the target record
+ * and reconciles its `customMetadata.orgId` against the caller's org via
+ * `assertRowOrg` (admin bypass) BEFORE any delete — mirrors
+ * `assertAgentCodeAccess` in agent-code-resolver.ts. Additionally requires
+ * `isAdminFromEvent || hasRoleFromEvent(event, REQUIRED_WRITE_ROLE)` (decision
+ * 31ee5b5d), checked only after the org gate passes so a cross-org caller
+ * never learns whether they merely lack the role. A record not found in the
+ * Registry is treated as a normal delete failure (no gate to run).
+ */
+export async function deleteAgentConfigRegistry(
+  agentId: string,
+  event?: OrgScopedEvent,
+): Promise<{ success: boolean; message?: string }> {
+  const registryService = getRegistryService();
+  try {
+    const existing = await registryService.getResource("agent", agentId);
+    if (!existing) {
+      return {
+        success: false,
+        message: `Failed to delete agent config: Agent config not found: ${agentId}`,
+      };
+    }
+
+    const mapped = registryService.mapToAgentConfig(existing);
+    await assertRowOrg(mapped, event);
+
+    if (
+      !isAdminFromEvent(event) &&
+      !hasRoleFromEvent(event, REQUIRED_WRITE_ROLE)
+    ) {
+      throw new Error(
+        `Access denied: requires ${REQUIRED_WRITE_ROLE} role to delete agent ${agentId}`,
+      );
+    }
+
+    await registryService.deleteResource("agent", agentId);
+    return {
+      success: true,
+      message: `Agent config ${agentId} deleted successfully`,
+    };
+  } catch (error) {
+    console.error("Error deleting agent config from Registry:", error);
+    return {
+      success: false,
+      message: `Failed to delete agent config: ${error}`,
+    };
+  }
+}
+
+/**
+ * Registry-backed manifest publish: validates the manifest, fetches the
+ * existing record, updates custom metadata with the new manifest, and
+ * calls updateResource. Returns the mapped AgentConfig.
+ *
+ * Fetch-then-verify, fail-closed (finding 1fcfd11e): the existing record is
+ * reconciled against the caller's org via `assertRowOrg` (admin bypass)
+ * BEFORE any mutation — mirrors `assertAgentCodeAccess` in
+ * agent-code-resolver.ts. Additionally requires `isAdminFromEvent ||
+ * hasRoleFromEvent(event, REQUIRED_WRITE_ROLE)` (decision 31ee5b5d), checked
+ * only after the org gate passes.
+ */
+export async function publishAgentManifestRegistry(
+  agentId: string,
+  manifestStr: string,
+  event?: OrgScopedEvent,
+): Promise<AgentConfig> {
+  // Parse the AWSJSON manifest string
+  let manifest: RawAgentManifest;
+  try {
+    manifest = JSON.parse(manifestStr);
+  } catch {
+    throw new Error("Invalid manifest JSON: unable to parse");
+  }
+
+  // Validate required fields
+  const validation = validateManifest(manifest);
+  if (!validation.valid) {
+    throw new Error(
+      `Manifest validation failed: ${validation.errors.join("; ")}`,
+    );
+  }
+
+  const registryService = getRegistryService();
+
+  // Verify agent exists in Registry
+  const existing = await registryService.getResource("agent", agentId);
+  if (!existing) {
+    throw new Error(`Agent config not found: ${agentId}`);
+  }
+
+  // Tenancy + role gate BEFORE any mutation (finding 1fcfd11e).
+  const mapped = registryService.mapToAgentConfig(existing);
+  await assertRowOrg(mapped, event);
+  if (
+    !isAdminFromEvent(event) &&
+    !hasRoleFromEvent(event, REQUIRED_WRITE_ROLE)
+  ) {
+    throw new Error(
+      `Access denied: requires ${REQUIRED_WRITE_ROLE} role to publish manifest for agent ${agentId}`,
+    );
+  }
+
+  // Deserialize existing custom metadata and merge in the new manifest
+  const existingMeta = registryService.deserializeCustomMetadata<{
+    categories: string[];
+    icon: string;
+    state: string;
+    appId?: string;
+    manifest?: Record<string, unknown>;
+    orgId?: string;
+    tags?: Record<string, string>;
+  }>(existing.customDescriptorContent ?? null, {
+    categories: [],
+    icon: "",
+    state: "active",
+    appId: undefined,
+    manifest: undefined,
+    orgId: undefined,
+    tags: undefined,
+  });
+
+  const updatedMeta = registryService.serializeCustomMetadata({
+    ...existingMeta,
+    manifest,
+  } as AgentCustomMetadata);
+
+  const record = await registryService.updateResource("agent", agentId, {
+    name: existing.name,
+    description: existing.description,
+    customMetadata: updatedMeta,
+  });
+
+  return registryService.mapToAgentConfig(record);
+}
+
+/**
+ * Admin-only pending-approvals queue. Global admin model — no org filtering
+ * (finding 59e5a79c: pending-approval visibility is intentionally
+ * cross-org for platform administrators).
+ */
+export async function listPendingApprovalsHandler(
+  event: AgentConfigResolverEvent,
+): Promise<{ items: unknown[]; nextToken?: string }> {
+  if (!isAdminFromEvent(event)) {
+    throw new Error("Unauthorized: admin role required");
+  }
+  const registryService = getRegistryService();
+  const opts: ListPendingApprovalsOptions = {};
+  if (event.arguments.limit != null) {
+    opts.limit = event.arguments.limit as number;
+  }
+  if (event.arguments.nextToken != null) {
+    opts.nextToken = event.arguments.nextToken as string;
+  }
+  const result = await registryService.listPendingApprovals(opts);
+  return { items: result.items, nextToken: result.nextToken };
+}
+
+/**
+ * Searches for agent configs via Registry semantic search.
+ * Returns results mapped to the AgentConfig GraphQL type, filtered to the
+ * caller's organization (admin sees all) — exactly as
+ * `listAgentConfigsRegistry` filters results (finding 1fcfd11e: this search
+ * path previously returned unfiltered cross-org results). A non-admin caller
+ * with no resolvable org gets an empty list and the search is skipped
+ * entirely, mirroring `listAgentConfigsRegistry`'s no-org short-circuit.
+ */
+export async function searchAgentConfigsRegistry(
+  query: string,
+  event?: OrgScopedEvent,
+): Promise<AgentConfig[]> {
+  const callerOrgId =
+    event !== undefined ? await extractOrgFromEvent(event) : null;
+  const admin = event !== undefined ? isAdminFromEvent(event) : false;
+
+  if (!admin && !callerOrgId) {
+    console.warn(
+      "searchAgentConfigsRegistry: no caller orgId and not admin; returning empty list",
+    );
+    return [];
+  }
+
+  const viewer =
+    event !== undefined
+      ? await viewerFromEvent(event)
+      : { isAdmin: false, roles: [], orgId: null, userId: null };
+
+  const registryService = getRegistryService();
+  const records = await registryService.searchResources("agent", query);
+  const configs = records.map((record) =>
+    registryService.mapToAgentConfig(record),
+  );
+  return configs.filter((a) => {
+    if (!admin && a.orgId !== callerOrgId && a.orgId !== "") return false;
+    return isRecordVisible(viewer, {
+      status: a.registryStatus ?? undefined,
+      orgId: a.orgId,
+      createdBy: a.createdBy,
+    });
+  });
+}
+
+/** Result of a bulk activation, grouped by per-agent outcome. */
+export interface ActivateAgentsResult {
+  activated: string[];
+  failed: string[];
+  alreadyActive: string[];
+}
+
+/**
+ * Parses a Registry record's customDescriptorContent JSON and returns its
+ * `sourceProjectId` when present. Malformed/missing metadata yields
+ * `undefined` rather than throwing — a single bad record must not abort the
+ * whole bulk operation.
+ */
+function extractSourceProjectId(
+  customDescriptorContent: string | undefined,
+): string | undefined {
+  if (!customDescriptorContent) return undefined;
+  try {
+    const parsed = JSON.parse(customDescriptorContent);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.sourceProjectId === "string"
+    ) {
+      return parsed.sourceProjectId;
+    }
+  } catch {
+    // Malformed metadata — treat as "no project" and skip.
+  }
+  return undefined;
+}
+
+/**
+ * Lists the Registry agent records fabricated for a project/session:
+ * records whose customDescriptorContent carries
+ * `sourceProjectId === projectId`. This is THE canonical fabricated-agent
+ * match — activation (below) and the intake resolver's app-binding path
+ * (intakeCreateApp) both rely on it, so the two can never diverge.
+ */
+export async function findProjectAgentRecords(
+  projectId: string,
+): Promise<RegistryRecord[]> {
+  const registryService = getRegistryService();
+  const records = await registryService.listResources("agent");
+  return records.filter(
+    (record) =>
+      extractSourceProjectId(record.customDescriptorContent) === projectId,
+  );
+}
+
+/**
+ * Activates every fabricated agent belonging to a project in one operation.
+ *
+ * Fabricated agents carry their originating `sourceProjectId` inside the
+ * Registry record's customDescriptorContent JSON. We list all agent records,
+ * select those matching `projectId`, and submit each non-active one for
+ * approval (APPROVED == active via toInternalState). Already-active agents
+ * (status APPROVED) are reported separately and skipped.
+ *
+ * Per-agent failures are swallowed and collected so one bad agent never
+ * aborts activation of the rest; the whole operation never throws on a
+ * single-agent error. Logs are kept free of record metadata (which can
+ * carry org-scoped fields) — only the agent name and error message are
+ * logged.
+ */
+export async function activateProjectAgents(
+  projectId: string,
+): Promise<ActivateAgentsResult> {
+  const registryService = getRegistryService();
+  const result: ActivateAgentsResult = {
+    activated: [],
+    failed: [],
+    alreadyActive: [],
+  };
+
+  const records = await findProjectAgentRecords(projectId);
+  for (const record of records) {
+    const name = record.name || record.recordId;
+
+    if (record.status === RegistryRecordStatusValues.APPROVED) {
+      result.alreadyActive.push(name);
+      continue;
+    }
+
+    try {
+      // Governance activation gate (US-IMP): strict-blocks imported, unattested
+      // agents BEFORE the status write. The throw is caught below so a blocked
+      // agent lands in `failed` without aborting activation of the rest of the
+      // batch; shadow/permissive emits telemetry and proceeds as before.
+      await enforceImportActivationGate(
+        registryService,
+        record.recordId,
+        record.customDescriptorContent ?? undefined,
+      );
+      // Activation must go through SubmitRegistryRecordForApproval, never a
+      // direct UpdateRegistryRecordStatus(APPROVED) — the AWS registry
+      // rejects DRAFT -> APPROVED (finding adde5b79). Decision 3d5843e9
+      // (finding 462c17ad): the REJECTED -> DRAFT resubmit step added in
+      // #182 is removed — UpdateRegistryRecordStatus rejects DRAFT as a
+      // target outright, so that step always failed at the registry call.
+      // Fail this record into `failed` with a structured, actionable reason
+      // instead of attempting the doomed resubmit.
+      if (record.status === RegistryRecordStatusValues.REJECTED) {
+        throw new Error(
+          "ValidationError: Rejected records cannot be resubmitted; create a new record",
+        );
+      }
+      await registryService.submitForApproval(record.recordId);
+      result.activated.push(name);
+    } catch (err) {
+      console.error(
+        `Failed to activate agent "${name}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+      result.failed.push(name);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Safely convert a DynamoDB item's `config` value to a JSON string suitable
+ * for the GraphQL AWSJSON scalar.  Handles:
+ *  - string values (already serialised) — returned as-is
+ *  - object/array values — JSON.stringify'd
+ *  - null / undefined / missing — returns "{}" and warns once per item
+ */
+function toAwsJsonConfig(value: unknown, agentId?: string): string {
+  if (typeof value === "string") return value;
+  if (value != null && typeof value === "object") return JSON.stringify(value);
+  console.warn(
+    `toAwsJsonConfig: missing or null config for agent "${agentId ?? "unknown"}", defaulting to "{}"`,
+  );
+  return "{}";
+}
+
+async function listAgentConfigs(): Promise<AgentConfig[]> {
+  const result = await docClient.send(
+    new ScanCommand({
+      TableName: AGENT_CONFIG_TABLE,
+    }),
+  );
+
+  return (result.Items || []).map((item) => ({
+    agentId: item.agentId,
+    name: typeof item.name === "string" ? item.name : undefined,
+    orgId: item.orgId || "",
+    config: toAwsJsonConfig(item.config, item.agentId),
+    state: item.state || "active",
+    categories: item.categories || [],
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    // Surface registry back-pointer so the merge step can detect cache
+    // rows that mirror a registry record (set by syncNameKeyedRow).
+    registryRecordId:
+      typeof item.registryRecordId === "string"
+        ? item.registryRecordId
+        : undefined,
+    registryStatus:
+      typeof item.registryStatus === "string" ? item.registryStatus : undefined,
+  }));
+}
+
+async function getAgentConfig(agentId: string): Promise<AgentConfig | null> {
+  const result = await docClient.send(
+    new GetCommand({
+      TableName: AGENT_CONFIG_TABLE,
+      Key: { agentId },
+    }),
+  );
+
+  if (!result.Item) {
+    return null;
+  }
+
+  return {
+    agentId: result.Item.agentId,
+    orgId: result.Item.orgId || "",
+    config: toAwsJsonConfig(result.Item.config, result.Item.agentId),
+    state: result.Item.state || "active",
+    categories: result.Item.categories || [],
+    createdAt: result.Item.createdAt,
+    updatedAt: result.Item.updatedAt,
+  };
+}
+
+async function createAgentConfig(
+  input: AgentConfigMutationInput,
+): Promise<AgentConfig> {
+  const now = new Date().toISOString();
+  const config = parseConfigOrThrow(input.config) ?? {};
+
+  const agentConfig: AgentConfig = {
+    agentId: input.agentId,
+    orgId: "",
+    config,
+    state: input.state || "active",
+    categories: input.categories || [],
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await docClient.send(
+    new PutCommand({
+      TableName: AGENT_CONFIG_TABLE,
+      Item: agentConfig,
+    }),
+  );
+
+  return {
+    ...agentConfig,
+    config: JSON.stringify(config),
+  };
+}
+
+async function updateAgentConfig(
+  input: AgentConfigMutationInput,
+): Promise<AgentConfig> {
+  const existing = await getAgentConfig(input.agentId);
+  if (!existing) {
+    throw new Error(`Agent config not found: ${input.agentId}`);
+  }
+
+  const now = new Date().toISOString();
+  // Defensive: legacy DynamoDB rows may have non-JSON `config` strings.
+  const existingConfig = (() => {
+    if (typeof existing.config !== "string") return existing.config ?? {};
+    try {
+      return JSON.parse(existing.config);
+    } catch {
+      return {};
+    }
+  })();
+  const newConfig = input.config
+    ? parseConfigOrThrow(input.config)
+    : existingConfig;
+
+  // D-02: Optimistic locking — increment version and use conditional write
+  const currentVersion =
+    (existing as AgentConfig & { version?: number }).version || 0;
+  const nextVersion = currentVersion + 1;
+
+  const updatedConfig: AgentConfig = {
+    agentId: input.agentId,
+    orgId: existing.orgId || "",
+    config: newConfig,
+    state: input.state || existing.state,
+    categories:
+      input.categories !== undefined ? input.categories : existing.categories,
+    createdAt: existing.createdAt,
+    updatedAt: now,
+  };
+
+  try {
+    await docClient.send(
+      new PutCommand({
+        TableName: AGENT_CONFIG_TABLE,
+        Item: { ...updatedConfig, version: nextVersion },
+        ConditionExpression:
+          currentVersion === 0
+            ? "attribute_not_exists(version) OR version = :currentVersion"
+            : "version = :currentVersion",
+        ExpressionAttributeValues: {
+          ":currentVersion": currentVersion,
+        },
+      }),
+    );
+  } catch (error: unknown) {
+    if (
+      error instanceof Error &&
+      error.name === "ConditionalCheckFailedException"
+    ) {
+      throw new Error(
+        `Conflict: agent config ${input.agentId} was modified concurrently. Please retry.`,
+      );
+    }
+    throw error;
+  }
+
+  return {
+    ...updatedConfig,
+    config: JSON.stringify(newConfig),
+  };
+}
+
+async function deleteAgentConfig(
+  agentId: string,
+): Promise<{ success: boolean; message?: string }> {
+  try {
+    await docClient.send(
+      new DeleteCommand({
+        TableName: AGENT_CONFIG_TABLE,
+        Key: { agentId },
+      }),
+    );
+
+    return {
+      success: true,
+      message: `Agent config ${agentId} deleted successfully`,
+    };
+  } catch (error) {
+    console.error("Error deleting agent config:", error);
+    return {
+      success: false,
+      message: `Failed to delete agent config: ${error}`,
+    };
+  }
+}
+
+// ─── Manifest Validation ─────────────────────────────────────
+
+export function validateManifest(manifest: RawAgentManifest): {
+  valid: boolean;
+  errors: string[];
+} {
+  const errors: string[] = [];
+
+  if (typeof manifest.name !== "string" || manifest.name.trim() === "") {
+    errors.push("name is required and must be a non-empty string");
+  }
+  if (
+    typeof manifest.description !== "string" ||
+    manifest.description.trim() === ""
+  ) {
+    errors.push("description is required and must be a non-empty string");
+  }
+  if (typeof manifest.version !== "string" || manifest.version.trim() === "") {
+    errors.push("version is required and must be a non-empty string");
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+// ─── Import Descriptor Validation (US-IMP-001) ───────────────
+
+/**
+ * The nine invocation protocols recognised by the import pipeline. Typed as
+ * AgentInvocationProtocol[] so every entry must be a valid protocol and the
+ * list stays in lock-step with the union in registry-service.ts.
+ */
+const IMPORT_INVOCATION_PROTOCOLS: readonly AgentInvocationProtocol[] = [
+  "AGENTCORE_RUNTIME",
+  "BEDROCK_AGENT",
+  "LAMBDA_INVOKE",
+  "HTTP_ENDPOINT",
+  "MCP",
+  "A2A",
+  "STEP_FUNCTIONS",
+  "SAGEMAKER_ENDPOINT",
+  "SQS_ASYNC",
+];
+
+/** Narrowing helper: true when `value` is a non-null, non-array object. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validates the invocation + origin blocks of an agent import descriptor
+ * (US-IMP-001). Sits beside validateManifest and follows the same
+ * `{ valid, errors }` contract.
+ *
+ * Requires:
+ *   - `invocation.protocol` is one of the nine AgentInvocationProtocol values
+ *   - `invocation.target` is a non-empty string
+ *   - `origin.ownership === 'external'`
+ *
+ * Each missing/invalid field contributes a specific, field-naming error so
+ * callers (and the UI) can pinpoint exactly what is wrong. Accepts `unknown`
+ * and narrows internally — never throws on malformed input.
+ */
+export function validateImportDescriptor(descriptor: unknown): {
+  valid: boolean;
+  errors: string[];
+} {
+  const errors: string[] = [];
+
+  const root = isPlainObject(descriptor) ? descriptor : {};
+  const invocation = isPlainObject(root.invocation)
+    ? root.invocation
+    : undefined;
+  const origin = isPlainObject(root.origin) ? root.origin : undefined;
+
+  const protocol = invocation?.protocol;
+  if (
+    typeof protocol !== "string" ||
+    !IMPORT_INVOCATION_PROTOCOLS.includes(protocol as AgentInvocationProtocol)
+  ) {
+    errors.push(
+      `invocation.protocol is required and must be one of: ${IMPORT_INVOCATION_PROTOCOLS.join(", ")}`,
+    );
+  }
+
+  const target = invocation?.target;
+  if (typeof target !== "string" || target.trim() === "") {
+    errors.push("invocation.target is required and must be a non-empty string");
+  }
+
+  if (origin?.ownership !== "external") {
+    errors.push("origin.ownership is required and must be 'external'");
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+// ─── Publish Agent Manifest ──────────────────────────────────
+
+async function publishAgentManifest(
+  agentId: string,
+  manifestStr: string,
+): Promise<unknown> {
+  // Parse the AWSJSON manifest string
+  let manifest: RawAgentManifest;
+  try {
+    manifest = JSON.parse(manifestStr);
+  } catch {
+    throw new Error("Invalid manifest JSON: unable to parse");
+  }
+
+  // Validate required fields
+  const validation = validateManifest(manifest);
+  if (!validation.valid) {
+    throw new Error(
+      `Manifest validation failed: ${validation.errors.join("; ")}`,
+    );
+  }
+
+  // Verify agent exists
+  const existing = await docClient.send(
+    new GetCommand({
+      TableName: AGENT_CONFIG_TABLE,
+      Key: { agentId },
+    }),
+  );
+
+  if (!existing.Item) {
+    throw new Error(`Agent config not found: ${agentId}`);
+  }
+
+  // Store manifest in agent config item
+  const now = new Date().toISOString();
+  const result = await docClient.send(
+    new UpdateCommand({
+      TableName: AGENT_CONFIG_TABLE,
+      Key: { agentId },
+      UpdateExpression: "SET #manifest = :manifest, #updatedAt = :updatedAt",
+      ExpressionAttributeNames: {
+        "#manifest": "manifest",
+        "#updatedAt": "updatedAt",
+      },
+      ExpressionAttributeValues: {
+        ":manifest": manifest,
+        ":updatedAt": now,
+      },
+      ReturnValues: "ALL_NEW",
+    }),
+  );
+
+  const item = result.Attributes!;
+  return {
+    agentId: item.agentId,
+    orgId: item.orgId || "",
+    config: toAwsJsonConfig(item.config, item.agentId),
+    state: item.state || "active",
+    categories: item.categories || [],
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    manifest: item.manifest,
+  };
+}

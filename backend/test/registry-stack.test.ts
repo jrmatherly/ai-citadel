@@ -1,0 +1,948 @@
+/**
+ * RegistryStack — backend-stack-split phase 2 (decision 30e6d067).
+ *
+ * Asserts:
+ * - the satellite's resolver count (39, matching the move manifest)
+ * - JWT-free: satellites don't own auth — RegistryStack must not define any
+ *   Cognito UserPool/Client/authorizer resources (BackendStack owns auth;
+ *   this satellite only consumes the pool ARN for AdminGetUser).
+ * - the SECURITY DISSENT VERBATIM CLAUSE: agent-import's Secrets Manager +
+ *   STS statements are byte-identical (action set + resource set) to the
+ *   pre-split baseline, not merely a subset.
+ * - role least-privilege spot checks.
+ * - cdk-nag suppression parity: the policy shapes match the categories
+ *   bin/app.ts's shared appLambdaSuppressions block covers (no new
+ *   suppression categories introduced by this satellite, aside from the one
+ *   documented CodeBucket-prefix suppression in bin/app.ts).
+ */
+import * as cdk from "aws-cdk-lib";
+import { Template, Match } from "aws-cdk-lib/assertions";
+import * as appsync from "aws-cdk-lib/aws-appsync";
+import * as cognito from "aws-cdk-lib/aws-cognito";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+import * as events from "aws-cdk-lib/aws-events";
+import * as path from "path";
+import { readFileSync } from "fs";
+import { scaffoldBackendAssetDirs } from "./helpers/scaffold-stub-assets";
+import {
+  expectNoRegistryExportImports,
+  expectRegistryGenerationBesideRegistryId,
+  registrySsmParamLogicalIds,
+  TemplateJson,
+} from "./helpers/registry-ssm";
+import { assertSharedAsyncDlqShape } from "./helpers/shared-dlq-shape";
+
+scaffoldBackendAssetDirs(["dist/lambda", "src/schema"]);
+
+import { RegistryStack } from "../lib/registry-stack";
+
+// Minimal shapes for the raw CloudFormation JSON returned by
+// Template.findResources()/findResources() — aws-cdk-lib/assertions does
+// not export types for this synthesized template JSON, so we model just
+// the fields these tests actually read.
+interface CfnIamStatement {
+  Action: string | string[];
+  Resource?: unknown;
+  [key: string]: unknown;
+}
+
+interface CfnIamPolicyResource {
+  Properties?: {
+    Roles?: Array<{ Ref?: string }>;
+    PolicyDocument?: {
+      Statement?: CfnIamStatement[];
+    };
+  };
+}
+
+interface CfnLambdaFunctionResource {
+  Properties?: {
+    Handler?: string;
+    FunctionName?: string;
+    Role?: { "Fn::GetAtt"?: [string, string] };
+    Environment?: {
+      Variables?: Record<string, unknown>;
+    };
+  };
+}
+
+interface CfnIamRoleResource {
+  Properties?: {
+    ManagedPolicyArns?: unknown[];
+  };
+}
+
+function createFixture(app: cdk.App) {
+  const backendStack = new cdk.Stack(app, "MockBackendStack", {
+    env: { account: "123456789012", region: "us-east-1" },
+  });
+
+  const agentEventBus = new events.EventBus(backendStack, "AgentEventBus", {
+    eventBusName: "citadel-agents-test",
+  });
+
+  const appSyncApi = new appsync.GraphqlApi(backendStack, "MockApi", {
+    name: "mock-api",
+    schema: appsync.SchemaFile.fromAsset(
+      path.resolve(__dirname, "../src/schema/schema.graphql"),
+    ),
+  });
+
+  const appsTable = new dynamodb.Table(backendStack, "AppsTable", {
+    tableName: "citadel-apps-test",
+    partitionKey: { name: "appId", type: dynamodb.AttributeType.STRING },
+    billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+  });
+
+  const workflowsTable = new dynamodb.Table(backendStack, "WorkflowsTable", {
+    tableName: "citadel-workflows-test",
+    partitionKey: {
+      name: "workflowId",
+      type: dynamodb.AttributeType.STRING,
+    },
+    billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+  });
+
+  const agentConfigTable = new dynamodb.Table(
+    backendStack,
+    "AgentConfigTable",
+    {
+      tableName: "citadel-agents-test",
+      partitionKey: { name: "agentId", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  const modelCatalogTable = new dynamodb.Table(
+    backendStack,
+    "ModelCatalogTable",
+    {
+      tableName: "citadel-model-catalog-test",
+      partitionKey: { name: "modelId", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  const idempotencyTable = new dynamodb.Table(
+    backendStack,
+    "IdempotencyTable",
+    {
+      tableName: "citadel-idempotency-test",
+      partitionKey: { name: "eventId", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  const adrsTable = new dynamodb.Table(backendStack, "AdrsTable", {
+    tableName: "citadel-adrs-test",
+    partitionKey: { name: "adrId", type: dynamodb.AttributeType.STRING },
+    billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+  });
+
+  const organisationTable = new dynamodb.Table(
+    backendStack,
+    "OrganisationTable",
+    {
+      tableName: "citadel-organisations-test",
+      partitionKey: { name: "orgId", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  const userPool = new cognito.UserPool(backendStack, "UserPool", {
+    userPoolName: "citadel-test-pool",
+  });
+
+  return {
+    appSyncApi,
+    agentEventBus,
+    appsTable,
+    workflowsTable,
+    agentConfigTable,
+    modelCatalogTable,
+    idempotencyTable,
+    adrsTable,
+    organisationTable,
+    userPool,
+  };
+}
+
+function createTestStack(): { stack: RegistryStack; template: Template } {
+  const app = new cdk.App();
+  const fixture = createFixture(app);
+
+  const stack = new RegistryStack(app, "TestRegistryStack", {
+    env: { account: "123456789012", region: "us-east-1" },
+    environment: "test",
+    ...fixture,
+  });
+
+  const template = Template.fromStack(stack);
+  return { stack, template };
+}
+
+describe("RegistryStack — backend-stack-split phase 2", () => {
+  let template: Template;
+
+  beforeAll(() => {
+    ({ template } = createTestStack());
+  });
+
+  // --- Resolver count ---
+  test("defines exactly 40 AppSync resolvers (matching the move manifest + wave-2a OnFabricationEventSubscriptionAuthorizerResolver, finding 87a171ad)", () => {
+    const resolvers = template.findResources("AWS::AppSync::Resolver");
+    expect(Object.keys(resolvers)).toHaveLength(40);
+  });
+
+  test("defines exactly 7 AppSync Lambda data sources", () => {
+    const dataSources = template.findResources("AWS::AppSync::DataSource", {
+      Properties: Match.objectLike({ Type: "AWS_LAMBDA" }),
+    });
+    expect(Object.keys(dataSources)).toHaveLength(7);
+  });
+
+  const expectedFields: Array<[string, string]> = [
+    ["Mutation", "importAgent"],
+    ["Mutation", "attestAgentImport"],
+    ["Query", "discoverAgents"],
+    ["Query", "describeAgentCandidate"],
+    ["Mutation", "testImportedAgent"],
+    ["Mutation", "probeAgentCandidate"],
+    ["Mutation", "probeImportReachability"],
+    ["Mutation", "proposeAgentManifestTier3"],
+    ["Mutation", "acceptProposedManifestTier3"],
+    ["Mutation", "publishImportToGateway"],
+    ["Mutation", "unpublishImportFromGateway"],
+    ["Query", "getAgentCode"],
+    ["Mutation", "updateAgentCode"],
+    ["Mutation", "requestAgentCreation"],
+    ["Mutation", "requestToolCreation"],
+    ["Query", "getFabricatorQueue"],
+    ["Mutation", "publishFabricationEvent"],
+    ["Query", "getApp"],
+    ["Query", "listApps"],
+    ["Mutation", "createApp"],
+    ["Mutation", "updateApp"],
+    ["Mutation", "deleteApp"],
+    ["Mutation", "bindWorkflowToApp"],
+    ["Mutation", "unbindWorkflowFromApp"],
+    ["Mutation", "updateAgentBinding"],
+    ["Mutation", "addAppComponent"],
+    ["Mutation", "removeAppComponent"],
+    ["Mutation", "setAppConfigSchema"],
+    ["Mutation", "setAppConfigValues"],
+    ["Mutation", "publishAppStatusEvent"],
+    ["Mutation", "createAppApiKey"],
+    ["Mutation", "revokeAppApiKey"],
+    ["Mutation", "rotateAppApiKey"],
+    ["Query", "listAppApiKeys"],
+    ["Mutation", "setAppAuthConfig"],
+    ["Mutation", "grantAppAccess"],
+    ["Mutation", "revokeAppAccess"],
+    ["Query", "listAppAccessEntries"],
+    ["Query", "getAppMetrics"],
+  ];
+
+  test.each(expectedFields)(
+    "attaches a resolver for %s.%s",
+    (typeName, fieldName) => {
+      template.hasResourceProperties("AWS::AppSync::Resolver", {
+        TypeName: typeName,
+        FieldName: fieldName,
+      });
+    },
+  );
+
+  // --- JWT-free: satellites don't own auth ---
+  test("does not define any Cognito UserPool (auth stays in BackendStack)", () => {
+    const pools = template.findResources("AWS::Cognito::UserPool");
+    expect(Object.keys(pools)).toHaveLength(0);
+  });
+
+  test("does not define any Cognito UserPoolClient", () => {
+    const clients = template.findResources("AWS::Cognito::UserPoolClient");
+    expect(Object.keys(clients)).toHaveLength(0);
+  });
+
+  test("does not define any AppSync GraphQLApi (attaches to BackendStack's API, doesn't own one)", () => {
+    const apis = template.findResources("AWS::AppSync::GraphQLApi");
+    expect(Object.keys(apis)).toHaveLength(0);
+  });
+
+  test("does not create the AgentCoreRegistry custom resource (stays in BackendStack; threaded in as props)", () => {
+    const customResources = template.findResources(
+      "AWS::CloudFormation::CustomResource",
+    );
+    expect(Object.keys(customResources)).toHaveLength(0);
+  });
+
+  // --- SECURITY DISSENT VERBATIM CLAUSE ---
+  // agent-import's Secrets Manager + STS statements must be byte-identical
+  // (action set AND resource set) to the pre-split baseline — not merely a
+  // subset, which rail 6's subset-or-equal check alone would tolerate.
+  describe("agent-import Secrets Manager + STS verbatim equivalence", () => {
+    function agentImportPolicyStatements(): CfnIamStatement[] {
+      const fns = template.findResources("AWS::Lambda::Function", {
+        Properties: { Handler: "agent-import-resolver.handler" },
+      });
+      const fnLogicalId = Object.keys(fns)[0];
+      expect(fnLogicalId).toBeDefined();
+      const roleRef = (fns[fnLogicalId] as CfnLambdaFunctionResource).Properties
+        ?.Role?.["Fn::GetAtt"]?.[0];
+      expect(roleRef).toBeDefined();
+
+      const policies = template.findResources("AWS::IAM::Policy");
+      const attached = Object.values(policies).filter(
+        (p: CfnIamPolicyResource) =>
+          (p.Properties?.Roles ?? []).some((r) => r?.Ref === roleRef),
+      );
+      return attached.flatMap(
+        (p: CfnIamPolicyResource) =>
+          p.Properties?.PolicyDocument?.Statement ?? [],
+      );
+    }
+
+    test("has a WRITE-only secretsmanager statement with EXACTLY [CreateSecret, PutSecretValue, TagResource] on /citadel/agents/*", () => {
+      const statements = agentImportPolicyStatements();
+      const match = statements.find((s) => {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        return (
+          actions.includes("secretsmanager:CreateSecret") &&
+          actions.includes("secretsmanager:PutSecretValue")
+        );
+      });
+      expect(match).toBeDefined();
+      const actions = Array.isArray(match.Action)
+        ? match.Action
+        : [match.Action];
+      expect(new Set(actions)).toEqual(
+        new Set([
+          "secretsmanager:CreateSecret",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:TagResource",
+        ]),
+      );
+      const resourceStr = JSON.stringify(match.Resource);
+      expect(resourceStr).toContain("secret:/citadel/agents/*");
+    });
+
+    test("has a READ-only secretsmanager statement with EXACTLY [GetSecretValue] on /citadel/agents/* (separate from the write statement)", () => {
+      const statements = agentImportPolicyStatements();
+      const readMatches = statements.filter((s) => {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        return (
+          actions.length === 1 && actions[0] === "secretsmanager:GetSecretValue"
+        );
+      });
+      expect(readMatches.length).toBeGreaterThan(0);
+      for (const stmt of readMatches) {
+        const resourceStr = JSON.stringify(stmt.Resource);
+        expect(resourceStr).toContain("secret:/citadel/agents/*");
+      }
+    });
+
+    test("has an sts:AssumeRole statement with EXACTLY that one action, scoped to arn:aws:iam::*:role/* with Null sts:ExternalId condition (cross-account trust-path)", () => {
+      const statements = agentImportPolicyStatements();
+      const match = statements.find((s) => {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        return actions.length === 1 && actions[0] === "sts:AssumeRole";
+      });
+      expect(match).toBeDefined();
+      const resources = Array.isArray(match.Resource)
+        ? match.Resource
+        : [match.Resource];
+      expect(resources).toEqual(["arn:aws:iam::*:role/*"]);
+      // Defence-in-depth: IAM denies an assume without an ExternalId.
+      expect(match.Condition).toEqual({ Null: { "sts:ExternalId": "false" } });
+    });
+
+    test("no statement broadens sts:AssumeRole to a bare wildcard Resource::* (must stay role/* scoped)", () => {
+      const statements = agentImportPolicyStatements();
+      for (const stmt of statements) {
+        const actions = Array.isArray(stmt.Action)
+          ? stmt.Action
+          : [stmt.Action];
+        if (!actions.includes("sts:AssumeRole")) continue;
+        const resources = Array.isArray(stmt.Resource)
+          ? stmt.Resource
+          : [stmt.Resource];
+        expect(resources).not.toContain("*");
+      }
+    });
+
+    // Invoke-wildcard account-scope pin: targets are operator-supplied per
+    // import, unknowable at synth time; tracked for tag-based conditions
+    // once imports tag targets. These must NEVER broaden to bare '*'.
+    test("invoke grants (lambda, bedrock, bedrock-agentcore, execute-api) are account-scoped, never bare '*'", () => {
+      const statements = agentImportPolicyStatements();
+      const invokeActions = [
+        "lambda:InvokeFunction",
+        "bedrock:InvokeAgent",
+        "bedrock-agentcore:InvokeAgentRuntime",
+        "execute-api:Invoke",
+      ];
+      const invokeStmts = statements.filter((s) => {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        return actions.some((a) => invokeActions.includes(a));
+      });
+      expect(invokeStmts.length).toBeGreaterThan(0);
+      for (const stmt of invokeStmts) {
+        const resources = Array.isArray(stmt.Resource)
+          ? stmt.Resource
+          : [stmt.Resource];
+        for (const r of resources) {
+          const rStr = typeof r === "string" ? r : JSON.stringify(r);
+          // Must never be a bare wildcard.
+          expect(rStr).not.toBe("*");
+          // Every resource must be scoped to the deployment account
+          // (CDK resolves ${this.account} to the stack's literal account).
+          expect(rStr).toContain("123456789012");
+        }
+      }
+    });
+  });
+
+  // --- Role least-privilege spot checks ---
+  test("registry-agent-record-resolver's Cognito grant is scoped to the userPoolArn, not Resource::*", () => {
+    const policies = template.findResources("AWS::IAM::Policy", {
+      Properties: Match.objectLike({
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: "cognito-idp:AdminGetUser",
+            }),
+          ]),
+        },
+      }),
+    });
+    const matches = Object.values(policies);
+    expect(matches.length).toBeGreaterThan(0);
+    for (const policy of matches) {
+      const statements =
+        (policy as CfnIamPolicyResource).Properties?.PolicyDocument
+          ?.Statement ?? [];
+      const cognitoStmt = statements.find(
+        (s) => s.Action === "cognito-idp:AdminGetUser",
+      );
+      expect(cognitoStmt?.Resource).not.toBe("*");
+    }
+  });
+
+  test("registry-agent-record-resolver keeps its deterministic functionName (only moved fn that does)", () => {
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      Handler: "registry-agent-record-resolver.handler",
+      FunctionName: "citadel-registry-agent-record-resolver-test",
+    });
+  });
+
+  test("registry-agent-record-resolver role grants ssm:GetParameter on the governance enforcement parameters", () => {
+    const fns = template.findResources("AWS::Lambda::Function", {
+      Properties: Match.objectLike({
+        Handler: "registry-agent-record-resolver.handler",
+      }),
+    });
+    const fnIds = Object.keys(fns);
+    expect(fnIds.length).toBe(1);
+    const roleRef = (fns[fnIds[0]] as CfnLambdaFunctionResource).Properties
+      ?.Role?.["Fn::GetAtt"]?.[0];
+    expect(roleRef).toBeDefined();
+
+    const policies = template.findResources("AWS::IAM::Policy");
+    const matched = Object.values(policies).some((policy) => {
+      const rolesRef = JSON.stringify(
+        (policy as CfnIamPolicyResource).Properties?.Roles,
+      );
+      if (!rolesRef?.includes(roleRef)) return false;
+      const statements =
+        (policy as CfnIamPolicyResource).Properties?.PolicyDocument
+          ?.Statement ?? [];
+      return statements.some((stmt) => {
+        const actions = Array.isArray(stmt.Action)
+          ? stmt.Action
+          : [stmt.Action];
+        const resourceStr = JSON.stringify(stmt.Resource ?? "");
+        return (
+          actions.includes("ssm:GetParameter") &&
+          resourceStr.includes("parameter/citadel/governance/enforce/test") &&
+          resourceStr.includes("parameter/citadel/governance/effective_at/test")
+        );
+      });
+    });
+    expect(matched).toBe(true);
+  });
+
+  test("registry-agent-record-resolver role includes dynamodb:UpdateItem on the agents table (approval-cache write)", () => {
+    const fns = template.findResources("AWS::Lambda::Function", {
+      Properties: Match.objectLike({
+        Handler: "registry-agent-record-resolver.handler",
+      }),
+    });
+    const fnIds = Object.keys(fns);
+    expect(fnIds.length).toBe(1);
+    const roleRef = (fns[fnIds[0]] as CfnLambdaFunctionResource).Properties
+      ?.Role?.["Fn::GetAtt"]?.[0];
+    expect(roleRef).toBeDefined();
+
+    const policies = template.findResources("AWS::IAM::Policy");
+    const matched = Object.values(policies).some((policy) => {
+      const rolesRef = JSON.stringify(
+        (policy as CfnIamPolicyResource).Properties?.Roles,
+      );
+      if (!rolesRef?.includes(roleRef)) return false;
+      const statements =
+        (policy as CfnIamPolicyResource).Properties?.PolicyDocument
+          ?.Statement ?? [];
+      return statements.some((stmt) => {
+        const actions = Array.isArray(stmt.Action)
+          ? stmt.Action
+          : [stmt.Action];
+        const resourceStr = JSON.stringify(stmt.Resource ?? "");
+        return (
+          actions.includes("dynamodb:UpdateItem") &&
+          resourceStr.includes("AgentConfigTable")
+        );
+      });
+    });
+    expect(matched).toBe(true);
+  });
+
+  test("no other moved Lambda has functionName pinning (auto-named, invoked via in-stack grantInvoke)", () => {
+    const fns = template.findResources("AWS::Lambda::Function");
+    for (const [_logicalId, fn] of Object.entries(fns)) {
+      const handler = (fn as CfnLambdaFunctionResource).Properties?.Handler;
+      if (handler === "registry-agent-record-resolver.handler") continue;
+      expect(
+        (fn as CfnLambdaFunctionResource).Properties?.FunctionName,
+      ).toBeUndefined();
+    }
+  });
+
+  test("registry-agent-record-resolver's role has NO iam:CreateRole, iam:PutRolePolicy, or iam:PassRole statement (finding 7d7da47a: unused agent-role-provisioning grant removed)", () => {
+    const fns = template.findResources("AWS::Lambda::Function", {
+      Properties: Match.objectLike({
+        Handler: "registry-agent-record-resolver.handler",
+      }),
+    });
+    const fnIds = Object.keys(fns);
+    expect(fnIds.length).toBe(1);
+    const roleRef = JSON.stringify(
+      (fns[fnIds[0]] as CfnLambdaFunctionResource).Properties?.Role,
+    );
+    const roleLogicalIdMatch = roleRef.match(
+      /([A-Za-z0-9]+ServiceRole[A-Za-z0-9]+)/,
+    );
+    expect(roleLogicalIdMatch).not.toBeNull();
+    const roleLogicalId = roleLogicalIdMatch![1];
+
+    const policies = template.findResources("AWS::IAM::Policy");
+    const forbidden = ["iam:CreateRole", "iam:PutRolePolicy", "iam:PassRole"];
+    for (const policy of Object.values(policies)) {
+      const rolesRef = JSON.stringify(
+        (policy as CfnIamPolicyResource).Properties?.Roles,
+      );
+      if (!rolesRef.includes(roleLogicalId)) continue;
+      const statements = (policy as CfnIamPolicyResource).Properties
+        ?.PolicyDocument?.Statement;
+      if (!Array.isArray(statements)) continue;
+      for (const stmt of statements) {
+        const actions = Array.isArray(stmt.Action)
+          ? stmt.Action
+          : [stmt.Action];
+        for (const forbiddenAction of forbidden) {
+          expect(actions).not.toContain(forbiddenAction);
+        }
+      }
+    }
+  });
+
+  describe("RegistrySyncLambda tools-table grant parity (bug #199 — GA UpdateItem path)", () => {
+    function registrySyncRoleStatements(): CfnIamStatement[] {
+      const fns = template.findResources("AWS::Lambda::Function", {
+        Properties: { Handler: "registry-sync.handler" },
+      });
+      const fnLogicalId = Object.keys(fns)[0];
+      expect(fnLogicalId).toBeDefined();
+      const roleRef = (fns[fnLogicalId] as CfnLambdaFunctionResource).Properties
+        ?.Role?.["Fn::GetAtt"]?.[0];
+      expect(roleRef).toBeDefined();
+
+      const policies = template.findResources("AWS::IAM::Policy");
+      const statements: CfnIamStatement[] = [];
+      for (const policy of Object.values(policies)) {
+        const props = (policy as CfnIamPolicyResource).Properties;
+        const roles = props?.Roles ?? [];
+        const attachedToSyncRole = roles.some((r) => r.Ref === roleRef);
+        if (!attachedToSyncRole) continue;
+        const stmts = props?.PolicyDocument?.Statement;
+        if (Array.isArray(stmts)) statements.push(...stmts);
+      }
+      return statements;
+    }
+
+    // Resource entries take two shapes in this stack's synthesized template:
+    //   - the agents table (granted via `Table.grantReadWriteData`, a
+    //     cross-stack construct) resolves to `{ "Fn::ImportValue":
+    //     "...ExportsOutputFnGetAtt<LogicalId>Arn..." }`, not a literal ARN
+    //     string — so matching must also inspect Fn::ImportValue keys.
+    //   - the tools table (granted via a literal `addToRolePolicy`
+    //     PolicyStatement in this stack) resolves to a plain ARN string.
+    // `resourceMatches` recognizes both shapes via a substring test against
+    // either the raw string or the Fn::ImportValue's own string value.
+    function resourceMatches(resource: unknown, substring: string): boolean {
+      if (typeof resource === "string") return resource.includes(substring);
+      if (
+        resource !== null &&
+        typeof resource === "object" &&
+        "Fn::ImportValue" in (resource as Record<string, unknown>)
+      ) {
+        const importValue = (resource as Record<string, unknown>)[
+          "Fn::ImportValue"
+        ];
+        return (
+          typeof importValue === "string" && importValue.includes(substring)
+        );
+      }
+      return false;
+    }
+
+    function actionsForResourceSubstring(
+      statements: CfnIamStatement[],
+      substring: string,
+    ): Set<string> {
+      const actions = new Set<string>();
+      for (const stmt of statements) {
+        const resources = Array.isArray(stmt.Resource)
+          ? stmt.Resource
+          : [stmt.Resource];
+        const matches = resources.some((r) => resourceMatches(r, substring));
+        if (!matches) continue;
+        const stmtActions = Array.isArray(stmt.Action)
+          ? stmt.Action
+          : [stmt.Action];
+        for (const a of stmtActions) {
+          if (typeof a === "string") actions.add(a);
+        }
+      }
+      return actions;
+    }
+
+    test("sync role grants dynamodb:UpdateItem on BOTH the agents table and the tools table", () => {
+      const statements = registrySyncRoleStatements();
+
+      const agentActions = actionsForResourceSubstring(
+        statements,
+        "AgentConfigTable",
+      );
+      const toolActions = actionsForResourceSubstring(
+        statements,
+        "citadel-tools-test",
+      );
+
+      expect(agentActions).toContain("dynamodb:UpdateItem");
+      expect(toolActions).toContain("dynamodb:UpdateItem");
+    });
+
+    test("tools table grant is a superset of the agent table's Get/Put/Delete/Update action set", () => {
+      const statements = registrySyncRoleStatements();
+
+      const agentActions = actionsForResourceSubstring(
+        statements,
+        "AgentConfigTable",
+      );
+      const toolActions = actionsForResourceSubstring(
+        statements,
+        "citadel-tools-test",
+      );
+
+      for (const required of [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:UpdateItem",
+      ]) {
+        expect(agentActions).toContain(required);
+        expect(toolActions).toContain(required);
+      }
+    });
+
+    test("contract: every DynamoDB *Command class used in registry-sync.ts maps to a granted action on BOTH table ARNs", () => {
+      const handlerSrc = readFileSync(
+        path.join(__dirname, "..", "src", "lambda", "registry-sync.ts"),
+        "utf-8",
+      );
+
+      // Derive the set of AWS SDK DynamoDB command classes actually
+      // constructed in the handler (e.g. "new PutCommand(", "new
+      // UpdateCommand(") rather than hardcoding the list, so this test
+      // fails loudly if a future command type is added without a
+      // matching grant.
+      const commandMatches = handlerSrc.matchAll(/new (\w+Command)\(/g);
+      const commandNames = new Set<string>();
+      for (const m of commandMatches) commandNames.add(m[1]);
+      expect(commandNames.size).toBeGreaterThan(0);
+
+      const COMMAND_TO_ACTION: Record<string, string> = {
+        PutCommand: "dynamodb:PutItem",
+        DeleteCommand: "dynamodb:DeleteItem",
+        UpdateCommand: "dynamodb:UpdateItem",
+        GetCommand: "dynamodb:GetItem",
+      };
+
+      const requiredActions = new Set<string>();
+      for (const name of commandNames) {
+        const action = COMMAND_TO_ACTION[name];
+        // Non-DynamoDB commands (e.g. SendMessageCommand, PutMetricDataCommand)
+        // are not part of this contract — skip them.
+        if (action) requiredActions.add(action);
+      }
+      expect(requiredActions.size).toBeGreaterThan(0);
+
+      const statements = registrySyncRoleStatements();
+      const agentActions = actionsForResourceSubstring(
+        statements,
+        "AgentConfigTable",
+      );
+      const toolActions = actionsForResourceSubstring(
+        statements,
+        "citadel-tools-test",
+      );
+
+      for (const action of requiredActions) {
+        expect(agentActions).toContain(action);
+        expect(toolActions).toContain(action);
+      }
+    });
+  });
+
+  test("no IAM policy statement grants a full-service wildcard action (iam:*, dynamodb:*, or s3:*)", () => {
+    const policies = template.findResources("AWS::IAM::Policy");
+    for (const policy of Object.values(policies)) {
+      const statements = (policy as CfnIamPolicyResource).Properties
+        ?.PolicyDocument?.Statement;
+      if (!Array.isArray(statements)) continue;
+      for (const stmt of statements) {
+        const actions = Array.isArray(stmt.Action)
+          ? stmt.Action
+          : [stmt.Action];
+        for (const action of actions) {
+          if (typeof action !== "string") continue;
+          expect(["iam:*", "dynamodb:*", "s3:*"]).not.toContain(action);
+        }
+      }
+    }
+  });
+
+  // --- moved constructs present ---
+  test("defines exactly 9 Lambda functions (the moved set)", () => {
+    const fns = template.findResources("AWS::Lambda::Function");
+    expect(Object.keys(fns)).toHaveLength(9);
+  });
+
+  test("defines exactly 3 EventBridge rules (AgentImportManifestResult, RegistrySync, FabricationEvent)", () => {
+    const rules = template.findResources("AWS::Events::Rule");
+    expect(Object.keys(rules)).toHaveLength(3);
+  });
+
+  test("defines the RegistrySync dead-letter queue", () => {
+    const queues = template.findResources("AWS::SQS::Queue", {
+      Properties: Match.objectLike({
+        QueueName: "citadel-registry-sync-dlq-test",
+      }),
+    });
+    expect(Object.keys(queues)).toHaveLength(1);
+  });
+
+  describe("RegistrySync DLQ_URL wiring (sync-diag-2026-09-26)", () => {
+    function registrySyncFn(): CfnLambdaFunctionResource {
+      const fns = template.findResources("AWS::Lambda::Function", {
+        Properties: { Handler: "registry-sync.handler" },
+      });
+      const fnLogicalId = Object.keys(fns)[0];
+      expect(fnLogicalId).toBeDefined();
+      return fns[fnLogicalId] as CfnLambdaFunctionResource;
+    }
+
+    test("sets DLQ_URL on the sync Lambda, pointed at the existing RegistrySyncDLQ queue", () => {
+      const fn = registrySyncFn();
+      const envVars = fn.Properties?.Environment?.Variables ?? {};
+      expect(envVars.DLQ_URL).toBeDefined();
+
+      const queues = template.findResources("AWS::SQS::Queue", {
+        Properties: Match.objectLike({
+          QueueName: "citadel-registry-sync-dlq-test",
+        }),
+      });
+      const dlqLogicalId = Object.keys(queues)[0];
+      expect(envVars.DLQ_URL).toEqual({ Ref: dlqLogicalId });
+    });
+
+    test("the sync Lambda's role can send messages to the RegistrySync DLQ", () => {
+      const fn = registrySyncFn();
+      const roleRef = fn.Properties?.Role?.["Fn::GetAtt"]?.[0];
+      expect(roleRef).toBeDefined();
+
+      const policies = template.findResources("AWS::IAM::Policy");
+      const attached = Object.values(policies).filter(
+        (p: CfnIamPolicyResource) =>
+          (p.Properties?.Roles ?? []).some((r) => r?.Ref === roleRef),
+      );
+      const statements = attached.flatMap(
+        (p: CfnIamPolicyResource) =>
+          p.Properties?.PolicyDocument?.Statement ?? [],
+      );
+      const sendMessageStatements = statements.filter((s: CfnIamStatement) => {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        return actions.includes("sqs:SendMessage");
+      });
+      expect(sendMessageStatements.length).toBeGreaterThan(0);
+    });
+
+    test("the RegistrySync rule's EventPattern has no detailType filter, so GA record detail-types match without a CDK change", () => {
+      const rules = template.findResources("AWS::Events::Rule", {
+        Properties: Match.objectLike({
+          Name: "citadel-registry-sync-test",
+        }),
+      });
+      const ruleLogicalId = Object.keys(rules)[0];
+      expect(ruleLogicalId).toBeDefined();
+      const pattern = (
+        rules[ruleLogicalId] as {
+          Properties?: { EventPattern?: Record<string, unknown> };
+        }
+      ).Properties?.EventPattern;
+      expect(pattern?.source).toEqual(["aws.agent-registry"]);
+      expect(pattern?.["detail-type"]).toBeUndefined();
+      expect(pattern?.detailType).toBeUndefined();
+    });
+  });
+
+  // --- cdk-nag suppression parity ---
+  test("every Lambda execution role assumes lambda.amazonaws.com with a ManagedPolicyArns array (matches the app-level IAM4 suppression category)", () => {
+    const roles = template.findResources("AWS::IAM::Role", {
+      Properties: Match.objectLike({
+        AssumeRolePolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Principal: { Service: "lambda.amazonaws.com" },
+            }),
+          ]),
+        }),
+      }),
+    });
+    const lambdaRoles = Object.values(roles);
+    expect(lambdaRoles.length).toBeGreaterThan(0);
+    for (const role of lambdaRoles) {
+      const managedArns = (role as CfnIamRoleResource).Properties
+        ?.ManagedPolicyArns;
+      expect(Array.isArray(managedArns)).toBe(true);
+    }
+  });
+
+  test("every AppSync data source has its own appsync.amazonaws.com-assumable service role (L1 cross-stack pattern)", () => {
+    const roles = template.findResources("AWS::IAM::Role", {
+      Properties: Match.objectLike({
+        AssumeRolePolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Principal: { Service: "appsync.amazonaws.com" },
+            }),
+          ]),
+        }),
+      }),
+    });
+    // 7 data sources => 7 appsync-assumable roles.
+    expect(Object.keys(roles)).toHaveLength(7);
+  });
+
+  describe("agent-code-resolver org/role gate wiring (finding 1a9181a4)", () => {
+    function agentCodeResolverFn(): CfnLambdaFunctionResource {
+      const fns = template.findResources("AWS::Lambda::Function", {
+        Properties: { Handler: "agent-code-resolver.handler" },
+      });
+      const fnLogicalId = Object.keys(fns)[0];
+      expect(fnLogicalId).toBeDefined();
+      return fns[fnLogicalId] as CfnLambdaFunctionResource;
+    }
+
+    test("is wired with REGISTRY_ID, mirroring the publish handler's owner-gate wiring", () => {
+      const fn = agentCodeResolverFn();
+      const envVars = fn.Properties?.Environment?.Variables ?? {};
+      expect(envVars.REGISTRY_ID).toBeDefined();
+    });
+
+    test("REGISTRY_ID is SSM-resolved (finding 8b7ee8af) and accompanied by REGISTRY_GENERATION on every carrier", () => {
+      const json = template.toJSON() as TemplateJson;
+      const { idParam } = registrySsmParamLogicalIds(json, "test");
+      const fn = agentCodeResolverFn();
+      const envVars = fn.Properties?.Environment?.Variables ?? {};
+      expect(envVars.REGISTRY_ID).toEqual({ Ref: idParam });
+      expectRegistryGenerationBesideRegistryId(json);
+    });
+
+    test("the template does NOT import the backend registry exports (SSM is the only sharing channel)", () => {
+      expectNoRegistryExportImports(template.toJSON() as TemplateJson);
+    });
+
+    test("has a READ-ONLY agent-registry:GetRegistryRecord statement scoped to the registry ARN — no Create/Update/Delete", () => {
+      const fn = agentCodeResolverFn();
+      const roleRef = fn.Properties?.Role?.["Fn::GetAtt"]?.[0];
+      expect(roleRef).toBeDefined();
+
+      const policies = template.findResources("AWS::IAM::Policy");
+      const attached = Object.values(policies).filter(
+        (p: CfnIamPolicyResource) =>
+          (p.Properties?.Roles ?? []).some((r) => r?.Ref === roleRef),
+      );
+      const statements = attached.flatMap(
+        (p: CfnIamPolicyResource) =>
+          p.Properties?.PolicyDocument?.Statement ?? [],
+      );
+
+      const registryStatements = statements.filter((s: CfnIamStatement) => {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        return actions.some(
+          (a: string) =>
+            typeof a === "string" && a.startsWith("agent-registry:"),
+        );
+      });
+      expect(registryStatements.length).toBeGreaterThan(0);
+
+      for (const stmt of registryStatements) {
+        const actions = Array.isArray(stmt.Action)
+          ? stmt.Action
+          : [stmt.Action];
+        expect(new Set(actions)).toEqual(
+          new Set(["agent-registry:GetRegistryRecord"]),
+        );
+        // No write-capable registry action anywhere on this role.
+        expect(actions).not.toContain("agent-registry:CreateRegistryRecord");
+        expect(actions).not.toContain("agent-registry:UpdateRegistryRecord");
+        expect(actions).not.toContain(
+          "agent-registry:UpdateRegistryRecordStatus",
+        );
+        expect(actions).not.toContain("agent-registry:DeleteRegistryRecord");
+      }
+    });
+  });
+});
+
+// CIT-125 slice A follow-up (design A.6 #6, deferred from the feature PR
+// per the slice-A verification advisory): shared async DLQ queue shape,
+// asserted against this file's existing Template.fromStack harness.
+describe("RegistryStack — CIT-125 slice A shared async DLQ shape", () => {
+  let template: Template;
+  beforeAll(() => {
+    ({ template } = createTestStack());
+  });
+
+  test("shared async DLQ carries the design queue shape (14d retention, SQS-managed SSE, enforceSSL policy)", () => {
+    assertSharedAsyncDlqShape(template, "registry");
+  });
+});

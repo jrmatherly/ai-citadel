@@ -1,0 +1,508 @@
+"""Layer-2 tool-call governance on the live Strands hooks seam (finding 027c4a89).
+
+Background
+----------
+The original layer-2 governance surface (``governed_tool_handler.GovernedToolHandler``)
+was injected as ``Agent(tool_handler=...)``. ``strands-agents==1.30.0`` REMOVED
+that seam: ``Agent.__init__`` accepts neither ``tool_handler`` nor ``**kwargs``,
+and ``strands.handlers.tool_handler`` is gone. So the injector
+(``agent_runner._install_governed_tool_handler``) detected the missing kwarg and
+merely WARNED — layer-2 allow/deny was INERT at runtime on every workflow-node
+agent execution, while the sibling idempotency concern HAD been re-ported to the
+hooks API. This module re-ports governance onto the SAME seam the idempotency
+hook uses (``BeforeToolCallEvent`` + writable ``selected_tool``), so the two are
+composed at one seam and can never diverge again (see ``tool_idempotency_hook.ComposedToolHook``).
+
+Decision (single source of truth)
+----------------------------------
+The allow/deny + audit-finding decision itself lives in
+``governed_tool_handler.record_governance_decision`` — this module only binds
+that decision to the real tool-call event. On DENY it REPLACES ``selected_tool``
+with a :class:`_GovernanceDeniedTool` whose ``stream()`` yields the deny error
+ToolResult and NEVER touches the real tool (mirroring the idempotency hook's
+``_KeyDerivationFailedTool``). On PERMIT it leaves ``selected_tool`` unchanged
+(the composing hook then applies idempotency).
+
+Degrades to a no-op import when ``strands`` is unavailable (dev/CI), mirroring
+``tool_idempotency_hook.py`` / ``governed_tool_handler.py``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from dataclasses import dataclass
+from typing import Any
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from governed_tool_handler import (  # noqa: E402
+    SCOPE_WORKER_TOOL_HANDLER,  # re-exported for symmetric reference
+    LedgerWriteError,
+    _approval_required_result,
+    _approval_unavailable_result,
+    _awaiting_approval_result,
+    _parse_approval_required_tools_env,
+    _parse_denied_tools_env,
+    record_approval_finding,
+    record_awaiting_approval,
+    record_governance_decision,
+)
+
+logger = logging.getLogger(__name__)
+
+# --- D2 SECURITY CONDITION: token-gated denylist→approval split --------------
+# Splitting a security control's entry point creates a bypass class where a
+# future caller invokes the approval phase WITHOUT the deny-list phase, silently
+# defeating the deny-list. To make that STRUCTURALLY IMPOSSIBLE, the deny-list
+# phase mints an opaque ``DenylistPassed`` token that the approval phase
+# REQUIRES. The token is not constructible by callers (its ``__init__`` demands
+# a module-private mint key), so ``evaluate_approval`` can only ever run after
+# ``evaluate_denylist`` produced a permit. A regex/naming convention would not
+# be enough; this is a type-level gate.
+_DENYLIST_MINT_KEY = object()
+
+
+class DenylistPassed:
+    """Opaque proof that the deny-list phase PERMITTED a specific tool call.
+
+    Minted ONLY by :meth:`GovernanceEvaluator.evaluate_denylist` (via the
+    module-private mint key). :meth:`GovernanceEvaluator.evaluate_approval`
+    requires an instance, so the approval phase cannot be reached without a
+    deny-list pass having produced one — invoking approval standalone is
+    structurally impossible."""
+
+    __slots__ = ("tool_name", "tool_use_id", "selected")
+
+    def __init__(self, _mint_key: Any, *, tool_name: str, tool_use_id: str, selected: Any):
+        if _mint_key is not _DENYLIST_MINT_KEY:
+            raise TypeError(
+                "DenylistPassed is not constructible by callers; it is minted "
+                "only by GovernanceEvaluator.evaluate_denylist (deny-list phase)"
+            )
+        self.tool_name = tool_name
+        self.tool_use_id = tool_use_id
+        self.selected = selected
+
+
+@dataclass
+class DenylistOutcome:
+    """Result of the deny-list phase. ``refused`` ⇒ the tool was swapped for a
+    deny/audit-unavailable tool and the caller must stop. Otherwise ``token`` is
+    the :class:`DenylistPassed` proof required by the approval phase — or
+    ``None`` when there was no real tool to gate (a no-op passthrough)."""
+
+    refused: bool
+    token: DenylistPassed | None = None
+
+try:
+    from strands.hooks import BeforeToolCallEvent  # type: ignore
+    from strands.types.tools import AgentTool  # type: ignore
+
+    _STRANDS_AVAILABLE = True
+except ImportError:  # pragma: no cover — dev/CI without strands-agents
+    _STRANDS_AVAILABLE = False
+    BeforeToolCallEvent = object  # type: ignore[assignment,misc]
+    AgentTool = object  # type: ignore[assignment,misc]
+
+
+class _GovernanceDeniedTool(AgentTool):  # type: ignore[misc]
+    """Replacement tool installed when governance DENYs a call. Its ``stream()``
+    yields the deny error ToolResult and never delegates to the real tool — so a
+    denied tool performs no side effect and never reaches the idempotency
+    reserve. Mirrors ``tool_idempotency_hook._KeyDerivationFailedTool``."""
+
+    def __init__(self, inner: Any, error_result: dict[str, Any]):
+        try:
+            super().__init__()
+        except TypeError:  # pragma: no cover — base signature drift
+            pass
+        self._inner = inner
+        self._error_result = error_result
+
+    @property
+    def tool_name(self) -> str:  # pragma: no cover — thin delegation
+        return self._inner.tool_name
+
+    @property
+    def tool_spec(self) -> Any:  # pragma: no cover — thin delegation
+        return self._inner.tool_spec
+
+    @property
+    def tool_type(self) -> str:  # pragma: no cover — thin delegation
+        return self._inner.tool_type
+
+    def get_display_properties(self) -> dict[str, str]:  # pragma: no cover
+        return self._inner.get_display_properties()
+
+    async def stream(self, tool_use: Any, invocation_state: dict[str, Any], **kwargs: Any):  # pragma: no cover — requires strands runtime
+        from strands_compat import ToolResultEvent  # local import; strands-only
+
+        yield ToolResultEvent(self._error_result)
+
+
+class GovernanceEvaluator:
+    """Applies the layer-2 allow/deny decision to a ``BeforeToolCallEvent``.
+
+    ``evaluate(event)`` writes the audit finding (PERMIT or DENY) via the shared
+    ``record_governance_decision`` and, on DENY, swaps ``event.selected_tool``
+    for a :class:`_GovernanceDeniedTool` and returns ``True``. On PERMIT it
+    returns ``False`` and leaves the event untouched. This is deliberately a
+    plain object (not a HookProvider) so it can be COMPOSED into the single
+    idempotency callback (``ComposedToolHook``) rather than registering a second,
+    independently-ordered callback.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        workflow_id: str,
+        denied_tools: set[str] | None = None,
+        eval_run_id: str | None = None,
+        approval_required_tools: set[str] | None = None,
+        org_id: str = "",
+        workflow_definition_id: str = "",
+        execution_id: str = "",
+        node_id: str = "",
+        governance_engine_decision_fn: Any | None = None,
+    ):
+        self._agent_id = agent_id or 'unknown-agent'
+        self._workflow_id = workflow_id or 'unknown-workflow'
+        # ``None`` → read DENIED_TOOLS from env (single env-parsing source of
+        # truth). An explicit (possibly empty) set overrides the env fallback.
+        self._denied_tools = (
+            denied_tools if denied_tools is not None else _parse_denied_tools_env()
+        )
+        self._eval_run_id = eval_run_id
+        # Approval-required tool gating (finding c947aa77). ``None`` → read the
+        # OPT-IN APPROVAL_REQUIRED_TOOLS set from env (mirrors DENIED_TOOLS);
+        # an explicit (possibly empty) set overrides the env fallback. The
+        # scope tuple for a grant is (org, workflow DEFINITION, node, tool).
+        self._approval_required_tools = (
+            approval_required_tools
+            if approval_required_tools is not None
+            else _parse_approval_required_tools_env()
+        )
+        self._org_id = org_id or ""
+        self._workflow_definition_id = workflow_definition_id or ""
+        self._execution_id = execution_id or ""
+        self._node_id = node_id or ""
+        # CIT-031 hook: optional callback ``(tool_name) -> ArbitrationDecision``
+        # that returns the governance engine's decision for a tool call.
+        # ``None`` (the default) means the engine is not connected yet —
+        # all tool calls are implicitly PERMIT at this layer. CIT-031 wires
+        # the actual governance engine routing rules here.
+        self._governance_engine_decision_fn = governance_engine_decision_fn
+
+    @property
+    def denied_tools(self) -> set[str]:  # pragma: no cover — trivial accessor
+        return self._denied_tools
+
+    @property
+    def approval_required_tools(self) -> set[str]:  # pragma: no cover — accessor
+        return self._approval_required_tools
+
+    def evaluate(self, event: Any) -> bool:
+        """Return True if the call was REFUSED (and ``selected_tool`` swapped) —
+        by the deny-list decision, the REQUIRE_APPROVAL gate, OR the approval
+        gate. On PERMIT (not denied AND, for a gated tool, a valid approval was
+        consumed) returns False and leaves the event untouched so idempotency
+        wrapping proceeds.
+
+        ADDITIVE SPLIT (D2, 47b6abac): this keeps its EXACT current
+        denylist-then-approval behaviour — it is the live contract for the
+        standalone supervisor-path ``GovernanceToolHook`` and the existing tests
+        (which must not change). It is now implemented on top of the two public
+        phase methods (:meth:`evaluate_denylist` / :meth:`evaluate_approval`) so
+        the ``ComposedToolHook`` can insert the breaker BETWEEN them; the token
+        gate makes calling approval without the deny-list structurally
+        impossible."""
+        outcome = self.evaluate_denylist(event)
+        if outcome.refused:
+            return True
+        if outcome.token is None:
+            return False  # nothing to gate (no real tool on the event)
+
+        # CIT-031 insertion point: REQUIRE_APPROVAL check AFTER deny-list pass,
+        # BEFORE approval-consume. If the governance engine returns
+        # REQUIRE_APPROVAL the tool is NOT executed; the node is parked.
+        if self.evaluate_require_approval(
+            event, outcome.token.tool_name, outcome.token.tool_use_id,
+            outcome.token.selected,
+        ):
+            return True
+
+        return self.evaluate_approval(event, outcome.token)
+
+    def evaluate_denylist(self, event: Any) -> DenylistOutcome:
+        """Deny-list phase ONLY. Writes the PERMIT/DENY audit finding and, on
+        DENY (or an audit-write failure), swaps ``selected_tool`` for a
+        deny/audit-unavailable tool. Returns a :class:`DenylistOutcome`: on
+        PERMIT its ``token`` is the opaque proof the approval phase requires."""
+        tool_use = getattr(event, "tool_use", None)
+        selected = getattr(event, "selected_tool", None)
+        if tool_use is None or selected is None:
+            return DenylistOutcome(refused=False, token=None)
+        if hasattr(tool_use, "get"):
+            tool_name = tool_use.get("name", "") or ""
+            tool_use_id = tool_use.get("toolUseId", "") or ""
+        else:
+            tool_name = getattr(tool_use, "name", "") or ""
+            tool_use_id = getattr(tool_use, "toolUseId", "") or ""
+
+        denied, error_result = record_governance_decision(
+            tool_name, tool_use_id,
+            agent_id=self._agent_id,
+            workflow_id=self._workflow_id,
+            denied_tools=self._denied_tools,
+            eval_run_id=self._eval_run_id,
+            # Governance ledger SLICE 2: self._org_id defaults to "" (see
+            # __init__) as a valid "disabled" sentinel for approval-scope
+            # gating; normalise the empty string to None here so an
+            # unconfigured org never writes a placeholder value onto the
+            # finding — only a genuinely non-empty org id is stamped.
+            org_id=self._org_id or None,
+        )
+        if denied and error_result is not None:
+            event.selected_tool = _GovernanceDeniedTool(selected, error_result)
+            return DenylistOutcome(refused=True, token=None)
+        # PERMITTED by the deny-list — mint the opaque proof the approval phase
+        # requires (structurally impossible to reach approval without it).
+        token = DenylistPassed(
+            _DENYLIST_MINT_KEY,
+            tool_name=tool_name, tool_use_id=tool_use_id, selected=selected,
+        )
+        return DenylistOutcome(refused=False, token=token)
+
+    def evaluate_require_approval(
+        self, event: Any, tool_name: str, tool_use_id: str, selected: Any,
+    ) -> bool:
+        """REQUIRE_APPROVAL phase (CIT-030 substrate, CIT-031 hook).
+
+        Consults the governance engine decision callback (if configured). When
+        the decision is ``REQUIRE_APPROVAL`` AND the ``APPROVAL_GATE_ENABLED``
+        feature flag is active:
+          1. Records the pending call in the awaiting-approval signal list
+             (keyed by idempotency key derived from execution/node context).
+          2. Swaps ``selected_tool`` for a non-executing tool so the real tool
+             never runs.
+          3. Returns ``True`` (refused / parked).
+
+        When APPROVAL_GATE_ENABLED is off, REQUIRE_APPROVAL is treated as DENY
+        (fail-closed fallback — the governance engine should not be producing
+        this verdict when the gate is disabled, but if it does, refusing is
+        safer than executing). When no governance engine callback is configured
+        (the default until CIT-031), this method is a no-op and returns False.
+        """
+        if self._governance_engine_decision_fn is None:
+            return False
+
+        from governance.models import ArbitrationDecision  # noqa: E402 — avoid import cycle
+
+        try:
+            decision = self._governance_engine_decision_fn(tool_name)
+        except Exception:  # noqa: BLE001 — engine failure is fail-closed
+            logger.error(
+                'governance engine decision callback failed for tool=%s; '
+                'treating as DENY (fail-closed)', tool_name,
+            )
+            result = _awaiting_approval_result(tool_use_id, tool_name)
+            event.selected_tool = _GovernanceDeniedTool(selected, result)
+            return True
+
+        if decision != ArbitrationDecision.REQUIRE_APPROVAL:
+            return False
+
+        approval_gate_enabled = os.environ.get('APPROVAL_GATE_ENABLED', '') == 'true'
+
+        if not approval_gate_enabled:
+            # Flag off: REQUIRE_APPROVAL is treated as DENY (fail-closed).
+            from governed_tool_handler import _deny_error_result
+            result = _deny_error_result(tool_use_id, tool_name)
+            event.selected_tool = _GovernanceDeniedTool(selected, result)
+            return True
+
+        # Gate active + REQUIRE_APPROVAL: park the tool call.
+        # Build an idempotency key from the execution/node context. The actual
+        # tool-execution-ledger integration (reserve as awaiting_approval) is
+        # CIT-031; here we record the signal for the worker's outcome emitter.
+        idempotency_key = f'{self._execution_id}#{self._node_id}#{tool_name}#{tool_use_id}'
+
+        record_awaiting_approval(
+            tool_name,
+            reason=f'require_approval:{tool_name}',
+            idempotency_key=idempotency_key,
+            execution_id=self._execution_id,
+            node_id=self._node_id,
+        )
+
+        result = _awaiting_approval_result(tool_use_id, tool_name)
+        event.selected_tool = _GovernanceDeniedTool(selected, result)
+        return True
+
+    def evaluate_approval(self, event: Any, token: DenylistPassed) -> bool:
+        """Approval phase ONLY. REQUIRES the :class:`DenylistPassed` token the
+        deny-list phase minted — passing anything else raises ``TypeError``, so
+        this phase can never run without a deny-list pass (D2 security
+        condition). Returns True if the call was REFUSED by the approval gate."""
+        if not isinstance(token, DenylistPassed):
+            raise TypeError(
+                "evaluate_approval requires the opaque DenylistPassed token from "
+                "evaluate_denylist — the approval phase must never run without "
+                "the deny-list phase (D2 security condition)"
+            )
+        return self._evaluate_approval(
+            event, token.selected, token.tool_name, token.tool_use_id,
+        )
+
+    def _evaluate_approval(
+        self, event: Any, selected: Any, tool_name: str, tool_use_id: str,
+    ) -> bool:
+        """Approval-required gate (finding c947aa77). Returns True if REFUSED
+        (tool swapped + refusal recorded so the node FAILS), False on PERMIT.
+
+        A tool is gated iff it is in the OPT-IN approval-required set. For a
+        gated tool a valid, unconsumed, pre-granted approval for
+        (org, workflowDef, node, tool) is atomically consumed against this
+        execution; absent/expired/already-consumed ⇒ POLICY refusal (node
+        FAILS, decision c0ca4576); an unreadable set/record ⇒ INFRA refusal
+        (fail-loud). An always-visible APPROVAL finding is written either way."""
+        if tool_name not in self._approval_required_tools:
+            return False  # not gated → permit passthrough
+
+        # Lazy import (avoids a governance_tool_hook ↔ tool_idempotency_hook
+        # import cycle; the refusal sink lives with the idempotency seam).
+        try:
+            from tool_idempotency_hook import _record_governance_refusal
+        except ImportError:  # pragma: no cover — worker-bundle sibling
+            _record_governance_refusal = None  # type: ignore[assignment]
+
+        try:
+            from governance import tool_approval
+        except ImportError:  # pragma: no cover — layer-staged package
+            from arbiter.governance import tool_approval  # type: ignore
+
+        def _refuse(exc: Exception, reason_code: str, infra: bool) -> bool:
+            # Write the always-visible APPROVAL finding (fail-closed). If the
+            # finding write itself fails, that is an infra refusal a fortiori.
+            try:
+                record_approval_finding(
+                    tool_name, permitted=False, reason_code=reason_code,
+                    agent_id=self._agent_id, workflow_id=self._workflow_id,
+                    eval_run_id=self._eval_run_id,
+                    org_id=self._org_id or None,
+                )
+            except LedgerWriteError as write_exc:
+                if _record_governance_refusal is not None:
+                    _record_governance_refusal(write_exc)
+            result = (
+                _approval_unavailable_result(tool_use_id, tool_name)
+                if infra
+                else _approval_required_result(tool_use_id, tool_name)
+            )
+            event.selected_tool = _GovernanceDeniedTool(selected, result)
+            if _record_governance_refusal is not None:
+                _record_governance_refusal(exc)
+            return True
+
+        # Fail-safe: a gated tool with an incomplete scope context cannot be
+        # validated against a (org, workflowDef, node, tool) grant ⇒ require
+        # approval (refuse), never run unapproved.
+        if not (self._org_id and self._workflow_definition_id and self._node_id and self._execution_id):
+            return _refuse(
+                tool_approval.ApprovalRequiredError(
+                    f"approval-required tool {tool_name!r} invoked without a "
+                    "complete (org, workflowDef, node, execution) context"
+                ),
+                "approval_required_context_incomplete", infra=False,
+            )
+
+        try:
+            grant = tool_approval.read_grant(
+                self._org_id, self._workflow_definition_id, self._node_id, tool_name,
+            )
+        except tool_approval.ApprovalReadError as exc:
+            return _refuse(exc, "approval_unreadable", infra=True)
+
+        if not tool_approval.grant_is_valid(
+            grant, self._org_id, self._workflow_definition_id, self._node_id, tool_name,
+        ):
+            return _refuse(
+                tool_approval.ApprovalRequiredError(
+                    f"no valid approval for tool {tool_name!r} "
+                    "(absent, expired, or malformed)"
+                ),
+                "approval_required_absent", infra=False,
+            )
+
+        try:
+            won = tool_approval.consume(
+                self._org_id, self._workflow_definition_id, self._node_id, tool_name,
+                self._execution_id,
+            )
+        except tool_approval.ApprovalReadError as exc:
+            return _refuse(exc, "approval_unreadable", infra=True)
+
+        if not won:
+            return _refuse(
+                tool_approval.ApprovalRequiredError(
+                    f"approval for tool {tool_name!r} already consumed "
+                    "(single-use exhausted)"
+                ),
+                "approval_required_already_consumed", infra=False,
+            )
+
+        # PERMIT: valid approval consumed by this execution. Write the visible
+        # PERMIT finding (fail-closed — a failed write is an infra refusal).
+        try:
+            record_approval_finding(
+                tool_name, permitted=True, reason_code="approval_consumed",
+                agent_id=self._agent_id, workflow_id=self._workflow_id,
+                eval_run_id=self._eval_run_id,
+                org_id=self._org_id or None,
+            )
+        except LedgerWriteError as exc:
+            return _refuse(exc, "approval_permit_finding_unwritable", infra=True)
+        return False
+
+
+class GovernanceToolHook:
+    """A standalone Strands ``HookProvider`` for layer-2 governance.
+
+    Used on the supervisor-task path (governance active, no idempotency
+    envelope). On the workflow-node path governance is instead COMPOSED with
+    idempotency into a single callback (``ComposedToolHook``) so ordering is
+    guaranteed and the two seams cannot diverge.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        workflow_id: str,
+        denied_tools: set[str] | None = None,
+        eval_run_id: str | None = None,
+        org_id: str | None = None,
+    ):
+        self._evaluator = GovernanceEvaluator(
+            agent_id=agent_id, workflow_id=workflow_id,
+            denied_tools=denied_tools, eval_run_id=eval_run_id,
+            org_id=org_id or "",
+        )
+
+    @property
+    def evaluator(self) -> GovernanceEvaluator:  # pragma: no cover — accessor
+        return self._evaluator
+
+    def register_hooks(self, registry: Any, **_kwargs: Any) -> None:
+        if not _STRANDS_AVAILABLE:  # pragma: no cover — dev/CI guard
+            logger.warning("governance hook skipped — strands unavailable")
+            return
+        registry.add_callback(BeforeToolCallEvent, self._on_before_tool_call)
+
+    def _on_before_tool_call(self, event: Any) -> None:  # pragma: no cover — requires strands runtime
+        self._evaluator.evaluate(event)

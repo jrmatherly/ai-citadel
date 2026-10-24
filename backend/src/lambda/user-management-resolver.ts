@@ -1,0 +1,857 @@
+import {
+  CognitoIdentityProviderClient,
+  AdminAddUserToGroupCommand,
+  AdminRemoveUserFromGroupCommand,
+  AdminUpdateUserAttributesCommand,
+  AdminUserGlobalSignOutCommand,
+  AdminGetUserCommand,
+  ListUsersCommand,
+  AdminListGroupsForUserCommand,
+  ListGroupsCommand,
+  AdminSetUserPasswordCommand,
+  AdminCreateUserCommand,
+} from "@aws-sdk/client-cognito-identity-provider";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import * as crypto from "crypto";
+import {
+  DynamoDBDocumentClient,
+  PutCommand,
+  ScanCommand,
+} from "@aws-sdk/lib-dynamodb";
+import { extractOrgFromEvent } from "../utils/auth-event";
+import { assertOrgNameExists } from "../utils/org-name";
+
+const cognitoClient = new CognitoIdentityProviderClient({});
+const dynamoClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const USER_POOL_ID = process.env.USER_POOL_ID!;
+const ORGANISATION_TABLE = process.env.ORGANISATION_TABLE!;
+// Authoritative user↔org store (decision 00d40a31, option A). The
+// pre-token-generation trigger mints the `custom:organization` claim from
+// this table by Cognito `sub`; the user attribute is display/back-compat.
+const USER_ORG_MEMBERSHIP_TABLE = process.env.USER_ORG_MEMBERSHIP_TABLE;
+
+// Cache for user groups to reduce Cognito API calls
+// Cache persists across warm Lambda invocations
+const groupCache = new Map<string, { groups: string[]; timestamp: number }>();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+interface AssignUserRoleInput {
+  userId: string;
+  role: string;
+  organization?: string;
+}
+
+interface ChangePasswordInput {
+  newPassword: string;
+}
+
+interface AdminCreateUserInput {
+  email: string;
+  givenName: string;
+  familyName: string;
+  // RATIFIED decision 228b3cc8 piece 5 (finding cbbc3be1): required, not
+  // optional. custom:organization must never be left unset at creation —
+  // see the adminCreateUser validation below for why no default is
+  // invented when this is omitted.
+  organization: string;
+}
+
+interface User {
+  userId: string;
+  email: string;
+  name: string;
+  givenName: string;
+  familyName: string;
+  role?: string;
+  organization?: string;
+  status: string;
+  createdAt: string;
+  enabled: boolean;
+}
+
+/**
+ * Check if a user is an admin with caching to reduce Cognito API calls
+ */
+async function isUserAdmin(username: string): Promise<boolean> {
+  // Check cache first
+  const cached = groupCache.get(username);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    console.log(`Cache hit for user ${username}`);
+    return cached.groups.includes("admin");
+  }
+
+  // Cache miss - fetch from Cognito
+  console.log(`Cache miss for user ${username}, fetching from Cognito`);
+  const groupsResponse = await cognitoClient.send(
+    new AdminListGroupsForUserCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: username,
+    }),
+  );
+
+  const groups = groupsResponse.Groups?.map((g) => g.GroupName!) || [];
+
+  // Update cache
+  groupCache.set(username, { groups, timestamp: Date.now() });
+
+  return groups.includes("admin");
+}
+
+/** AppSync event slice this resolver reads: Cognito identity + arguments. */
+interface UserManagementResolverEvent {
+  info: { fieldName: string };
+  identity?: { username?: string; claims?: { username?: string } };
+  arguments: {
+    userId: string;
+    role: string;
+    input: AssignUserRoleInput & ChangePasswordInput & AdminCreateUserInput;
+  };
+}
+
+/**
+ * Resolves the caller's username from the AppSync-injected Cognito
+ * identity. Throws when identity is unresolvable — every read op in this
+ * module must fail closed rather than proceed with an unknown caller
+ * (finding f21582e6).
+ */
+function requireCallerUsername(event: UserManagementResolverEvent): string {
+  const callerUsername =
+    event.identity?.username || event.identity?.claims?.username;
+  if (!callerUsername) {
+    throw new Error("Unable to determine caller identity");
+  }
+  return callerUsername;
+}
+
+/**
+ * Resolves the caller's org for a non-admin org-scoping decision. Reuses
+ * extractOrgFromEvent (JWT `custom:organization` claim, falling back to an
+ * AdminGetUser lookup) rather than inventing a second identity path.
+ * Throws when the org cannot be resolved — fail closed (finding f21582e6).
+ */
+async function requireCallerOrg(
+  event: UserManagementResolverEvent,
+): Promise<string> {
+  const org = await extractOrgFromEvent(event);
+  if (!org) {
+    throw new Error("Unable to determine caller's organization");
+  }
+  return org;
+}
+
+export const handler = async (event: UserManagementResolverEvent) => {
+  console.log("Event:", JSON.stringify(event, null, 2));
+
+  const fieldName = event.info.fieldName;
+
+  try {
+    switch (fieldName) {
+      case "listUsers":
+        return await listUsers(event);
+      case "getUser":
+        return await getUser(event.arguments.userId, event);
+      case "getCurrentUserProfile":
+        return await getCurrentUserProfile(event);
+      case "listAvailableRoles":
+        return await listAvailableRoles(event);
+      case "listOrganizations":
+        return await listOrganizations(event);
+      case "adminCreateUser":
+        return await adminCreateUser(event, event.arguments.input);
+      case "assignUserRole":
+        return await assignUserRole(event.arguments.input, event);
+      case "removeUserRole":
+        return await removeUserRole(
+          event.arguments.userId,
+          event.arguments.role,
+          event,
+        );
+      case "changePassword":
+        return await changePassword(event, event.arguments.input);
+      case "adminResetUserPassword":
+        return await adminResetUserPassword(event, event.arguments.userId);
+      case "adminResendInvitation":
+        return await adminResendInvitation(event, event.arguments.userId);
+      default:
+        throw new Error(`Unknown field: ${fieldName}`);
+    }
+  } catch (error) {
+    console.error("Error:", error);
+    throw error;
+  }
+};
+
+async function listUsers(event: UserManagementResolverEvent): Promise<User[]> {
+  const callerUsername = requireCallerUsername(event);
+  const callerIsAdmin = await isUserAdmin(callerUsername);
+  // Non-admin callers are confined to their own org; fail closed if it
+  // cannot be resolved (finding f21582e6). The GLOBAL 'admin' Cognito
+  // group retains cross-tenant visibility, preserved deliberately.
+  const callerOrg = callerIsAdmin ? null : await requireCallerOrg(event);
+
+  const response = await cognitoClient.send(
+    new ListUsersCommand({
+      UserPoolId: USER_POOL_ID,
+    }),
+  );
+
+  const users: User[] = [];
+
+  for (const user of response.Users || []) {
+    const attributes = user.Attributes || [];
+    const email = attributes.find((attr) => attr.Name === "email")?.Value || "";
+    const givenName =
+      attributes.find((attr) => attr.Name === "given_name")?.Value || "";
+    const familyName =
+      attributes.find((attr) => attr.Name === "family_name")?.Value || "";
+    const organization = attributes.find(
+      (attr) => attr.Name === "custom:organization",
+    )?.Value;
+
+    if (!callerIsAdmin && organization !== callerOrg) {
+      continue;
+    }
+
+    // Get user's groups (roles)
+    const groupsResponse = await cognitoClient.send(
+      new AdminListGroupsForUserCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: user.Username!,
+      }),
+    );
+
+    // Cognito does NOT guarantee the order in which Groups are returned for a
+    // multi-group user. Selecting `Groups[0]` was flaky — if an admin happened
+    // to also be in a non-admin group and Cognito returned that group first,
+    // the OrganizationContext on the frontend would fall through to the
+    // non-admin branch (and show "No Org" if the user had no
+    // custom:organization attribute set). Prefer 'admin' if present so the
+    // most-privileged role always wins; otherwise take the first returned
+    // group, matching the prior behaviour for single-group users.
+    const groupNames = (groupsResponse.Groups || [])
+      .map((g) => g.GroupName)
+      .filter((n): n is string => !!n);
+    const role = groupNames.find((n) => n === "admin") ?? groupNames[0];
+
+    users.push({
+      userId: user.Username!,
+      email,
+      name: `${givenName} ${familyName}`.trim(),
+      givenName,
+      familyName,
+      role,
+      organization,
+      status: user.UserStatus || "UNKNOWN",
+      createdAt: user.UserCreateDate?.toISOString() || new Date().toISOString(),
+      enabled: user.Enabled || false,
+    });
+  }
+
+  return users;
+}
+
+async function getUser(
+  userId: string,
+  event: UserManagementResolverEvent,
+): Promise<User> {
+  const callerUsername = requireCallerUsername(event);
+  const callerIsAdmin = await isUserAdmin(callerUsername);
+
+  const response = await cognitoClient.send(
+    new AdminGetUserCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: userId,
+    }),
+  );
+
+  const attributes = response.UserAttributes || [];
+  const email = attributes.find((attr) => attr.Name === "email")?.Value || "";
+  const givenName =
+    attributes.find((attr) => attr.Name === "given_name")?.Value || "";
+  const familyName =
+    attributes.find((attr) => attr.Name === "family_name")?.Value || "";
+  const organization = attributes.find(
+    (attr) => attr.Name === "custom:organization",
+  )?.Value;
+
+  if (!callerIsAdmin && userId !== callerUsername) {
+    // Non-admin callers may always fetch their own profile (self-lookup,
+    // used by getCurrentUserProfile). For any other target, the caller's
+    // org must be resolvable and must match the target's org — fail
+    // closed otherwise (finding f21582e6).
+    const callerOrg = await requireCallerOrg(event);
+    if (organization !== callerOrg) {
+      throw new Error("User not found");
+    }
+  }
+
+  // Get user's groups (roles)
+  const groupsResponse = await cognitoClient.send(
+    new AdminListGroupsForUserCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: userId,
+    }),
+  );
+
+  // Cognito does NOT guarantee the order in which Groups are returned for a
+  // multi-group user. Selecting `Groups[0]` was flaky — if an admin happened
+  // to also be in a non-admin group and Cognito returned that group first,
+  // the OrganizationContext on the frontend would fall through to the
+  // non-admin branch (and show "No Org" if the user had no
+  // custom:organization attribute set). Prefer 'admin' if present so the
+  // most-privileged role always wins; otherwise take the first returned
+  // group, matching the prior behaviour for single-group users.
+  const groupNames = (groupsResponse.Groups || [])
+    .map((g) => g.GroupName)
+    .filter((n): n is string => !!n);
+  const role = groupNames.find((n) => n === "admin") ?? groupNames[0];
+
+  return {
+    userId: response.Username!,
+    email,
+    name: `${givenName} ${familyName}`.trim(),
+    givenName,
+    familyName,
+    role,
+    organization,
+    status: response.UserStatus || "UNKNOWN",
+    createdAt:
+      response.UserCreateDate?.toISOString() || new Date().toISOString(),
+    enabled: response.Enabled || false,
+  };
+}
+
+async function getCurrentUserProfile(
+  event: UserManagementResolverEvent,
+): Promise<User> {
+  // Extract username from the Cognito identity
+  const username = event.identity?.username || event.identity?.claims?.username;
+
+  if (!username) {
+    throw new Error("Unable to determine current user from request context");
+  }
+
+  return await getUser(username, event);
+}
+
+async function assignUserRole(
+  input: AssignUserRoleInput,
+  event: UserManagementResolverEvent,
+) {
+  const { userId, role, organization } = input;
+
+  // Verify the caller is an admin
+  const callerUsername =
+    event.identity?.username || event.identity?.claims?.username;
+
+  if (!callerUsername) {
+    throw new Error("Unable to determine caller identity");
+  }
+
+  // Check if caller is admin (with caching)
+  const callerIsAdmin = await isUserAdmin(callerUsername);
+
+  if (!callerIsAdmin) {
+    throw new Error("Only administrators can assign user roles");
+  }
+
+  console.log(
+    `Assigning role ${role} and organization ${organization} to user ${userId}`,
+  );
+
+  // Write-boundary validation (Wave-3B design item 1): reject a
+  // non-existent or tombstoned organization name BEFORE any Cognito write —
+  // including the group membership mutations below, which are also
+  // "Cognito writes" and must not be committed on an invalid organization.
+  // assertOrgNameExists throws with a distinct message for each case (see
+  // backend/src/utils/org-name.ts) and the error propagates to the
+  // resolver's own error handling.
+  if (organization) {
+    await assertOrgNameExists(dynamoClient, ORGANISATION_TABLE, organization);
+  }
+
+  // Get current groups to remove user from old role
+  const groupsResponse = await cognitoClient.send(
+    new AdminListGroupsForUserCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: userId,
+    }),
+  );
+
+  // Remove user from all existing groups
+  for (const group of groupsResponse.Groups || []) {
+    await cognitoClient.send(
+      new AdminRemoveUserFromGroupCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: userId,
+        GroupName: group.GroupName!,
+      }),
+    );
+  }
+
+  // Add user to new role group
+  await cognitoClient.send(
+    new AdminAddUserToGroupCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: userId,
+      GroupName: role,
+    }),
+  );
+
+  // Update organization if provided: membership table FIRST (authoritative),
+  // then the custom attribute (display/back-compat mirror).
+  if (organization) {
+    // Detect a REAL organization change (Wave-3B design item 2): read the
+    // target's CURRENT custom:organization before writing the new value,
+    // using an exact string compare (no normalization — matches the
+    // canonical-name rule this codebase applies to every tenancy
+    // comparison; see auth-event.ts). The same AdminGetUser response also
+    // yields the target's Cognito `sub`, the membership-table key.
+    const currentUser = await cognitoClient.send(
+      new AdminGetUserCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: userId,
+      }),
+    );
+    const previousOrg = currentUser.UserAttributes?.find(
+      (attr) => attr.Name === "custom:organization",
+    )?.Value;
+    const targetSub = currentUser.UserAttributes?.find(
+      (attr) => attr.Name === "sub",
+    )?.Value;
+
+    // decision 00d40a31 (option A): the UserOrgMembership table is the
+    // AUTHORITATIVE source of the user's organization — the
+    // pre-token-generation trigger mints the `custom:organization` claim
+    // from it and NEVER reads the user attribute. Write the row BEFORE the
+    // attribute so the two can never disagree in the dangerous direction
+    // (attribute says X, claim says nothing/other). If this write fails,
+    // abort here: the attribute is not touched and the user is not signed
+    // out, so their current (correct) claim keeps working.
+    if (!targetSub) {
+      throw new Error(
+        `Cannot assign organization: Cognito user ${userId} has no sub attribute`,
+      );
+    }
+    if (!USER_ORG_MEMBERSHIP_TABLE) {
+      throw new Error(
+        "Cannot assign organization: USER_ORG_MEMBERSHIP_TABLE is not configured",
+      );
+    }
+    await dynamoClient.send(
+      new PutCommand({
+        TableName: USER_ORG_MEMBERSHIP_TABLE,
+        Item: {
+          sub: targetSub,
+          orgName: organization,
+          updatedAt: new Date().toISOString(),
+          updatedBy: callerUsername,
+        },
+      }),
+    );
+
+    // Display/back-compat mirror of the membership row (listUsers and the
+    // admin UI read it; no authorization path does).
+    await cognitoClient.send(
+      new AdminUpdateUserAttributesCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: userId,
+        UserAttributes: [
+          {
+            Name: "custom:organization",
+            Value: organization,
+          },
+        ],
+      }),
+    );
+
+    // Sign out the target's existing sessions ONLY on a real change, and
+    // ONLY AFTER both writes complete — the next login then regenerates a
+    // token whose custom:organization claim the pre-token-generation
+    // trigger reads from the membership row written above. This revokes
+    // refresh tokens; an already-issued, unexpired access/ID token remains
+    // valid at AppSync until its own TTL (known limitation, see design
+    // notes).
+    if (organization !== previousOrg) {
+      await cognitoClient.send(
+        new AdminUserGlobalSignOutCommand({
+          UserPoolId: USER_POOL_ID,
+          Username: userId,
+        }),
+      );
+    }
+  }
+
+  console.log(
+    `Successfully assigned role ${role} and organization ${organization} to user ${userId}`,
+  );
+
+  return {
+    success: true,
+    message: `User ${userId} assigned to role ${role}${organization ? ` and organization ${organization}` : ""}`,
+  };
+}
+
+async function removeUserRole(
+  userId: string,
+  role: string,
+  event: UserManagementResolverEvent,
+) {
+  // Verify the caller is an admin
+  const callerUsername =
+    event.identity?.username || event.identity?.claims?.username;
+
+  if (!callerUsername) {
+    throw new Error("Unable to determine caller identity");
+  }
+
+  // Check if caller is admin (with caching)
+  const callerIsAdmin = await isUserAdmin(callerUsername);
+
+  if (!callerIsAdmin) {
+    throw new Error("Only administrators can remove user roles");
+  }
+
+  await cognitoClient.send(
+    new AdminRemoveUserFromGroupCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: userId,
+      GroupName: role,
+    }),
+  );
+
+  return {
+    success: true,
+    message: `User ${userId} removed from role ${role}`,
+  };
+}
+
+async function listAvailableRoles(
+  event: UserManagementResolverEvent,
+): Promise<string[]> {
+  // No tenant data is returned, so this stays global — but identity must
+  // still be read and resolvable, failing closed otherwise (finding
+  // f21582e6).
+  requireCallerUsername(event);
+
+  const response = await cognitoClient.send(
+    new ListGroupsCommand({
+      UserPoolId: USER_POOL_ID,
+    }),
+  );
+
+  return (response.Groups || [])
+    .map((group) => group.GroupName)
+    .filter((name): name is string => !!name)
+    .sort();
+}
+
+async function listOrganizations(event: UserManagementResolverEvent) {
+  const callerUsername = requireCallerUsername(event);
+  const callerIsAdmin = await isUserAdmin(callerUsername);
+  // Non-admin callers are confined to their own org; the GLOBAL 'admin'
+  // Cognito group retains cross-tenant visibility, preserved deliberately.
+  const callerOrg = callerIsAdmin ? null : await requireCallerOrg(event);
+
+  const response = await dynamoClient.send(
+    new ScanCommand({
+      TableName: ORGANISATION_TABLE,
+    }),
+  );
+
+  // RATIFIED decision 228b3cc8: the organisation NAME is canonical for the
+  // `custom:organization` claim and every tenancy comparison in this
+  // codebase (assignUserRole writes the NAME, extractOrgFromEvent reads it
+  // back verbatim). `callerOrg` here is therefore always a NAME, never the
+  // generated `orgId` UUID — comparing it against `item.orgId` was always
+  // false for non-admins (see auth-event.ts's "Canonical tenancy claim"
+  // note for the shared rule). Compare NAME to NAME.
+  return (response.Items || [])
+    .filter((item) => callerIsAdmin || item.name === callerOrg)
+    .map((item) => {
+      console.log("Raw item from DynamoDB:", JSON.stringify(item));
+
+      // Ensure createdAt is in proper ISO 8601 format for AppSync
+      let createdAt = item.createdAt;
+      console.log("Original createdAt:", createdAt, "Type:", typeof createdAt);
+
+      if (createdAt && typeof createdAt === "string") {
+        // Remove microseconds if present
+        const parts = createdAt.split(".");
+        if (parts.length > 1) {
+          // Has microseconds, take only the date/time part
+          createdAt = parts[0];
+          console.log("After removing microseconds:", createdAt);
+        }
+        // Ensure it ends with 'Z' (but don't add if already present)
+        if (!createdAt.endsWith("Z")) {
+          createdAt = createdAt + "Z";
+          console.log("Added Z:", createdAt);
+        } else {
+          console.log("Already has Z, not adding");
+        }
+      }
+
+      console.log("Final createdAt:", createdAt);
+
+      return {
+        orgId: item.orgId,
+        name: item.name || item.orgId,
+        description: item.description,
+        createdAt: createdAt,
+      };
+    });
+}
+
+async function changePassword(
+  event: UserManagementResolverEvent,
+  input: ChangePasswordInput,
+) {
+  const { newPassword } = input;
+
+  // Get username from the Cognito identity
+  const username = event.identity?.username || event.identity?.claims?.username;
+
+  if (!username) {
+    throw new Error("Unable to determine current user from request context");
+  }
+
+  try {
+    // Use AdminSetUserPassword to change the user's password
+    // Since the user is already authenticated, we know they have valid credentials
+    await cognitoClient.send(
+      new AdminSetUserPasswordCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: username,
+        Password: newPassword,
+        Permanent: true, // This is a permanent password, not temporary
+      }),
+    );
+
+    return {
+      success: true,
+      message: "Password changed successfully",
+    };
+  } catch (error: unknown) {
+    console.error("Error changing password:", error);
+    return {
+      success: false,
+      message:
+        (error instanceof Error ? error.message : "") ||
+        "Failed to change password",
+    };
+  }
+}
+
+async function adminResetUserPassword(
+  event: UserManagementResolverEvent,
+  userId: string,
+) {
+  // Verify the caller is an admin
+  const callerUsername =
+    event.identity?.username || event.identity?.claims?.username;
+
+  if (!callerUsername) {
+    throw new Error("Unable to determine caller identity");
+  }
+
+  // Check if caller is admin (with caching)
+  const callerIsAdmin = await isUserAdmin(callerUsername);
+
+  if (!callerIsAdmin) {
+    throw new Error("Only administrators can reset user passwords");
+  }
+
+  try {
+    // Generate a temporary password (user will be forced to change it on next login)
+    const tempPassword = generateTemporaryPassword();
+
+    await cognitoClient.send(
+      new AdminSetUserPasswordCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: userId,
+        Password: tempPassword,
+        Permanent: false, // User must change password on next login
+      }),
+    );
+
+    return {
+      success: true,
+      message: "Password reset successfully.",
+    };
+  } catch (error: unknown) {
+    console.error("Error resetting password:", error);
+    return {
+      success: false,
+      message:
+        (error instanceof Error ? error.message : "") ||
+        "Failed to reset password",
+    };
+  }
+}
+
+async function adminCreateUser(
+  event: UserManagementResolverEvent,
+  input: AdminCreateUserInput,
+) {
+  // Verify the caller is an admin
+  const callerUsername =
+    event.identity?.username || event.identity?.claims?.username;
+
+  if (!callerUsername) {
+    throw new Error("Unable to determine caller identity");
+  }
+
+  // Check if caller is admin (with caching)
+  const callerIsAdmin = await isUserAdmin(callerUsername);
+
+  if (!callerIsAdmin) {
+    throw new Error("Only administrators can create users");
+  }
+
+  const { email, givenName, familyName, organization } = input;
+
+  // RATIFIED decision 228b3cc8 piece 5 (finding cbbc3be1): organization is
+  // REQUIRED at creation time, with NO invented default. Previously the
+  // organisation was applied solely by a separate, OPTIONAL assignUserRole
+  // call the frontend made only when a role was also chosen — an
+  // organisation-only, no-role creation left the user with NO
+  // custom:organization claim at all, which then fails closed (by design)
+  // across every org-scoped resolver with no clear signal of why. A silent
+  // default (e.g. "Default") would let a caller who forgot to pick an
+  // organisation create a user in the wrong tenant with no warning, which
+  // is worse than a clear upfront validation error — so this fails clearly
+  // instead. Team.tsx's Add User dialog already collects an organization
+  // from the name-valued `organizations` list (per the ratified
+  // NAME-is-canonical convention), so this is a required, not an
+  // impossible, ask of every caller.
+  if (!organization) {
+    return {
+      success: false,
+      message: "An organization is required to create a user.",
+    };
+  }
+
+  // Write-boundary validation (Wave-3B design item 1): reject a
+  // non-existent or tombstoned organization name BEFORE any Cognito write.
+  await assertOrgNameExists(dynamoClient, ORGANISATION_TABLE, organization);
+
+  try {
+    // Create user with email as username
+    // Cognito will send an email with temporary password automatically
+    await cognitoClient.send(
+      new AdminCreateUserCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: email,
+        UserAttributes: [
+          { Name: "email", Value: email },
+          { Name: "email_verified", Value: "true" }, // Set to true so email is verified
+          { Name: "given_name", Value: givenName },
+          { Name: "family_name", Value: familyName },
+          // custom:organization stores the organisation NAME (ratified
+          // decision 228b3cc8) and remains an admin-API-only write (PR
+          // 146 keeps this attribute non-user-writable) — the value comes
+          // from this admin-supplied input, never from a self-service path.
+          { Name: "custom:organization", Value: organization },
+        ],
+        // Remove MessageAction to allow Cognito to send the welcome email
+        DesiredDeliveryMediums: ["EMAIL"],
+      }),
+    );
+
+    console.log(`Successfully created user ${email}`);
+
+    return {
+      success: true,
+      message: `User ${email} created successfully. An invitation email with temporary password has been sent to their email address.`,
+    };
+  } catch (error: unknown) {
+    console.error("Error creating user:", error);
+
+    if (error instanceof Error && error.name === "UsernameExistsException") {
+      return {
+        success: false,
+        message: "A user with this email already exists",
+      };
+    }
+
+    return {
+      success: false,
+      message:
+        (error instanceof Error ? error.message : "") ||
+        "Failed to create user",
+    };
+  }
+}
+
+async function adminResendInvitation(
+  event: UserManagementResolverEvent,
+  userId: string,
+) {
+  // Verify the caller is an admin
+  const callerUsername =
+    event.identity?.username || event.identity?.claims?.username;
+
+  if (!callerUsername) {
+    throw new Error("Unable to determine caller identity");
+  }
+
+  // Check if caller is admin (with caching)
+  const callerIsAdmin = await isUserAdmin(callerUsername);
+
+  if (!callerIsAdmin) {
+    throw new Error("Only administrators can resend invitations");
+  }
+
+  try {
+    // Generate a temporary password and set it
+    const tempPassword = generateTemporaryPassword();
+
+    await cognitoClient.send(
+      new AdminSetUserPasswordCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: userId,
+        Password: tempPassword,
+        Permanent: false, // User must change password on first login
+      }),
+    );
+
+    return {
+      success: true,
+      message: "Invitation resent.",
+    };
+  } catch (error: unknown) {
+    console.error("Error resending invitation:", error);
+    return {
+      success: false,
+      message:
+        (error instanceof Error ? error.message : "") ||
+        "Failed to resend invitation",
+    };
+  }
+}
+
+function generateTemporaryPassword(): string {
+  const length = 12;
+  const charset =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
+  let password = "";
+
+  // Ensure password meets Cognito requirements
+  password += "A"; // uppercase
+  password += "a"; // lowercase
+  password += "1"; // digit
+  password += "!"; // symbol
+
+  for (let i = password.length; i < length; i++) {
+    password += charset.charAt(crypto.randomInt(charset.length));
+  }
+
+  // Shuffle the password using crypto-secure randomness
+  const arr = password.split("");
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr.join("");
+}

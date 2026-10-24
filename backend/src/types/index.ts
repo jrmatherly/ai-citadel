@@ -1,0 +1,1140 @@
+export interface Project {
+  id: string;
+  name: string;
+  status: ProjectStatus;
+  currentModule: Module;
+  progress: ProjectProgress;
+  createdAt: string;
+  updatedAt: string;
+  owner: string;
+  description?: string;
+  requirements?: string;
+  agents?: AgentStatus[];
+  // governance archetype classification.
+  // archetypeStatus defaults to PENDING when absent; the resolver normalises
+  // missing values on read so grandfathered DDB rows appear consistent.
+  archetype?: GovernanceArchetype;
+  archetypeConfidence?: number;
+  archetypeStatus?: ProjectArchetypeStatus;
+}
+
+export interface Module {
+  id: string;
+  name: string;
+  description: string;
+  status: ModuleStatus;
+  agentId: string;
+}
+
+export interface ProjectProgress {
+  overall: number;
+  assessment: number;
+  design: number;
+  planning: number;
+  implementation: number;
+  currentPhase: string;
+  estimatedCompletion?: string;
+}
+
+export interface AgentStatus {
+  agentId: string;
+  projectId: string;
+  status: AgentStatusEnum;
+  currentTask?: string;
+  progress?: number;
+  lastUpdate: string;
+  metadata?: Record<string, unknown>;
+  errorMessage?: string;
+}
+
+export interface ConversationMessage {
+  id: string;
+  projectId: string;
+  agentId: string;
+  message: string;
+  messageType: MessageType;
+  timestamp: string;
+  metadata?: Record<string, unknown>;
+  correlationId?: string;
+}
+
+export interface DocumentUploadResult {
+  success: boolean;
+  documentId?: string;
+  url?: string;
+  message: string;
+}
+
+export interface ProjectConnection {
+  items: Project[];
+  nextToken?: string;
+}
+
+export interface ProjectFilter {
+  status?: ProjectStatus;
+  owner?: string;
+  createdAfter?: string;
+  createdBefore?: string;
+}
+
+export interface CreateProjectInput {
+  name: string;
+  description?: string;
+  requirements?: string;
+}
+
+export interface UpdateProjectInput {
+  name?: string;
+  description?: string;
+  requirements?: string;
+  status?: ProjectStatus;
+  // governance archetype fields — all nullable for partial updates.
+  archetype?: GovernanceArchetype;
+  archetypeConfidence?: number;
+  archetypeStatus?: ProjectArchetypeStatus;
+}
+
+export interface AgentStatusInput {
+  status: AgentStatusEnum;
+  currentTask?: string;
+  progress?: number;
+  metadata?: Record<string, unknown>;
+  errorMessage?: string;
+}
+
+export interface ProjectProgressInput {
+  overall?: number;
+  assessment?: number;
+  design?: number;
+  planning?: number;
+  implementation?: number;
+  currentPhase?: string;
+  estimatedCompletion?: string;
+}
+
+export interface ConversationMessageInput {
+  agentId: string;
+  message: string;
+  messageType: MessageType;
+  metadata?: Record<string, unknown>;
+  correlationId?: string;
+}
+
+export interface S3Object {
+  bucket: string;
+  key: string;
+  region: string;
+}
+
+export enum ProjectStatus {
+  CREATED = "CREATED",
+  IN_PROGRESS = "IN_PROGRESS",
+  ASSESSMENT_COMPLETE = "ASSESSMENT_COMPLETE",
+  DESIGN_COMPLETE = "DESIGN_COMPLETE",
+  PLANNING_COMPLETE = "PLANNING_COMPLETE",
+  IMPLEMENTATION_READY = "IMPLEMENTATION_READY",
+  COMPLETED = "COMPLETED",
+  ERROR = "ERROR",
+}
+
+// governance archetype classification — frozen at three values
+// per QT2A-8 (no OTHER escape hatch; ambiguous projects use archetypeStatus
+// PENDING_ESCALATION instead).
+export enum GovernanceArchetype {
+  MONOLITHIC_DB = "MONOLITHIC_DB",
+  ENTERPRISE_APP_SPRAWL = "ENTERPRISE_APP_SPRAWL",
+  HYBRID_IT_OT = "HYBRID_IT_OT",
+}
+
+export enum ProjectArchetypeStatus {
+  PENDING = "PENDING",
+  CLASSIFIED = "CLASSIFIED",
+  PENDING_ESCALATION = "PENDING_ESCALATION",
+}
+
+// AgentDesignAssessment entity — four-dimension complexity
+// ranking per PLAN_GOV_FUTURE_STATE.md §3.1. dimensionRanking is always 4
+// entries with ranks forming exactly the set {1,2,3,4} (validated at the
+// resolver). FourDimension values frozen at four per QT2A-8 sibling rule.
+export type FourDimensionLiteral =
+  "CODE" | "DATA" | "INTEGRATION" | "INFRASTRUCTURE";
+
+export enum FourDimension {
+  CODE = "CODE",
+  DATA = "DATA",
+  INTEGRATION = "INTEGRATION",
+  INFRASTRUCTURE = "INFRASTRUCTURE",
+}
+
+export interface DimensionComplexity {
+  dimension: FourDimensionLiteral;
+  rank: number;
+  rationale: string;
+}
+
+export interface DimensionComplexityInput {
+  dimension: FourDimensionLiteral;
+  rank: number;
+  rationale: string;
+}
+
+export interface AgentDesignAssessment {
+  projectId: string;
+  archetype: GovernanceArchetype | null;
+  archetypeConfidence: number | null;
+  archetypeStatus: ProjectArchetypeStatus;
+  dimensionRanking: DimensionComplexity[];
+  accessibleDataSources: string[];
+  primaryRiskAreas: string[];
+  completedAt: string | null;
+  completedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SubmitAgentDesignAssessmentInput {
+  projectId: string;
+  archetype: GovernanceArchetype;
+  archetypeConfidence?: number;
+  dimensionRanking: DimensionComplexityInput[];
+  accessibleDataSources: string[];
+  primaryRiskAreas: string[];
+}
+
+// ADR (Architecture Decision Record) governance entity.
+// Matrix locked by QT3-5 in.kiro/planning/PLAN_GOV_DIFF.md §9.
+export enum ADRStatus {
+  PROPOSED = "PROPOSED",
+  LOCKED = "LOCKED",
+  SUPERSEDED = "SUPERSEDED",
+  REOPENED = "REOPENED",
+}
+
+export enum ADRSeverity {
+  LOW = "LOW",
+  MEDIUM = "MEDIUM",
+  HIGH = "HIGH",
+  CRITICAL = "CRITICAL",
+}
+
+export interface ADR {
+  adrId: string;
+  projectId: string;
+  title: string;
+  decision: string;
+  reasoning: string;
+  constraints: string[];
+  alternativesConsidered: string[];
+  revisitConditions: string[];
+  status: ADRStatus;
+  severity?: ADRSeverity;
+  affectsModules?: string[];
+  reviewers?: string[];
+  version: number;
+  createdAt: string;
+  createdBy: string;
+  lockedAt?: string;
+  supersededBy?: string;
+  sourceRoundIds: string[];
+}
+
+export interface ADRInput {
+  projectId: string;
+  title: string;
+  decision: string;
+  reasoning: string;
+  constraints: string[];
+  alternativesConsidered: string[];
+  revisitConditions: string[];
+  severity?: ADRSeverity;
+  affectsModules?: string[];
+  reviewers?: string[];
+  sourceRoundIds: string[];
+}
+
+// ADR re-open audit trail (QT2A-7 + QT3-3).
+// The authResult lifecycle is PENDING (row inserted before the Cognito
+// permission check) → ALLOWED | DENIED (after the check). transitionError
+// is populated only when authResult=ALLOWED but LifecycleManager rejected
+// the LOCKED→REOPENED transition; on DENIED and on success it stays unset.
+export type AuthResultLiteral = "PENDING" | "ALLOWED" | "DENIED";
+
+export interface ADRReopenAttempt {
+  attemptId: string;
+  adrId: string;
+  projectId: string;
+  attemptedBy: string;
+  attemptedAt: string;
+  proposedChange: string;
+  revisitConditionMatched: boolean;
+  reason: string;
+  authResult: AuthResultLiteral;
+  // Populated when auth was ALLOWED but the lifecycle transition then failed.
+  // Empty on success and on DENIED.
+  transitionError?: string;
+}
+
+export enum ModuleStatus {
+  PENDING = "PENDING",
+  IN_PROGRESS = "IN_PROGRESS",
+  COMPLETED = "COMPLETED",
+  ERROR = "ERROR",
+}
+
+export enum AgentStatusEnum {
+  IDLE = "IDLE",
+  PROCESSING = "PROCESSING",
+  WAITING_FOR_INPUT = "WAITING_FOR_INPUT",
+  COMPLETED = "COMPLETED",
+  ERROR = "ERROR",
+}
+
+export enum MessageType {
+  USER_INPUT = "USER_INPUT",
+  AGENT_RESPONSE = "AGENT_RESPONSE",
+  SYSTEM_NOTIFICATION = "SYSTEM_NOTIFICATION",
+  PROGRESS_UPDATE = "PROGRESS_UPDATE",
+}
+
+// Event types for EventBridge integration
+export interface AgentEvent {
+  eventType: string;
+  projectId: string;
+  agentId?: string;
+  payload: unknown;
+  timestamp: string;
+  correlationId?: string;
+}
+
+// Authorization context
+export interface AuthContext {
+  userId: string;
+  username?: string;
+  groups?: string[];
+  roles?: string[];
+}
+
+// Identity payload shape observed by the governance resolvers. Depending on
+// the AppSync auth mode, the role/group claims appear either at the top
+// level or nested under `claims`, so both locations are modelled.
+export interface GovernanceEventIdentity {
+  sub?: string;
+  username?: string;
+  "custom:role"?: string;
+  "cognito:groups"?: string[];
+  claims?: { "custom:role"?: string; [claim: string]: unknown };
+}
+
+// Minimal AppSync event shape shared by the governance resolvers (ADR,
+// ExecutionSpecification, InterrogationRound, AgentDesignAssessment,
+// ProgramReview). TArgs is the resolver-specific merged arguments view.
+export interface GovernanceResolverEvent<TArgs = Record<string, unknown>> {
+  info?: { fieldName?: string };
+  identity?: GovernanceEventIdentity;
+  arguments: TArgs;
+}
+
+// Service layer integration types
+export interface ServiceLayerRequest {
+  agentId: string;
+  projectId: string;
+  action: string;
+  payload: unknown;
+  correlationId: string;
+}
+
+export interface ServiceLayerResponse {
+  success: boolean;
+  data?: unknown;
+  error?: string;
+  correlationId: string;
+}
+
+// ExecutionSpecification
+export type SpecStatusLiteral =
+  "DRAFT" | "PENDING_REVIEW" | "APPROVED" | "REJECTED";
+
+export interface ExecutionSpecification {
+  specId: string;
+  projectId: string;
+  sourceAdrIds: string[];
+  structuredPayload: string; // AWSJSON — string-encoded
+  narrativeS3Uri: string;
+  status: SpecStatusLiteral;
+  version: number;
+  createdAt: string;
+  createdBy: string;
+  submittedAt?: string;
+  approvedAt?: string;
+  approvedBy?: string;
+  rejectedAt?: string;
+  rejectedBy?: string;
+  rejectionReason?: string;
+}
+
+export interface ExecutionSpecificationInput {
+  projectId: string;
+  sourceAdrIds: string[];
+  structuredPayload: string;
+  narrativeS3Uri: string;
+}
+
+export interface ReviseExecutionSpecificationInput {
+  structuredPayload: string;
+  narrativeS3Uri: string;
+}
+
+// EvalSuite / EvalCase (CIT-101 — Evaluation Domain Model + Versioned Suites)
+//
+// Eval suites are release evidence, governed exactly like
+// ExecutionSpecifications: RETAIN + deletionProtection tables, lifecycle-
+// gated, optimistically locked. See backend/src/adapters/lifecycle.ts
+// EVALSUITE_TRANSITIONS and backend/src/lambda/eval-resolver.ts.
+export type EvalSuiteStatusLiteral = "DRAFT" | "FROZEN" | "ARCHIVED";
+
+export interface EvalSuite {
+  suiteId: string;
+  orgId: string;
+  agentTargetId: string;
+  name: string;
+  description: string;
+  semver: string;
+  status: EvalSuiteStatusLiteral;
+  version: number;
+  references: string[];
+  parentSuiteId?: string | null;
+  frozenAt?: string;
+  frozenBy?: string;
+  approvedAt?: string;
+  approvedBy?: string;
+  createdAt: string;
+  createdBy: string;
+  updatedAt: string;
+  /** Optional gate-class metadata consumable by a future release gate
+   * (e.g. "adversarial-injection", "unauthorized-tool-use",
+   * "data-leakage", "policy-bypass", "unsafe-delegation"). Not enum-locked
+   * so orgs can extend with their own pack classes. Additive/optional —
+   * absent on every pre-existing suite. */
+  gateClass?: string;
+}
+
+export interface EvalSuiteInput {
+  orgId: string;
+  agentTargetId: string;
+  name: string;
+  description: string;
+  semver: string;
+  gateClass?: string;
+}
+
+export type EvalCaseKindLiteral = "CONVERSATION" | "EXECUTION";
+
+/**
+ * Phase 2 (production sampling) — admin-authored, per-org sampling
+ * configuration. Hard gate: sampling occurs only when `optIn === true`
+ * (see eval-sampling-config.ts's resolveEffectiveRate — a config with
+ * optIn!==true, or an absent config entirely, always resolves rate=0).
+ */
+export interface EvalSamplingConfig {
+  orgId: string;
+  optIn: boolean;
+  defaultSampleRate: number;
+  perAgentSampleRate: Record<string, number>;
+  updatedAt?: string;
+  updatedBy?: string;
+}
+
+export interface EvalSamplingConfigInput {
+  optIn: boolean;
+  defaultSampleRate: number;
+  perAgentSampleRate?: Record<string, number>;
+}
+
+export interface EvalCaseInputPayload {
+  prompt?: string | null;
+  transcript?: TranscriptMessage[] | null;
+  structuredInput?: string | null; // AWSJSON — string-encoded; null when unavailable (execution-kind honest limitation)
+}
+
+export type MatchSpecMode = "EXACT" | "CONTAINS" | "REGEX" | "JSON_SUBSET";
+
+export interface MatchSpec {
+  mode: MatchSpecMode;
+  target: string; // AWSJSON — string-encoded when target is structured
+  path?: string;
+}
+
+export type PolicyDecisionLiteral = "PERMIT" | "DENY" | "ESCALATE";
+
+export interface ExpectedPolicyOutcome {
+  decision: PolicyDecisionLiteral;
+  findingTypes: string[];
+  minSeverity?: string;
+}
+
+export interface GroundingRequirement {
+  sourceUri?: string;
+  mustCiteAnyOf: string[];
+  mustNotHallucinate: boolean;
+}
+
+export type ToolSequenceMode = "SET" | "SUBSEQUENCE" | "STRICT";
+
+export interface ToolSequenceSpec {
+  mode: ToolSequenceMode;
+  tools: string[];
+}
+
+/** Phase 1 (trajectory eval dimension) — see
+ * backend/src/lambda/utils/eval-trajectory.ts::TrajectorySpecForScoring.
+ * All sub-fields optional; each present sub-field contributes one
+ * sub-assertion to the trajectory dimension score. Ordered toolSequence
+ * modes (SUBSEQUENCE/STRICT) degrade to UNKNOWN at scoring time when no
+ * ordering signal is available — never guessed. */
+export interface TrajectorySpec {
+  toolSequence?: ToolSequenceSpec;
+  dagPath?: string[];
+  maxSteps?: number;
+  noLoop?: boolean;
+  noRedundantCalls?: boolean;
+}
+
+export type EvalCaseProvenanceSourceLiteral =
+  "AUTHORED" | "IMPORTED_FROM_REPLAY";
+
+export interface EvalCaseProvenance {
+  source: EvalCaseProvenanceSourceLiteral;
+  packageHash?: string;
+  producerCommit: string | null;
+  correlationId?: string;
+  importedAt?: string;
+  /** Set true when the source replay package's toolResults.partial === true. */
+  toolResultsPartial?: boolean;
+  /** Honest v1 limitation note — set for execution-kind imports (nodes[].inputs unavailable). */
+  note?: string;
+}
+
+export interface EvalCase {
+  suiteId: string;
+  caseId: string;
+  name: string;
+  description: string;
+  kind: EvalCaseKindLiteral;
+  input: EvalCaseInputPayload;
+  expectedOutcome: MatchSpec;
+  requiredTools: string[];
+  forbiddenTools: string[];
+  expectedPolicyOutcome?: ExpectedPolicyOutcome;
+  groundingRequirements?: GroundingRequirement[];
+  maxLatencyMs?: number;
+  maxCostUsd?: number;
+  trajectorySpec?: TrajectorySpec;
+  provenance: EvalCaseProvenance;
+  version: number;
+  createdAt: string;
+  createdBy: string;
+  updatedAt: string;
+}
+
+export interface EvalCaseInput {
+  name: string;
+  description: string;
+  kind: EvalCaseKindLiteral;
+  input: EvalCaseInputPayload;
+  expectedOutcome: MatchSpec;
+  requiredTools?: string[];
+  forbiddenTools?: string[];
+  expectedPolicyOutcome?: ExpectedPolicyOutcome;
+  groundingRequirements?: GroundingRequirement[];
+  maxLatencyMs?: number;
+  maxCostUsd?: number;
+  trajectorySpec?: TrajectorySpec;
+}
+
+// EvalRun / EvalRunCaseResult (CIT-102 — Eval Runner)
+//
+// FROZEN CROSS-LANGUAGE CONTRACT (Pass A -> Pass B), verbatim per architect
+// design §9: execution/dispatch detail additive keys `evalRunId: string`,
+// `evalContext: true`, `forbiddenTools: string[]`; governance finding field
+// `eval_run_id` (Python dataclass) <-> `evalRunId` (DDB/event alias).
+export type EvalRunStatusLiteral =
+  "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
+
+export type EvalRunCaseStatusLiteral =
+  "PENDING" | "DISPATCHED" | "RUNNING" | "COMPLETED" | "FAILED" | "TIMEOUT";
+
+export interface EvalRun {
+  evalRunId: string;
+  orgId: string;
+  suiteId: string;
+  suiteVersion: number;
+  agentTargetId: string;
+  agentTargetVersion: string;
+  status: EvalRunStatusLiteral;
+  caseCount: number;
+  pendingCases: number;
+  startedAt: string;
+  startedBy: string;
+  completedAt?: string;
+  durationMs?: number;
+  idempotencyKey: string;
+  evalScopedRoleArn?: string;
+  error?: string;
+  /** CIT-103, additive: per-dimension aggregates computed by
+   * eval-run-aggregator.ts on governance.eval.run.completed. AWSJSON on
+   * the wire — serialized DimensionAggregate[] (eval-score-aggregate.ts).
+   * NEVER a composite single number (design §4 — see
+   * eval-no-composite.guard.test.ts). Absent until the aggregator has run
+   * at least once for this run. */
+  scoreAggregates?: string;
+}
+
+export interface StartEvalRunInput {
+  suiteId: string;
+  agentTargetId: string;
+  agentTargetVersion: string;
+  idempotencyKey: string;
+}
+
+export interface EvalRunCaseResult {
+  evalRunId: string;
+  caseId: string;
+  orgId: string;
+  caseKind: EvalCaseKindLiteral;
+  targetAdapter: "execution" | "conversation";
+  status: EvalRunCaseStatusLiteral;
+  executionId?: string;
+  conversationId?: string;
+  /** Per-case minted correlation id (mintRunId()) — distinct from evalRunId. */
+  runId?: string;
+  dispatchedAt?: string;
+  startedAt?: string;
+  completedAt?: string;
+  deadlineAt?: string;
+  latencyMs?: number;
+  artifactKind?: "execution" | "conversation";
+  artifactRef?: string;
+  error?: string;
+  timedOut?: boolean;
+  /** Guards the atomic pendingCases decrement against duplicate completion events. */
+  completionRecorded?: boolean;
+  /** CIT-103, additive: the case's 7-dimension ScoreVector (eval-scoring.ts
+   * DimensionScore[]), SET idempotently by eval-case-scorer.ts (and,
+   * defensively, by eval-run-aggregator.ts's self-sufficient fallback
+   * scoring for any COMPLETED case missing one). AWSJSON on the wire.
+   * Absent for PENDING/DISPATCHED/RUNNING/FAILED/TIMEOUT cases and for a
+   * COMPLETED case not yet scored. */
+  scoreVector?: string;
+  /** ISO-8601 timestamp of the most recent scoreVector write. */
+  scoredAt?: string;
+  /** Scorer implementation version — bumping this is how CIT-107's
+   * pluggable-evaluator registry signals a re-score is warranted; a
+   * re-score with an unchanged scorerVersion is idempotent (deterministic
+   * dims are byte-equal, design §5/§6). */
+  scorerVersion?: string;
+}
+
+// EvalBaseline / EvalComparison (CIT-105) — I/O layer wire shapes. The
+// pure compute types (EvalComparisonVerdict, EvalComparisonDimension, ...)
+// live in src/lambda/utils/eval-comparison.ts and are reused verbatim here
+// (never re-declared) — this section only adds the DDB row / GraphQL wire
+// shapes the resolver persists and returns.
+import type {
+  EvalComparisonVerdict,
+  ResolvedComparisonThresholds,
+} from "../lambda/utils/eval-comparison";
+import type { PartialComparisonThresholds } from "../lambda/utils/eval-comparison-config";
+
+/** EvalBaselinesTable row (PK orgId, SK `${agentTargetId}#${suiteId}`) —
+ * mutable designation pointer, re-baselined on promotion (design §3). */
+export interface EvalBaseline {
+  orgId: string;
+  agentTargetId: string;
+  suiteId: string;
+  baselineEvalRunId: string;
+  baselineSuiteVersion: number;
+  baselineAgentTargetVersion: string;
+  previousBaselineEvalRunId?: string;
+  reason?: string;
+  designatedAt: string;
+  designatedBy: string;
+  version: number;
+}
+
+export interface DesignateEvalBaselineInput {
+  orgId: string;
+  agentTargetId: string;
+  suiteId: string;
+  baselineEvalRunId: string;
+  reason?: string;
+}
+
+/** EvalComparisonsTable row (PK comparisonId) — computed verdict, release
+ * evidence (design §3). `caseDetail` carries the full per-case×per-dimension
+ * EvalComparisonVerdict.dimensions[].perCase breakdown inline as AWSJSON
+ * when under the size cap; `caseDetailRef` points at the S3 offload
+ * (`eval-comparisons/{comparisonId}.json`) when it exceeds the cap. Exactly
+ * one of the two is set. The dimension-level summary (everything in
+ * EvalComparisonVerdict EXCEPT perCase) is always stored inline — it is
+ * small and bounded (8 dims). */
+export interface EvalComparisonRow {
+  comparisonId: string;
+  orgId: string;
+  suiteId: string;
+  suiteVersion: number;
+  agentTargetId: string;
+  baselineEvalRunId: string;
+  baselineAgentTargetVersion: string;
+  candidateEvalRunIds: string[];
+  candidateAgentTargetVersion: string;
+  repeatCount: number;
+  scorerVersions: string[];
+  thresholds: ResolvedComparisonThresholds;
+  /** Dimension summaries WITHOUT the perCase breakdown (offloaded/inlined
+   * separately as caseDetail/caseDetailRef) — see design §3. */
+  dimensions: Omit<EvalComparisonVerdict["dimensions"][number], "perCase">[];
+  anyMaterialRegression: boolean;
+  materiallyRegressedDimensions: string[];
+  unstableDimensions: string[];
+  verdictStatus: EvalComparisonVerdict["verdictStatus"];
+  /** Inline per-case×per-dimension breakdown (AWSJSON on the wire) — set
+   * when under MAX_JSON_FIELD_BYTES, mutually exclusive with caseDetailRef. */
+  caseDetail?: string;
+  /** S3 key (`eval-comparisons/{comparisonId}.json`) — set when caseDetail
+   * would exceed the size cap, mutually exclusive with caseDetail. */
+  caseDetailRef?: string;
+  createdAt: string;
+  createdBy: string;
+}
+
+export interface ComputeEvalComparisonInput {
+  orgId: string;
+  suiteId: string;
+  candidateEvalRunIds: string[];
+  baselineEvalRunId?: string;
+  thresholdOverride?: PartialComparisonThresholds;
+  idempotencyKey: string;
+}
+
+/** EvalComparisonConfigTable row (PK orgId, SK suiteId; SK sentinel
+ * `__default__` = org-wide default) — admin-authored threshold config
+ * source of truth (design §4). Reuses ComparisonThresholdConfigRow's
+ * `thresholds` shape from eval-comparison-config.ts. */
+export interface EvalComparisonThresholdConfigRow {
+  orgId: string;
+  suiteId: string;
+  thresholds: PartialComparisonThresholds;
+  updatedAt?: string;
+  updatedBy?: string;
+  version: number;
+}
+
+export interface SetEvalComparisonThresholdConfigInput {
+  thresholds: PartialComparisonThresholds;
+}
+
+// EvalCaseArtifactDiff (CIT-105 per-case artifact read path) — I/O-layer
+// wire shapes for getEvalCaseArtifactDiff. Honest per-side absence enum
+// (design memory projects/cit-105-artifacts-design §2): every state is
+// distinguishable and never faked/empty-defaulted.
+export type EvalArtifactAvailability =
+  | "OK"
+  | "RUN_ABSENT"
+  | "RUN_NOT_COMPLETED"
+  | "CASE_ABSENT"
+  | "ARTIFACT_MISSING"
+  | "ARTIFACT_UNRESOLVED"
+  | "ARTIFACT_WITHHELD_SANITISATION";
+
+export interface GetEvalCaseArtifactDiffInput {
+  orgId: string;
+  suiteId: string;
+  caseId: string;
+  baselineEvalRunId: string;
+  candidateEvalRunId: string;
+  transcriptCursor?: string | null;
+  trajectoryCursor?: string | null;
+}
+
+export interface EvalArtifactSideView {
+  side: "BASELINE" | "CANDIDATE";
+  availability: EvalArtifactAvailability;
+  evalRunId: string;
+  caseId: string;
+  caseKind?: EvalCaseKindLiteral;
+  artifactKind?: string;
+  correlationId?: string;
+  sanitisation?: {
+    redactPiiVersion: string;
+    secretPatternsVersion: string;
+    gate: string;
+  };
+  transcript: Array<{
+    index: number;
+    role: string;
+    content: string;
+    truncated: boolean;
+  }>;
+  transcriptTotalCount: number;
+  transcriptReturnedCount: number;
+  transcriptTruncated: boolean;
+  transcriptNextCursor: string | null;
+  transcriptTotalBytes: number;
+  transcriptReturnedBytes: number;
+  trajectory: Array<{
+    stepIndex: number;
+    nodeId: string;
+    agentId: string | null;
+    status: string | null;
+    startedAt: string | null;
+    completedAt: string | null;
+    output: unknown;
+    outputTruncated: boolean;
+  }>;
+  trajectoryTotalCount: number;
+  trajectoryReturnedCount: number;
+  trajectoryTruncated: boolean;
+  trajectoryNextCursor: string | null;
+  toolSet: string[];
+  toolOrder: string[] | null;
+}
+
+export interface EvalCaseArtifactDiff {
+  suiteId: string;
+  caseId: string;
+  baseline: EvalArtifactSideView;
+  candidate: EvalArtifactSideView;
+}
+
+// InterrogationRound
+export type RoundStatusLiteral =
+  "IN_PROGRESS" | "AWAITING_CONSTRAINTS" | "REVISED" | "STABILISED";
+
+export interface TranscriptMessage {
+  role: string;
+  content: string;
+}
+
+export interface InterrogationRound {
+  projectId: string;
+  roundN: number;
+  transcriptS3Uri: string;
+  status: RoundStatusLiteral;
+  humanConstraints?: string[];
+  revisedRecommendation?: string;
+  startedAt: string;
+  completedAt?: string;
+  transcriptSizeBytes?: number;
+}
+
+// ProgramReview — executive governance-checklist audit (Req 10).
+// Contract shared with backend/src/lambda/program-review-resolver.ts (Track A).
+// Question catalogue is parsed at Lambda cold-start from
+// backend/src/lambda/governance-checklist.md bundled next to the handler. Each
+// ChecklistResult.answer is one of ChecklistAnswer and represents the
+// evidence-based evaluation of one of the 20 checklist questions.
+export type ChecklistAnswerLiteral =
+  "PASS" | "FAIL" | "NOT_APPLICABLE" | "PENDING_EVIDENCE";
+
+export enum ChecklistAnswer {
+  PASS = "PASS",
+  FAIL = "FAIL",
+  NOT_APPLICABLE = "NOT_APPLICABLE",
+  PENDING_EVIDENCE = "PENDING_EVIDENCE",
+}
+
+export interface ChecklistResult {
+  questionId: string;
+  question: string;
+  answer: ChecklistAnswerLiteral;
+  evidenceRefs: string[];
+  notes: string | null;
+}
+
+export interface ProgramReview {
+  reviewId: string;
+  projectId: string;
+  results: ChecklistResult[];
+  runAt: string;
+  runBy: string;
+  createdAt: string;
+}
+
+// ── Agent Release Bundles (slice 1) ─────────────────────────────────────
+//
+// AgentRelease is a content-addressed, immutable audit record: its
+// identity (releaseId) is the sha256 of the canonicalized constituents
+// below, computed order-independently over object keys and set-like
+// collections (see release-hash.ts). It has no lifecycle/status field —
+// it is a pure snapshot, never updated or deleted after creation.
+//
+// Two reference classes (per design):
+//   Class A — POINTER: sources that are immutable-by-lifecycle
+//     (execSpecId+execSpecVersion; evalRunId+evalSuiteId+evalSuiteVersion).
+//   Class B — SNAPSHOT: sources that mutate in place, so the release
+//     pins an inline content snapshot + digest rather than a version
+//     pointer (agentConfig, promptVersions, modelConfigSnapshot,
+//     toolConfigs, policySnapshot).
+//
+// Eval evidence is intentionally NON-NULLABLE: a release cannot exist
+// without evalRunId + evalSuiteId + evalSuiteVersion.
+
+/** Class B — inline content snapshot + digest of a mutable source. */
+export interface ContentSnapshot {
+  /** Identifier of the source record this snapshot was taken from. */
+  sourceId: string;
+  /** Inline snapshot of the source's content at cut time. */
+  content: string;
+  /** sha256 digest of `content`, computed independently for tamper
+   * detection at the constituent level (in addition to the release-wide
+   * releaseId hash). */
+  digest: string;
+}
+
+/** Class B — resolved per-slot model configuration snapshot. */
+export interface ModelConfigSnapshot {
+  slot: string;
+  content: string;
+  digest: string;
+}
+
+/** Class B — governance/policy posture snapshot at cut time. */
+export interface PolicySnapshot {
+  enforcementMode: string;
+  ruleSetVersion: string;
+  authorityUnitGrantIds: string[];
+}
+
+/** Non-nullable eval evidence pinned into a release. Class A — referenced
+ * by pointer because EvalRun rows are append-only and the suite is frozen
+ * (references[]>0) at cut time rather than snapshotted. */
+export interface AgentReleaseEvalEvidence {
+  evalRunId: string;
+  evalSuiteId: string;
+  evalSuiteVersion: number;
+}
+
+/** The full set of constituents pinned by a release. This exact shape
+ * (independent of key/array ordering) is what releaseId's hash covers. */
+export interface AgentReleaseConstituents {
+  /** Class B — registry descriptor snapshot for the agent config. */
+  agentConfig: ContentSnapshot;
+  /** Class B — promptName -> content snapshot. */
+  promptVersions: Record<string, ContentSnapshot>;
+  /** Class A — APPROVED (terminal/immutable) execution specification. */
+  execSpecId: string;
+  execSpecVersion: number;
+  /** Class B — resolved per-slot model configuration snapshots. */
+  modelConfigSnapshots: ModelConfigSnapshot[];
+  /** Class B — tool descriptor snapshots. */
+  toolConfigs: ContentSnapshot[];
+  /** Class B — governance/policy posture snapshot. */
+  policySnapshot: PolicySnapshot;
+  /** Class A — non-nullable eval evidence. */
+  evalEvidence: AgentReleaseEvalEvidence;
+}
+
+/** A cut, immutable AgentRelease row. releaseId is the content hash of
+ * `constituents` (see release-hash.ts) and is never recomputed or
+ * reassigned after the row is created. */
+export interface AgentRelease extends AgentReleaseConstituents {
+  releaseId: string;
+  orgId: string;
+  agentTargetId: string;
+  semver: string;
+  createdAt: string;
+  createdBy: string;
+  /** Provenance mirrored from deployment-manifest.json. */
+  gitSha: string;
+  region: string;
+  runId: string;
+}
+
+/** Input to cut a new release — everything but the computed releaseId. */
+export type AgentReleaseInput = Omit<AgentRelease, "releaseId">;
+
+// ── Environment Release Pointer (agent releases, follow-on slice) ──────
+//
+// Value set mirrors the CDK deploy-stage literal already threaded through
+// this codebase as `props.environment` / `process.env.ENVIRONMENT` (see
+// bin/app.ts: `process.env.ENVIRONMENT || "dev"`; backend-stack.ts's
+// `${props.environment}` table-name suffixing) rather than inventing a
+// separate set of environment names. Cased UPPERCASE here, not lowercase
+// like the CDK prop, to match this codebase's own enum convention (every
+// other GraphQL-enum-backed literal type in this file —
+// EvalCaseKindLiteral, EvalRunStatusLiteral, SpecStatusLiteral, etc. — is
+// UPPERCASE end-to-end with its GraphQL enum). "TEST" is excluded — it is
+// a CDK-synth-only stack suffix (see e.g.
+// test/backend-stack-agent-releases-table.test.ts), never a real
+// promotion target an agent is dispatched against.
+export type EnvironmentLiteral = "DEV" | "STAGING" | "PROD";
+
+/**
+ * EnvironmentReleasePointerTable row (PK orgId, SK
+ * `${agentTargetId}#${environment}`) — the MUTABLE cursor saying which
+ * AgentRelease an (org, agent, environment) triple currently runs.
+ * Deliberately the opposite of AgentRelease's immutability: this row is
+ * overwritten on every promotion, but ONLY via a version-gated
+ * ConditionExpression at the write boundary (environment-release-
+ * pointer-store.ts) — never a blind Put. previousReleaseId is carried
+ * forward on every move so a later rollback story can read what was
+ * running immediately before the current release, without having to
+ * replay history from elsewhere.
+ */
+export interface EnvironmentReleasePointer {
+  orgId: string;
+  agentTargetId: string;
+  environment: EnvironmentLiteral;
+  releaseId: string;
+  previousReleaseId: string | null;
+  promotedAt: string;
+  promotedBy: string;
+  version: number;
+  /** Canary state (attribution-only interim — decision D2). Absent/null
+   * ⇒ no canary ⇒ 100% of dispatch resolves the stable `releaseId`, so
+   * every pre-canary pointer row (and every reader) behaves exactly as
+   * before. When present, `releaseId` remains the STABLE arm (source of
+   * truth) and `canary.candidateReleaseId` is arm B; the split is a pure
+   * function of a server-minted stickiness key, the preserved salt, and
+   * `percentBasisPoints`. See canary-assignment.ts. */
+  canary?: CanaryState | null;
+  /** Discriminates why this pointer version was written (I3 gap-free
+   * history). Absent on pre-canary rows (treated as PROMOTE). */
+  transitionType?: PointerTransitionType;
+}
+
+/** Why a pointer version was written. PROMOTE is the pre-canary move
+ * (and the default when the attribute is absent, for backward-compat).
+ * The CANARY_* transitions are all written through the SAME version-gated
+ * atomic pointer+history write as PROMOTE. */
+export type PointerTransitionType =
+  | "PROMOTE"
+  | "CANARY_START"
+  | "CANARY_REWEIGHT"
+  | "CANARY_PROMOTE"
+  | "CANARY_ABORT"
+  // Auto (non-human) transitions minted SERVER-SIDE by the release-
+  // rollback evaluator (never accepted from caller input — the floor
+  // derivation keys on human-vs-system, so a spoofable transition would
+  // let a buggy/compromised caller forge a human baseline). AUTO_ABORT_CANARY
+  // is the v1 action: zero the candidate arm, leave the human-promoted
+  // stable `releaseId` untouched — by construction it can never cross the
+  // floor. AUTO_ROLLBACK (flip stable → previousReleaseId) is reserved for
+  // the floor logic and a future action scope; the v1 evaluator never
+  // mints it (decision D4: ABORT_CANARY-only).
+  | "AUTO_ABORT_CANARY"
+  | "AUTO_ROLLBACK";
+
+/** Canary traffic-split state carried on the pointer row (decision D2:
+ * ATTRIBUTION-ONLY — there is no release→config binding yet, so both arms
+ * run the identical live config; the arm only labels which release WOULD
+ * serve, recorded on usage/findings/metrics). `salt` is minted ONCE at
+ * startCanary and PRESERVED verbatim across every reweight (decision D3,
+ * stable-salt-recompute, NO pin store); it is cleared only on
+ * promote/abort. Deliberately NOT exposed over GraphQL (internal). */
+export interface CanaryState {
+  /** Arm B — a release already gate-passed for this env at startCanary. */
+  candidateReleaseId: string;
+  /** Threshold in basis points, integer 0..10000 (0.00%..100.00%). */
+  percentBasisPoints: number;
+  /** Stickiness unit. Interim keys are server-minted orchestrationId
+   * (supervisor) / executionId (stepRunner) — see decision D1. */
+  stickiness: CanaryStickiness;
+  /** Minted once at start, preserved across reweight (decision D3). */
+  salt: string;
+  startedAt: string;
+  /** Server-derived identity of the operator who started the canary. */
+  startedBy: string;
+}
+
+/** Canary stickiness unit. `conversation`/`user` are the specced units;
+ * the interim implementation keys on the server-minted orchestration /
+ * execution id (decision D1 — no conversationId threading yet). */
+export type CanaryStickiness = "conversation" | "user";
+
+/** Interim human-approval input for promoteEnvironmentReleasePointer
+ * (decision 8165b7e5 — rides the existing promote mutation; the CIT-030
+ * approval substrate does not exist). `approved` is caller-supplied;
+ * `decidedBy` is deliberately ABSENT here — it is derived from
+ * authContext.userId in the resolver, never accepted from input. */
+export interface PromotionApproval {
+  approved: boolean;
+  justification?: string | null;
+}
+
+/** Input to set (create-or-move) the pointer for one (agentTargetId,
+ * environment) pair. orgId is derived from the caller, never taken from
+ * caller-supplied input — same doctrine as CutAgentReleaseInput.
+ * `approval` is OPTIONAL and its requirement is mode-dependent — see
+ * environment-release-pointer-resolver.ts's promoteEnvironmentReleasePointer
+ * for the strict/shadow/permissive disposition. */
+export interface SetEnvironmentReleasePointerInput {
+  agentTargetId: string;
+  environment: EnvironmentLiteral;
+  releaseId: string;
+  approval?: PromotionApproval | null;
+}
+
+/**
+ * EnvironmentReleasePointerHistory row (G6 — "what ran in PROD on date
+ * D"). Append-only time-series of every pointer move, written ATOMICALLY
+ * with the pointer move itself (TransactWriteItems inside the sole
+ * pointer writer, environment-release-pointer-store.ts), so history is a
+ * gap-free record of every promotion — an invariant enforced at the
+ * write boundary, matching AgentRelease's own immutability philosophy.
+ * PK orgId, SK `${agentTargetId}#${environment}#${promotedAt}#${version}`
+ * (the composite stored under the `historySortKey` attribute) so a
+ * `begins_with(agent#env#)` Query with a `<= D` range answers "what
+ * release was running in that env at date D" — take the greatest
+ * (latest) row ≤ D. `version` disambiguates equal-millisecond timestamps
+ * and guarantees uniqueness. Every attribute mirrors
+ * EnvironmentReleasePointer.
+ */
+export interface EnvironmentReleasePointerHistoryEntry {
+  orgId: string;
+  agentTargetId: string;
+  environment: EnvironmentLiteral;
+  releaseId: string;
+  previousReleaseId: string | null;
+  promotedAt: string;
+  promotedBy: string;
+  version: number;
+  /** Snapshot of the canary state at this version (null when the version
+   * carried no canary — e.g. a plain PROMOTE, or a CANARY_PROMOTE/ABORT
+   * that cleared it). Absent on pre-canary history rows. */
+  canary?: CanaryState | null;
+  /** Discriminates the transition that produced this version. Absent on
+   * pre-canary rows (treated as PROMOTE). */
+  transitionType?: PointerTransitionType;
+}
+
+/** Input to startCanary — begins a canary episode. `orgId`/`startedBy`
+ * are server-derived, never taken from input. `approval` rides the same
+ * strict-mode gate as a full promotion (decision D4/D7: startCanary runs
+ * the identical ladder + quality gate + approval chain). */
+export interface StartCanaryInput {
+  agentTargetId: string;
+  environment: EnvironmentLiteral;
+  candidateReleaseId: string;
+  percentBasisPoints: number;
+  stickiness: CanaryStickiness;
+  approval?: PromotionApproval | null;
+}
+
+/** Input to reweightCanary — moves only the threshold; the salt (hence
+ * every key's bucket) is preserved, so only keys the threshold crosses
+ * re-bucket (decision D3). No re-gate. */
+export interface ReweightCanaryInput {
+  agentTargetId: string;
+  environment: EnvironmentLiteral;
+  percentBasisPoints: number;
+}
+
+/** Input to promoteCanary (→100%, stable := candidate, clears canary) and
+ * abortCanary (→0%, revert to stable, clears canary). `approval` is
+ * consumed by promoteCanary's re-gate (decision D4). */
+export interface CanaryOpInput {
+  agentTargetId: string;
+  environment: EnvironmentLiteral;
+  approval?: PromotionApproval | null;
+}

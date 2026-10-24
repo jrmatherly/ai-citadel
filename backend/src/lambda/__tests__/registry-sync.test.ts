@@ -1,0 +1,1776 @@
+/**
+ * Tests for registry-sync Lambda — event validation, routing, and cache operations
+ */
+
+// Set env vars before importing the module
+process.env.AGENT_CONFIG_TABLE = "test-agents-table";
+process.env.TOOLS_CONFIG_TABLE = "test-tools-table";
+process.env.REGISTRY_ID = "test-registry-id";
+process.env.DLQ_URL = "https://sqs.us-east-1.amazonaws.com/123456789/test-dlq";
+
+import { mockClient } from "aws-sdk-client-mock";
+import {
+  DynamoDBDocumentClient,
+  PutCommand,
+  DeleteCommand,
+  UpdateCommand,
+} from "@aws-sdk/lib-dynamodb";
+import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
+import {
+  CloudWatchClient,
+  PutMetricDataCommand,
+} from "@aws-sdk/client-cloudwatch";
+import { TypeMismatchError } from "../../services/registry-service";
+import type { RegistryRecord } from "../../services/registry-service";
+
+// Mock the shared RegistryService used by the GA record-fetch path — the
+// GA event only carries registryRecordId/registryId, so the handler must
+// hydrate the full record before it can build a cache row.
+const mockGetResource = jest.fn();
+jest.mock("../../services/registry-service", () => {
+  const actual = jest.requireActual("../../services/registry-service");
+  return {
+    ...actual,
+    RegistryService: jest.fn().mockImplementation(() => ({
+      getResource: mockGetResource,
+    })),
+  };
+});
+
+import {
+  handler,
+  validateEvent,
+  getTableForResourceType,
+  toInternalState,
+  deserializeCustomMetadata,
+  buildAgentCacheRecord,
+  buildToolCacheRecord,
+  handleCreateOrUpdate,
+  handleDelete,
+  handleStatusChanged,
+  sendToDlq,
+  emitSyncFailureMetric,
+} from "../registry-sync";
+import type {
+  RegistryEvent,
+  RegistryResourcePayload,
+  ResourceType,
+} from "../registry-sync";
+
+// ---------------------------------------------------------------------------
+// Mocks
+// ---------------------------------------------------------------------------
+
+const ddbMock = mockClient(DynamoDBDocumentClient);
+const sqsMock = mockClient(SQSClient);
+const cwMock = mockClient(CloudWatchClient);
+
+beforeEach(() => {
+  ddbMock.reset();
+  sqsMock.reset();
+  cwMock.reset();
+  mockGetResource.mockReset();
+  // Default: SQS and CloudWatch succeed
+  sqsMock.on(SendMessageCommand).resolves({});
+  cwMock.on(PutMetricDataCommand).resolves({});
+  jest.spyOn(console, "log").mockImplementation();
+  jest.spyOn(console, "warn").mockImplementation();
+  jest.spyOn(console, "error").mockImplementation();
+});
+
+afterEach(() => {
+  jest.restoreAllMocks();
+});
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Loosely-typed overrides so tests can build deliberately malformed events. */
+interface EventOverrides {
+  source?: string;
+  "detail-type"?: string;
+  detail?: Record<string, unknown>;
+}
+
+function makeEvent(overrides: EventOverrides = {}): RegistryEvent {
+  return {
+    source: "aws.agent-registry",
+    "detail-type": "Agent Registry Record Created",
+    detail: {
+      resourceId: "res-123",
+      resourceType: "agent",
+      eventType: "CREATED",
+      resource: { name: "TestAgent" },
+      ...overrides.detail,
+    },
+    ...overrides,
+    ...(overrides.detail
+      ? { detail: { ...makeEvent().detail, ...overrides.detail } }
+      : {}),
+  } as RegistryEvent;
+}
+
+function makeAgentResource(
+  overrides: RegistryResourcePayload = {},
+): RegistryResourcePayload {
+  return {
+    description: "A test agent for registry sync",
+    customDescriptorContent: JSON.stringify({
+      categories: ["cat1"],
+      icon: "icon.png",
+      state: "APPROVED",
+      appId: "app-1",
+      manifest: {
+        name: "TestAgent",
+        version: "1.0",
+        description: "A test agent",
+      },
+      config: { name: "TestAgent", filename: "test.py", schema: {} },
+      createdBy: "user-1",
+      sourceProjectId: "proj-1",
+    }),
+    createdAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-02T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function makeToolResource(
+  overrides: RegistryResourcePayload = {},
+): RegistryResourcePayload {
+  return {
+    description: JSON.stringify({ name: "TestTool", filename: "tool.py" }),
+    customDescriptorContent: JSON.stringify({
+      categories: ["toolcat"],
+      icon: "tool-icon.png",
+      state: "active",
+      integrationBindings: [
+        { integrationId: "int-1", integrationType: "REST" },
+      ],
+      dataStoreBindings: [{ dataStoreId: "ds-1", dataStoreType: "S3" }],
+      appId: "app-2",
+    }),
+    createdAt: "2024-02-01T00:00:00.000Z",
+    updatedAt: "2024-02-02T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// validateEvent (from task 4.1 — preserved)
+// ---------------------------------------------------------------------------
+
+describe("validateEvent", () => {
+  test("returns null for a valid event", () => {
+    expect(validateEvent(makeEvent())).toBeNull();
+  });
+
+  test("rejects null event", () => {
+    expect(validateEvent(null)).toBe("Event is null or undefined");
+  });
+
+  test("rejects wrong source", () => {
+    expect(validateEvent(makeEvent({ source: "aws.s3" }))).toContain(
+      "Unexpected event source",
+    );
+  });
+
+  test("rejects wrong detail-type", () => {
+    expect(
+      validateEvent(makeEvent({ "detail-type": "SomethingElse" })),
+    ).toContain("Unexpected detail-type");
+  });
+
+  // GA namespace migration: the rule/handler no longer accept a single
+  // hard-coded detail-type — every record-lifecycle detail-type in the
+  // allowlist must validate, and a registry-lifecycle detail-type (which
+  // this record-only handler does not process) must still be rejected.
+  test("accepts every allowlisted record detail-type", () => {
+    for (const detailType of [
+      "Agent Registry Record Created",
+      "Agent Registry Record Updated",
+      "Agent Registry Record Deleted",
+      "Agent Registry Record Status Changed",
+      "Agent Registry Record Pending Approval",
+      "Agent Registry Record Approved",
+      "Agent Registry Record Rejected",
+    ]) {
+      expect(
+        validateEvent(makeEvent({ "detail-type": detailType })),
+      ).toBeNull();
+    }
+  });
+
+  test("rejects a registry-lifecycle detail-type (not a record event)", () => {
+    expect(
+      validateEvent(makeEvent({ "detail-type": "Registry Ready" })),
+    ).toContain("Unexpected detail-type");
+  });
+
+  test("rejects missing detail", () => {
+    const event = {
+      source: "aws.agent-registry",
+      "detail-type": "Agent Registry Record Created",
+    };
+    expect(validateEvent(event)).toBe("Event detail is missing");
+  });
+
+  test("rejects missing resourceId", () => {
+    const event = makeEvent({
+      detail: { resourceId: "", resourceType: "agent", eventType: "CREATED" },
+    });
+    expect(validateEvent(event)).toContain("resourceId");
+  });
+
+  test("rejects invalid resourceType", () => {
+    const event = makeEvent({
+      detail: {
+        resourceId: "r1",
+        resourceType: "widget",
+        eventType: "CREATED",
+      },
+    });
+    expect(validateEvent(event)).toContain("Invalid resourceType");
+  });
+
+  test("rejects invalid eventType", () => {
+    const event = makeEvent({
+      detail: {
+        resourceId: "r1",
+        resourceType: "agent",
+        eventType: "EXPLODED",
+      },
+    });
+    expect(validateEvent(event)).toContain("Invalid eventType");
+  });
+
+  test("accepts all valid eventTypes", () => {
+    for (const eventType of [
+      "CREATED",
+      "UPDATED",
+      "DELETED",
+      "STATUS_CHANGED",
+    ]) {
+      const event = makeEvent({
+        detail: { resourceId: "r1", resourceType: "agent", eventType },
+      });
+      expect(validateEvent(event)).toBeNull();
+    }
+  });
+
+  test("accepts both agent and tool resourceTypes", () => {
+    for (const resourceType of ["agent", "tool"]) {
+      const event = makeEvent({
+        detail: { resourceId: "r1", resourceType, eventType: "CREATED" },
+      });
+      expect(validateEvent(event)).toBeNull();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getTableForResourceType (from task 4.1 — preserved)
+// ---------------------------------------------------------------------------
+
+describe("getTableForResourceType", () => {
+  test("routes agent to AGENT_CONFIG_TABLE", () => {
+    expect(getTableForResourceType("agent")).toBe("test-agents-table");
+  });
+
+  test("routes tool to TOOLS_CONFIG_TABLE", () => {
+    expect(getTableForResourceType("tool")).toBe("test-tools-table");
+  });
+
+  test("throws for unknown resourceType", () => {
+    expect(() =>
+      getTableForResourceType("widget" as unknown as ResourceType),
+    ).toThrow("Unknown resourceType");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// toInternalState
+// ---------------------------------------------------------------------------
+
+describe("toInternalState", () => {
+  test("maps APPROVED to active", () => {
+    expect(toInternalState("APPROVED")).toBe("active");
+  });
+
+  test("maps DEPRECATED to inactive", () => {
+    expect(toInternalState("DEPRECATED")).toBe("inactive");
+  });
+
+  test("maps DRAFT to maintenance", () => {
+    expect(toInternalState("DRAFT")).toBe("maintenance");
+  });
+
+  test("maps PENDING_APPROVAL to pending", () => {
+    expect(toInternalState("PENDING_APPROVAL")).toBe("pending");
+  });
+
+  test("maps unknown status to inactive with warning", () => {
+    expect(toInternalState("UNKNOWN_STATUS")).toBe("inactive");
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Unknown registry status"),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deserializeCustomMetadata
+// ---------------------------------------------------------------------------
+
+describe("deserializeCustomMetadata", () => {
+  const defaults = { categories: [] as string[], icon: "", state: "active" };
+
+  test("returns defaults for null input", () => {
+    expect(deserializeCustomMetadata(null, defaults)).toEqual(defaults);
+  });
+
+  test("returns defaults for empty string", () => {
+    expect(deserializeCustomMetadata("", defaults)).toEqual(defaults);
+  });
+
+  test("returns defaults for invalid JSON", () => {
+    expect(deserializeCustomMetadata("not-json", defaults)).toEqual(defaults);
+  });
+
+  test("returns defaults for JSON array", () => {
+    expect(deserializeCustomMetadata("[1,2]", defaults)).toEqual(defaults);
+  });
+
+  test("merges valid JSON with defaults", () => {
+    const result = deserializeCustomMetadata(
+      JSON.stringify({ categories: ["a"], icon: "x" }),
+      defaults,
+    );
+    expect(result).toEqual({ categories: ["a"], icon: "x", state: "active" });
+  });
+
+  test("overrides all defaults when all fields present", () => {
+    const result = deserializeCustomMetadata(
+      JSON.stringify({ categories: ["b"], icon: "y", state: "inactive" }),
+      defaults,
+    );
+    expect(result).toEqual({ categories: ["b"], icon: "y", state: "inactive" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildAgentCacheRecord
+// ---------------------------------------------------------------------------
+
+describe("buildAgentCacheRecord", () => {
+  test("maps all fields from resource with custom metadata", () => {
+    const resource = makeAgentResource();
+    const record = buildAgentCacheRecord("agent-1", resource);
+
+    expect(record.agentId).toBe("agent-1");
+    expect(record.config).toEqual({
+      name: "TestAgent",
+      filename: "test.py",
+      schema: {},
+    });
+    expect(record.description).toBe(resource.description);
+    expect(record.state).toBe("active");
+    expect(record.categories).toEqual(["cat1"]);
+    expect(record.icon).toBe("icon.png");
+    expect(record.appId).toBe("app-1");
+    expect(record.manifest).toEqual({
+      name: "TestAgent",
+      version: "1.0",
+      description: "A test agent",
+    });
+    expect(record.createdBy).toBe("user-1");
+    expect(record.sourceProjectId).toBe("proj-1");
+    expect(record.createdAt).toBe("2024-01-01T00:00:00.000Z");
+    expect(record.updatedAt).toBe("2024-01-02T00:00:00.000Z");
+  });
+
+  test("uses defaults when custom metadata is missing", () => {
+    const resource = { description: "desc" };
+    const record = buildAgentCacheRecord("agent-2", resource);
+
+    expect(record.agentId).toBe("agent-2");
+    expect(record.config).toBeUndefined();
+    expect(record.description).toBe("desc");
+    expect(record.state).toBe("active");
+    expect(record.categories).toEqual([]);
+    expect(record.icon).toBe("");
+    expect(record.appId).toBeUndefined();
+    expect(record.manifest).toBeUndefined();
+    expect(record.createdBy).toBeUndefined();
+    expect(record.sourceProjectId).toBeUndefined();
+  });
+
+  test("generates timestamps when not provided", () => {
+    const record = buildAgentCacheRecord("agent-3", {});
+    expect(record.createdAt).toBeDefined();
+    expect(record.updatedAt).toBeDefined();
+  });
+
+  test("denormalizes the event resource.name onto the cache record", () => {
+    const resource = makeAgentResource({
+      name: "Support Agent",
+    } as unknown as RegistryResourcePayload);
+    const record = buildAgentCacheRecord("agent-1", resource);
+    expect(record.name).toBe("Support Agent");
+  });
+
+  test("defaults name to empty string when resource.name is absent", () => {
+    const record = buildAgentCacheRecord("agent-2", { description: "desc" });
+    expect(record.name).toBe("");
+  });
+
+  test('denormalizes an explicit empty-string manifest orgId (system-shared) as ""', () => {
+    const resource = makeAgentResource({
+      customDescriptorContent: JSON.stringify({
+        orgId: "",
+        categories: [],
+        icon: "",
+        state: "APPROVED",
+      }),
+    });
+    const record = buildAgentCacheRecord("agent-1", resource);
+    expect(record.orgId).toBe("");
+  });
+
+  test("denormalizes a specific manifest orgId", () => {
+    const resource = makeAgentResource({
+      customDescriptorContent: JSON.stringify({
+        orgId: "org-1",
+        categories: [],
+        icon: "",
+        state: "APPROVED",
+      }),
+    });
+    const record = buildAgentCacheRecord("agent-1", resource);
+    expect(record.orgId).toBe("org-1");
+  });
+
+  test('leaves orgId undefined (NOT coerced to "") when the manifest omits it entirely', () => {
+    // Fail-closed requirement: a record that merely omits orgId must not be
+    // treated as system-shared by downstream tenant checks, which only
+    // special-case an EXPLICIT empty string.
+    const resource = makeAgentResource({
+      customDescriptorContent: JSON.stringify({
+        categories: [],
+        icon: "",
+        state: "APPROVED",
+      }),
+    });
+    const record = buildAgentCacheRecord("agent-1", resource);
+    expect(record.orgId).toBeUndefined();
+  });
+
+  test("leaves orgId undefined when customDescriptorContent is entirely absent", () => {
+    const record = buildAgentCacheRecord("agent-1", { description: "desc" });
+    expect(record.orgId).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // Finding c2538f86 — parity + negative coverage
+  // -------------------------------------------------------------------------
+
+  test("finding c2538f86: config/description/createdBy/sourceProjectId/state parity with inlineContent", () => {
+    const inlineConfig = {
+      name: "FabricatedAgent",
+      filename: "fabricated.py",
+      schema: { type: "object" },
+    };
+    const resource = makeAgentResource({
+      description: "Prose description that must NOT land in config",
+      customDescriptorContent: JSON.stringify({
+        config: inlineConfig,
+        createdBy: "user-42",
+        orgId: "org-9",
+        sourceProjectId: "proj-9",
+        state: "DEPRECATED",
+        categories: ["fabricated"],
+        icon: "fab-icon.png",
+      }),
+    });
+
+    const record = buildAgentCacheRecord("agent-fab-1", resource);
+
+    expect(record.config).toEqual(inlineConfig);
+    expect(record.description).toBe(resource.description);
+    expect(record.createdBy).toBe("user-42");
+    expect(record.orgId).toBe("org-9");
+    expect(record.sourceProjectId).toBe("proj-9");
+    expect(record.state).toBe(toInternalState("DEPRECATED"));
+    expect(record.state).toBe("inactive");
+  });
+
+  test("finding c2538f86: meta.config as a JSON string is parsed into an object", () => {
+    const inlineConfig = { name: "StrConfigAgent", filename: "str.py" };
+    const resource = makeAgentResource({
+      customDescriptorContent: JSON.stringify({
+        config: JSON.stringify(inlineConfig),
+        state: "APPROVED",
+        categories: [],
+        icon: "",
+      }),
+    });
+
+    const record = buildAgentCacheRecord("agent-fab-2", resource);
+    expect(record.config).toEqual(inlineConfig);
+  });
+
+  test("finding c2538f86: missing meta.config leaves config undefined and warns with the recordId, never falling back to description", () => {
+    const resource = makeAgentResource({
+      description: "Some prose description",
+      customDescriptorContent: JSON.stringify({
+        state: "APPROVED",
+        categories: [],
+        icon: "",
+      }),
+    });
+
+    const record = buildAgentCacheRecord("agent-fab-3", resource);
+    expect(record.config).toBeUndefined();
+    expect(record.config).not.toBe(resource.description);
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("agent-fab-3"),
+    );
+  });
+
+  test("finding c2538f86: a prose string in meta.config leaves config undefined and warns, never writing prose into config", () => {
+    const resource = makeAgentResource({
+      description: "The canonical description",
+      customDescriptorContent: JSON.stringify({
+        config: "This is prose, not a config object",
+        state: "APPROVED",
+        categories: [],
+        icon: "",
+      }),
+    });
+
+    const record = buildAgentCacheRecord("agent-fab-4", resource);
+    expect(record.config).toBeUndefined();
+    expect(record.config).not.toBe(resource.description);
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("agent-fab-4"),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildToolCacheRecord
+// ---------------------------------------------------------------------------
+
+describe("buildToolCacheRecord", () => {
+  test("maps all fields from resource with custom metadata", () => {
+    const resource = makeToolResource();
+    const record = buildToolCacheRecord("tool-1", resource);
+
+    expect(record.toolId).toBe("tool-1");
+    expect(record.config).toBe(resource.description);
+    expect(record.state).toBe("active");
+    expect(record.categories).toEqual(["toolcat"]);
+    expect(record.icon).toBe("tool-icon.png");
+    expect(record.integrationBindings).toEqual([
+      { integrationId: "int-1", integrationType: "REST" },
+    ]);
+    expect(record.dataStoreBindings).toEqual([
+      { dataStoreId: "ds-1", dataStoreType: "S3" },
+    ]);
+    expect(record.appId).toBe("app-2");
+    expect(record.createdAt).toBe("2024-02-01T00:00:00.000Z");
+    expect(record.updatedAt).toBe("2024-02-02T00:00:00.000Z");
+  });
+
+  test("uses defaults when custom metadata is missing", () => {
+    const resource = { description: "tool-desc" };
+    const record = buildToolCacheRecord("tool-2", resource);
+
+    expect(record.toolId).toBe("tool-2");
+    expect(record.state).toBe("active");
+    expect(record.categories).toEqual([]);
+    expect(record.integrationBindings).toBeUndefined();
+    expect(record.dataStoreBindings).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleCreateOrUpdate
+// ---------------------------------------------------------------------------
+
+describe("handleCreateOrUpdate", () => {
+  test("sends PutCommand for agent CREATED with conditional write", async () => {
+    ddbMock.on(PutCommand).resolves({});
+
+    const resource = makeAgentResource();
+    await handleCreateOrUpdate(
+      "test-agents-table",
+      "agent",
+      "agent-1",
+      resource,
+    );
+
+    const call = ddbMock.commandCalls(PutCommand)[0];
+    const input = call.args[0].input;
+
+    expect(input.TableName).toBe("test-agents-table");
+    expect(input.Item!.agentId).toBe("agent-1");
+    expect(input.ConditionExpression).toContain("attribute_not_exists");
+    expect(input.ConditionExpression).toContain("#updatedAt < :newUpdatedAt");
+  });
+
+  test("sends PutCommand for tool CREATED with correct key", async () => {
+    ddbMock.on(PutCommand).resolves({});
+
+    const resource = makeToolResource();
+    await handleCreateOrUpdate("test-tools-table", "tool", "tool-1", resource);
+
+    const call = ddbMock.commandCalls(PutCommand)[0];
+    const input = call.args[0].input;
+
+    expect(input.TableName).toBe("test-tools-table");
+    expect(input.Item!.toolId).toBe("tool-1");
+    expect(input.ExpressionAttributeNames!["#key"]).toBe("toolId");
+  });
+
+  test("sends PutCommand for UPDATED event (same logic as CREATED)", async () => {
+    ddbMock.on(PutCommand).resolves({});
+
+    const resource = makeAgentResource({
+      updatedAt: "2024-06-01T00:00:00.000Z",
+    });
+    await handleCreateOrUpdate(
+      "test-agents-table",
+      "agent",
+      "agent-1",
+      resource,
+    );
+
+    const call = ddbMock.commandCalls(PutCommand)[0];
+    expect(call.args[0].input.Item!.updatedAt).toBe("2024-06-01T00:00:00.000Z");
+  });
+
+  test("propagates DynamoDB errors (non-conditional)", async () => {
+    const error = new Error("DynamoDB failure");
+    error.name = "InternalServerError";
+    ddbMock.on(PutCommand).rejects(error);
+
+    await expect(
+      handleCreateOrUpdate(
+        "test-agents-table",
+        "agent",
+        "agent-1",
+        makeAgentResource(),
+      ),
+    ).rejects.toThrow("DynamoDB failure");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleDelete
+// ---------------------------------------------------------------------------
+
+describe("handleDelete", () => {
+  test("sends DeleteCommand for agent with correct key", async () => {
+    ddbMock.on(DeleteCommand).resolves({});
+
+    await handleDelete("test-agents-table", "agent", "agent-1");
+
+    const call = ddbMock.commandCalls(DeleteCommand)[0];
+    const input = call.args[0].input;
+
+    expect(input.TableName).toBe("test-agents-table");
+    expect(input.Key).toEqual({ agentId: "agent-1" });
+  });
+
+  test("sends DeleteCommand for tool with correct key", async () => {
+    ddbMock.on(DeleteCommand).resolves({});
+
+    await handleDelete("test-tools-table", "tool", "tool-1");
+
+    const call = ddbMock.commandCalls(DeleteCommand)[0];
+    expect(call.args[0].input.Key).toEqual({ toolId: "tool-1" });
+  });
+
+  test("propagates DynamoDB errors", async () => {
+    ddbMock.on(DeleteCommand).rejects(new Error("Delete failed"));
+
+    await expect(
+      handleDelete("test-agents-table", "agent", "a-1"),
+    ).rejects.toThrow("Delete failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleStatusChanged
+// ---------------------------------------------------------------------------
+
+describe("handleStatusChanged", () => {
+  test("sends UpdateCommand with mapped state for APPROVED", async () => {
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handleStatusChanged(
+      "test-agents-table",
+      "agent",
+      "agent-1",
+      "APPROVED",
+    );
+
+    const call = ddbMock.commandCalls(UpdateCommand)[0];
+    const input = call.args[0].input;
+
+    expect(input.TableName).toBe("test-agents-table");
+    expect(input.Key).toEqual({ agentId: "agent-1" });
+    expect(input.ExpressionAttributeValues![":newState"]).toBe("active");
+    expect(input.ConditionExpression).toContain("attribute_exists");
+    expect(input.ConditionExpression).toContain("#state <> :newState");
+  });
+
+  test("maps DEPRECATED to inactive", async () => {
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handleStatusChanged(
+      "test-tools-table",
+      "tool",
+      "tool-1",
+      "DEPRECATED",
+    );
+
+    const call = ddbMock.commandCalls(UpdateCommand)[0];
+    expect(call.args[0].input.ExpressionAttributeValues![":newState"]).toBe(
+      "inactive",
+    );
+    expect(call.args[0].input.Key).toEqual({ toolId: "tool-1" });
+  });
+
+  test("maps DRAFT to maintenance", async () => {
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handleStatusChanged("test-agents-table", "agent", "a-1", "DRAFT");
+
+    const call = ddbMock.commandCalls(UpdateCommand)[0];
+    expect(call.args[0].input.ExpressionAttributeValues![":newState"]).toBe(
+      "maintenance",
+    );
+  });
+
+  test("maps unknown status to inactive", async () => {
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handleStatusChanged(
+      "test-agents-table",
+      "agent",
+      "a-1",
+      "SOME_UNKNOWN",
+    );
+
+    const call = ddbMock.commandCalls(UpdateCommand)[0];
+    expect(call.args[0].input.ExpressionAttributeValues![":newState"]).toBe(
+      "inactive",
+    );
+  });
+
+  test("updates updatedAt timestamp", async () => {
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handleStatusChanged("test-agents-table", "agent", "a-1", "APPROVED");
+
+    const call = ddbMock.commandCalls(UpdateCommand)[0];
+    expect(call.args[0].input.UpdateExpression).toContain("#updatedAt");
+    expect(call.args[0].input.ExpressionAttributeValues![":now"]).toBeDefined();
+  });
+
+  test("propagates DynamoDB errors (non-conditional)", async () => {
+    const error = new Error("Update failed");
+    error.name = "InternalServerError";
+    ddbMock.on(UpdateCommand).rejects(error);
+
+    await expect(
+      handleStatusChanged("test-agents-table", "agent", "a-1", "APPROVED"),
+    ).rejects.toThrow("Update failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handler — full integration with DynamoDB mock
+// ---------------------------------------------------------------------------
+
+describe("handler — cache operations", () => {
+  test("CREATED agent event writes to DynamoDB", async () => {
+    ddbMock.on(PutCommand).resolves({});
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "CREATED",
+        resource: makeAgentResource(),
+      },
+    });
+
+    await handler(event);
+
+    expect(ddbMock.commandCalls(PutCommand)).toHaveLength(1);
+    const input = ddbMock.commandCalls(PutCommand)[0].args[0].input;
+    expect(input.TableName).toBe("test-agents-table");
+    expect(input.Item!.agentId).toBe("agent-1");
+  });
+
+  test("UPDATED tool event writes to DynamoDB", async () => {
+    ddbMock.on(PutCommand).resolves({});
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "tool-1",
+        resourceType: "tool",
+        eventType: "UPDATED",
+        resource: makeToolResource(),
+      },
+    });
+
+    await handler(event);
+
+    expect(ddbMock.commandCalls(PutCommand)).toHaveLength(1);
+    const input = ddbMock.commandCalls(PutCommand)[0].args[0].input;
+    expect(input.TableName).toBe("test-tools-table");
+    expect(input.Item!.toolId).toBe("tool-1");
+  });
+
+  test("DELETED event sends DeleteCommand", async () => {
+    ddbMock.on(DeleteCommand).resolves({});
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "DELETED",
+      },
+    });
+
+    await handler(event);
+
+    expect(ddbMock.commandCalls(DeleteCommand)).toHaveLength(1);
+    expect(ddbMock.commandCalls(DeleteCommand)[0].args[0].input.Key).toEqual({
+      agentId: "agent-1",
+    });
+  });
+
+  test("STATUS_CHANGED event sends UpdateCommand", async () => {
+    ddbMock.on(UpdateCommand).resolves({});
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "STATUS_CHANGED",
+        previousStatus: "DRAFT",
+        newStatus: "APPROVED",
+      },
+    });
+
+    await handler(event);
+
+    expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(1);
+    expect(
+      ddbMock.commandCalls(UpdateCommand)[0].args[0].input
+        .ExpressionAttributeValues![":newState"],
+    ).toBe("active");
+  });
+
+  test("CREATED event without resource payload skips write", async () => {
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "CREATED",
+        resource: undefined,
+      },
+    });
+
+    await handler(event);
+
+    expect(ddbMock.commandCalls(PutCommand)).toHaveLength(0);
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("No resource payload"),
+    );
+  });
+
+  test("STATUS_CHANGED event without newStatus skips update", async () => {
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "STATUS_CHANGED",
+        newStatus: undefined,
+      },
+    });
+
+    await handler(event);
+
+    expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(0);
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("No newStatus"),
+    );
+  });
+
+  test("ConditionalCheckFailedException is swallowed (idempotency)", async () => {
+    const error = new Error("Conditional check failed");
+    error.name = "ConditionalCheckFailedException";
+    ddbMock.on(PutCommand).rejects(error);
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "CREATED",
+        resource: makeAgentResource(),
+      },
+    });
+
+    // Should not throw
+    await expect(handler(event)).resolves.toBeUndefined();
+  });
+
+  test("ConditionalCheckFailedException on STATUS_CHANGED is swallowed", async () => {
+    const error = new Error("Conditional check failed");
+    error.name = "ConditionalCheckFailedException";
+    ddbMock.on(UpdateCommand).rejects(error);
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "STATUS_CHANGED",
+        newStatus: "APPROVED",
+      },
+    });
+
+    await expect(handler(event)).resolves.toBeUndefined();
+  });
+
+  test("non-conditional DynamoDB errors propagate and route to DLQ", async () => {
+    const error = new Error("DynamoDB is down");
+    error.name = "InternalServerError";
+    ddbMock.on(PutCommand).rejects(error);
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "CREATED",
+        resource: makeAgentResource(),
+      },
+    });
+
+    await expect(handler(event)).rejects.toThrow("DynamoDB is down");
+    // DLQ and metric are verified in the dedicated DLQ routing tests
+  });
+
+  test("malformed event sends to DLQ then throws", async () => {
+    const badEvent = {
+      source: "aws.s3",
+      "detail-type": "wrong",
+      detail: {},
+    } as unknown as RegistryEvent;
+    await expect(handler(badEvent)).rejects.toThrow(
+      "Malformed registry sync event",
+    );
+
+    // Verify DLQ was called
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(1);
+    const sqsInput = sqsMock.commandCalls(SendMessageCommand)[0].args[0].input;
+    expect(sqsInput.QueueUrl).toBe(
+      "https://sqs.us-east-1.amazonaws.com/123456789/test-dlq",
+    );
+    const body = JSON.parse(sqsInput.MessageBody!);
+    expect(body.reason).toContain("Malformed event");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sendToDlq
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// GA agent-registry events — synthetic fixtures mirroring the shape of
+// real event JSON (detail-type "Registry Record State changed
+// to Draft" / "... to Approved"), detail carries only registryRecordId +
+// registryId. No inline resource payload — the handler must hydrate via
+// RegistryService.getResource before it can build a cache row.
+// ---------------------------------------------------------------------------
+
+function makeGaDraftEvent(): unknown {
+  return {
+    version: "0",
+    id: "82c22b67-cc81-4ef7-9b75-e084a05198bc",
+    "detail-type": "Registry Record State changed to Draft",
+    source: "aws.agent-registry",
+    account: "123456789012",
+    time: "2026-01-01T00:00:00Z",
+    region: "us-west-2",
+    resources: [
+      "arn:aws:agent-registry:us-west-2:123456789012:registry/RegTest000001/record/RecDraft00001",
+    ],
+    detail: {
+      registryRecordId: "RecDraft00001",
+      registryId: "RegTest000001",
+    },
+  };
+}
+
+function makeGaApprovedEvent(): unknown {
+  return {
+    version: "0",
+    id: "RecApprv00001-event-id",
+    "detail-type": "Registry Record State changed to Approved",
+    source: "aws.agent-registry",
+    account: "123456789012",
+    time: "2026-01-01T00:00:03Z",
+    region: "us-west-2",
+    resources: [
+      "arn:aws:agent-registry:us-west-2:123456789012:registry/RegTest000001/record/RecApprv00001",
+    ],
+    detail: {
+      registryRecordId: "RecApprv00001",
+      registryId: "RegTest000001",
+    },
+  };
+}
+
+const gaAgentRecord: RegistryRecord = {
+  recordId: "RecDraft00001",
+  name: "TestAgent",
+  description: "A test agent for registry sync",
+  status: "DRAFT",
+  customDescriptorContent: JSON.stringify({
+    categories: ["cat1"],
+    icon: "icon.png",
+    state: "DRAFT",
+    appId: "app-1",
+    manifest: { name: "TestAgent", version: "1.0" },
+  }),
+  createdAt: new Date("2026-01-01T00:00:00.000Z"),
+  updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+};
+
+describe("validateEvent — GA detail-types", () => {
+  test("accepts 'Registry Record State changed to Draft'", () => {
+    expect(validateEvent(makeGaDraftEvent() as RegistryEvent)).toBeNull();
+  });
+
+  test("accepts 'Registry Record State changed to Approved'", () => {
+    expect(validateEvent(makeGaApprovedEvent() as RegistryEvent)).toBeNull();
+  });
+
+  test("rejects an unknown GA-shaped detail-type", () => {
+    const event = {
+      ...(makeGaDraftEvent() as Record<string, unknown>),
+      "detail-type": "Registry Record State changed to Bogus",
+    };
+    expect(validateEvent(event as RegistryEvent)).toContain(
+      "Unexpected detail-type",
+    );
+  });
+});
+
+describe("handler — GA agent-registry events", () => {
+  test("Draft event hydrates the record via RegistryService and writes to DynamoDB via merge UpdateCommand", async () => {
+    mockGetResource.mockResolvedValueOnce(gaAgentRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    expect(mockGetResource).toHaveBeenCalledWith("agent", "RecDraft00001");
+    expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(1);
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.Key).toEqual({ agentId: "RecDraft00001" });
+    expect(input.ExpressionAttributeValues![":state"]).toBe("maintenance"); // DRAFT -> maintenance
+  });
+
+  test("Approved event hydrates the record and writes to DynamoDB via merge UpdateCommand", async () => {
+    mockGetResource.mockResolvedValueOnce({
+      ...gaAgentRecord,
+      recordId: "RecApprv00001",
+      status: "APPROVED",
+      customDescriptorContent: JSON.stringify({
+        categories: [],
+        icon: "",
+        state: "APPROVED",
+      }),
+    });
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaApprovedEvent() as RegistryEvent);
+
+    expect(mockGetResource).toHaveBeenCalledWith("agent", "RecApprv00001");
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.Key).toEqual({ agentId: "RecApprv00001" });
+    expect(input.ExpressionAttributeValues![":state"]).toBe("active"); // APPROVED -> active
+  });
+
+  test("falls back to tool type when the record is not an agent", async () => {
+    mockGetResource.mockImplementation(async (type: string, _id: string) => {
+      if (type === "agent") {
+        throw new TypeMismatchError("not an agent");
+      }
+      return {
+        recordId: "RecDraft00001",
+        name: "TestTool",
+        description: JSON.stringify({ name: "TestTool" }),
+        status: "DRAFT",
+        customDescriptorContent: JSON.stringify({
+          categories: [],
+          icon: "",
+          state: "active",
+        }),
+      };
+    });
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    expect(mockGetResource).toHaveBeenCalledWith("agent", "RecDraft00001");
+    expect(mockGetResource).toHaveBeenCalledWith("tool", "RecDraft00001");
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.Key).toEqual({ toolId: "RecDraft00001" });
+  });
+
+  test("missing record (null from getResource) sends to DLQ and does not throw", async () => {
+    mockGetResource.mockResolvedValue(null);
+
+    await expect(
+      handler(makeGaDraftEvent() as RegistryEvent),
+    ).resolves.toBeUndefined();
+
+    expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(0);
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(1);
+  });
+
+  test("unknown detail-type is rejected, sent to DLQ, and throws — negative test", async () => {
+    const badEvent = {
+      ...(makeGaDraftEvent() as Record<string, unknown>),
+      "detail-type": "Registry Record State changed to Bogus",
+    };
+
+    await expect(handler(badEvent as RegistryEvent)).rejects.toThrow(
+      "Malformed registry sync event",
+    );
+    expect(mockGetResource).not.toHaveBeenCalled();
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Bug: GA upsert must MERGE, not replace (fixtures = real GA records)
+  // -------------------------------------------------------------------------
+
+  const zdRecord: RegistryRecord = {
+    recordId: "RecDraft00003",
+    name: "fixture_draft_agent",
+    description: "Synthetic DRAFT agent fixture for the GA sync path.",
+    status: "DRAFT",
+    customDescriptorContent: JSON.stringify({
+      categories: ["worker"],
+      icon: "",
+      state: "active",
+      manifest: {
+        name: "fixture_draft_agent",
+        description: "Synthetic DRAFT agent fixture for the GA sync path.",
+        version: 1,
+        tools: [],
+      },
+      orgId: "",
+    }),
+    createdAt: new Date("2026-01-01T00:00:01.000Z"),
+    updatedAt: new Date("2026-01-01T00:00:02.000Z"),
+  };
+
+  const mjRecord: RegistryRecord = {
+    recordId: "RecApprv00002",
+    name: "fixture_approved_agent",
+    description: "Synthetic APPROVED agent fixture for the GA sync path.",
+    status: "APPROVED",
+    customDescriptorContent: JSON.stringify({
+      categories: ["built-in", "worker", "demo"],
+      icon: "",
+      state: "active",
+      manifest: {
+        name: "fixture_approved_agent",
+        description: "Synthetic APPROVED agent fixture for the GA sync path.",
+        version: 1,
+        tools: [],
+      },
+      orgId: "",
+    }),
+    createdAt: new Date("2026-01-01T00:00:01.000Z"),
+    updatedAt: new Date("2026-01-01T00:00:02.000Z"),
+  };
+
+  test("real GA record RecDraft00003: UpdateExpression contains no REMOVE of config/createdBy/sourceProjectId", async () => {
+    mockGetResource.mockResolvedValueOnce(zdRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).not.toMatch(/REMOVE/i);
+    // config appears only inside if_not_exists (safe default for new items),
+    // never as a direct #config = :config overwrite.
+    expect(input.UpdateExpression).not.toContain("#config = :config");
+    expect(input.UpdateExpression).not.toContain("createdBy");
+    expect(input.UpdateExpression).not.toContain("sourceProjectId");
+  });
+
+  test("real GA record RecApprv00002: a pre-existing config/createdBy/sourceProjectId in DDB survives the merge (not overwritten or removed)", async () => {
+    mockGetResource.mockResolvedValueOnce(mjRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaApprovedEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    // The merge UpdateCommand must SET only derived fields; config appears
+    // only inside if_not_exists (safe default for new items), not as a
+    // direct :config value. createdBy/sourceProjectId must not appear at all.
+    expect(input.UpdateExpression).not.toContain(":config");
+    expect(input.UpdateExpression).not.toContain(":createdBy");
+    expect(input.UpdateExpression).not.toContain(":sourceProjectId");
+  });
+
+  test("real GA record RecDraft00003: status 'DRAFT' maps to internal state 'maintenance'", async () => {
+    mockGetResource.mockResolvedValueOnce(zdRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.ExpressionAttributeValues![":state"]).toBe("maintenance");
+  });
+
+  test("real GA record RecApprv00002: status 'APPROVED' maps to internal state 'active'", async () => {
+    mockGetResource.mockResolvedValueOnce(mjRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaApprovedEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.ExpressionAttributeValues![":state"]).toBe("active");
+  });
+
+  test("unknown status on GA path PRESERVES existing DDB state instead of forcing inactive, with a WARN", async () => {
+    mockGetResource.mockResolvedValueOnce({
+      ...zdRecord,
+      status: "SOME_FUTURE_LIFECYCLE_VALUE",
+    });
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    // No :state value bound at all => UpdateExpression must not SET #state,
+    // leaving whatever is already in DDB untouched.
+    expect(input.UpdateExpression).not.toContain("#state = :state");
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("SOME_FUTURE_LIFECYCLE_VALUE"),
+    );
+  });
+
+  test("GA merge UpdateExpression SETs name, description, updatedAt, and registry ids derived from the record", async () => {
+    mockGetResource.mockResolvedValueOnce(zdRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.ExpressionAttributeValues![":name"]).toBe(
+      "fixture_draft_agent",
+    );
+    expect(input.ExpressionAttributeValues![":description"]).toBe(
+      zdRecord.description,
+    );
+    expect(input.ExpressionAttributeValues![":updatedAt"]).toBeDefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // Bug fix: never overwrite cached fields with empty registry values
+  // (orgId '' from a migrated record must not clobber a real cached value).
+  // -------------------------------------------------------------------------
+
+  test("orgId '' from the registry record is OMITTED from the SET clause, preserving the cached 'Default' value, with a WARN naming orgId", async () => {
+    mockGetResource.mockResolvedValueOnce({
+      recordId: "RecDraft00001",
+      name: "fixture_migrated_agent",
+      description: "Synthetic migrated agent fixture.",
+      status: "DRAFT",
+      customDescriptorContent: JSON.stringify({
+        categories: ["worker"],
+        icon: "icon.png",
+        state: "active",
+        orgId: "",
+      }),
+      createdAt: new Date("2026-01-01T00:00:01.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:02.000Z"),
+    });
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).not.toContain("#orgId = :orgId");
+    expect(input.ExpressionAttributeValues![":orgId"]).toBeUndefined();
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("orgId"));
+  });
+
+  test("orgId 'Acme' from the registry record IS written to the SET clause", async () => {
+    mockGetResource.mockResolvedValueOnce({
+      recordId: "RecDraft00001",
+      name: "fixture_org_agent",
+      description: "Synthetic org-scoped agent fixture.",
+      status: "DRAFT",
+      customDescriptorContent: JSON.stringify({
+        categories: ["worker"],
+        icon: "icon.png",
+        state: "active",
+        orgId: "Acme",
+      }),
+      createdAt: new Date("2026-01-01T00:00:01.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:02.000Z"),
+    });
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain("#orgId = :orgId");
+    expect(input.ExpressionAttributeValues![":orgId"]).toBe("Acme");
+  });
+
+  test("icon '' from the registry record is OMITTED from the SET clause, preserving the cached icon", async () => {
+    mockGetResource.mockResolvedValueOnce({
+      recordId: "RecDraft00001",
+      name: "fixture_no_icon_agent",
+      description: "Synthetic agent fixture with empty icon.",
+      status: "DRAFT",
+      customDescriptorContent: JSON.stringify({
+        categories: ["worker"],
+        icon: "",
+        state: "active",
+        orgId: "Acme",
+      }),
+      createdAt: new Date("2026-01-01T00:00:01.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:02.000Z"),
+    });
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).not.toContain("#icon = :icon");
+    expect(input.ExpressionAttributeValues![":icon"]).toBeUndefined();
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("icon"));
+  });
+
+  test("appId '' is omitted; empty categories array is omitted; description '' is omitted — all preserving cached values", async () => {
+    mockGetResource.mockResolvedValueOnce({
+      recordId: "RecDraft00001",
+      name: "fixture_all_empty_agent",
+      description: "",
+      status: "DRAFT",
+      customDescriptorContent: JSON.stringify({
+        categories: [],
+        icon: "",
+        state: "active",
+        appId: "",
+        orgId: "",
+      }),
+      createdAt: new Date("2026-01-01T00:00:01.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:02.000Z"),
+    });
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    for (const field of [
+      "appId",
+      "categories",
+      "description",
+      "orgId",
+      "icon",
+    ]) {
+      expect(input.UpdateExpression).not.toContain(`#${field} = :${field}`);
+    }
+    // updatedAt and state are still written — the merge isn't a full no-op
+    expect(input.UpdateExpression).toContain("#updatedAt = :updatedAt");
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("skipping empty/absent record-derived fields"),
+    );
+  });
+
+  test("non-empty categories, icon, description, and name ARE written to the SET clause", async () => {
+    mockGetResource.mockResolvedValueOnce(zdRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain("#categories = :categories");
+    expect(input.UpdateExpression).toContain("#description = :description");
+    expect(input.UpdateExpression).toContain("#name = :name");
+    expect(input.ExpressionAttributeValues![":categories"]).toEqual(["worker"]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Bug fix: newly created items (key absent) must get config + createdAt
+  // via if_not_exists so the row is complete; existing items keep theirs.
+  // -------------------------------------------------------------------------
+
+  test("new item: SET clause contains if_not_exists for config (empty map) and createdAt from the record", async () => {
+    mockGetResource.mockResolvedValueOnce(zdRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain(
+      "#config = if_not_exists(#config, :emptyConfig)",
+    );
+    expect(input.UpdateExpression).toContain(
+      "#createdAt = if_not_exists(#createdAt, :recordCreatedAt)",
+    );
+    // Agent config default is an empty map (not a string)
+    expect(input.ExpressionAttributeValues![":emptyConfig"]).toEqual({});
+    expect(input.ExpressionAttributeValues![":recordCreatedAt"]).toBe(
+      "2026-01-01T00:00:01.000Z",
+    );
+  });
+
+  test("existing item with config: expression still uses if_not_exists (DynamoDB preserves the existing value)", async () => {
+    mockGetResource.mockResolvedValueOnce(mjRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaApprovedEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    // The if_not_exists clause is always present — DynamoDB semantics mean
+    // existing items keep their config/createdAt unchanged.
+    expect(input.UpdateExpression).toContain(
+      "#config = if_not_exists(#config, :emptyConfig)",
+    );
+    expect(input.UpdateExpression).toContain(
+      "#createdAt = if_not_exists(#createdAt, :recordCreatedAt)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sendToDlq
+// ---------------------------------------------------------------------------
+
+describe("sendToDlq", () => {
+  test("sends event and reason to SQS", async () => {
+    const event = { foo: "bar" };
+    await sendToDlq(event, "test reason");
+
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(1);
+    const input = sqsMock.commandCalls(SendMessageCommand)[0].args[0].input;
+    expect(input.QueueUrl).toBe(
+      "https://sqs.us-east-1.amazonaws.com/123456789/test-dlq",
+    );
+    const body = JSON.parse(input.MessageBody!);
+    expect(body.event).toEqual({ foo: "bar" });
+    expect(body.reason).toBe("test reason");
+    expect(body.timestamp).toBeDefined();
+  });
+
+  test("does not throw when SQS fails", async () => {
+    sqsMock.on(SendMessageCommand).rejects(new Error("SQS down"));
+    await expect(sendToDlq({}, "reason")).resolves.toBeUndefined();
+    expect(console.error).toHaveBeenCalledWith(
+      "Failed to send event to DLQ:",
+      expect.any(Error),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// emitSyncFailureMetric
+// ---------------------------------------------------------------------------
+
+describe("emitSyncFailureMetric", () => {
+  test("emits SyncFailure metric to CloudWatch", async () => {
+    await emitSyncFailureMetric();
+
+    expect(cwMock.commandCalls(PutMetricDataCommand)).toHaveLength(1);
+    const input = cwMock.commandCalls(PutMetricDataCommand)[0].args[0].input;
+    expect(input.Namespace).toBe("RegistrySync");
+    expect(input.MetricData![0].MetricName).toBe("SyncFailure");
+    expect(input.MetricData![0].Value).toBe(1);
+    expect(input.MetricData![0].Unit).toBe("Count");
+  });
+
+  test("does not throw when CloudWatch fails", async () => {
+    cwMock.on(PutMetricDataCommand).rejects(new Error("CW down"));
+    await expect(emitSyncFailureMetric()).resolves.toBeUndefined();
+    expect(console.error).toHaveBeenCalledWith(
+      "Failed to emit SyncFailure metric:",
+      expect.any(Error),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handler — DLQ routing and metric emission
+// ---------------------------------------------------------------------------
+
+describe("handler — DLQ routing and metrics", () => {
+  test("DynamoDB write failure sends to DLQ and emits SyncFailure metric", async () => {
+    const error = new Error("DynamoDB is down");
+    error.name = "InternalServerError";
+    ddbMock.on(PutCommand).rejects(error);
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "CREATED",
+        resource: makeAgentResource(),
+      },
+    });
+
+    await expect(handler(event)).rejects.toThrow("DynamoDB is down");
+
+    // Verify DLQ
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(1);
+    const sqsBody = JSON.parse(
+      sqsMock.commandCalls(SendMessageCommand)[0].args[0].input.MessageBody!,
+    );
+    expect(sqsBody.reason).toContain("DynamoDB write failure");
+
+    // Verify CloudWatch metric
+    expect(cwMock.commandCalls(PutMetricDataCommand)).toHaveLength(1);
+    expect(
+      cwMock.commandCalls(PutMetricDataCommand)[0].args[0].input.MetricData![0]
+        .MetricName,
+    ).toBe("SyncFailure");
+  });
+
+  test("DynamoDB delete failure sends to DLQ and emits metric", async () => {
+    const error = new Error("Delete failed");
+    error.name = "InternalServerError";
+    ddbMock.on(DeleteCommand).rejects(error);
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "DELETED",
+      },
+    });
+
+    await expect(handler(event)).rejects.toThrow("Delete failed");
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(1);
+    expect(cwMock.commandCalls(PutMetricDataCommand)).toHaveLength(1);
+  });
+
+  test("DynamoDB update failure sends to DLQ and emits metric", async () => {
+    const error = new Error("Update failed");
+    error.name = "InternalServerError";
+    ddbMock.on(UpdateCommand).rejects(error);
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "STATUS_CHANGED",
+        newStatus: "APPROVED",
+      },
+    });
+
+    await expect(handler(event)).rejects.toThrow("Update failed");
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(1);
+    expect(cwMock.commandCalls(PutMetricDataCommand)).toHaveLength(1);
+  });
+
+  test("ConditionalCheckFailedException does NOT send to DLQ or emit metric", async () => {
+    const error = new Error("Conditional check failed");
+    error.name = "ConditionalCheckFailedException";
+    ddbMock.on(PutCommand).rejects(error);
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "CREATED",
+        resource: makeAgentResource(),
+      },
+    });
+
+    await expect(handler(event)).resolves.toBeUndefined();
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(0);
+    expect(cwMock.commandCalls(PutMetricDataCommand)).toHaveLength(0);
+  });
+
+  test("malformed event sends to DLQ but does NOT emit SyncFailure metric", async () => {
+    const badEvent = {
+      source: "aws.s3",
+      "detail-type": "wrong",
+      detail: {},
+    } as unknown as RegistryEvent;
+    await expect(handler(badEvent)).rejects.toThrow(
+      "Malformed registry sync event",
+    );
+
+    // DLQ should be called
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(1);
+    // No CloudWatch metric for malformed events (not a DynamoDB failure)
+    expect(cwMock.commandCalls(PutMetricDataCommand)).toHaveLength(0);
+  });
+
+  test("handler still throws even if DLQ send fails", async () => {
+    const ddbError = new Error("DynamoDB is down");
+    ddbError.name = "InternalServerError";
+    ddbMock.on(PutCommand).rejects(ddbError);
+    sqsMock.on(SendMessageCommand).rejects(new Error("SQS also down"));
+
+    const event = makeEvent({
+      detail: {
+        resourceId: "agent-1",
+        resourceType: "agent",
+        eventType: "CREATED",
+        resource: makeAgentResource(),
+      },
+    });
+
+    // Original error still propagates
+    await expect(handler(event)).rejects.toThrow("DynamoDB is down");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CIT-042 — tags denormalization into cache items
+// ---------------------------------------------------------------------------
+
+describe("tags denormalization — legacy buildAgentCacheRecord", () => {
+  test("tags written to cache record when present in metadata", () => {
+    const resource = makeAgentResource({
+      customDescriptorContent: JSON.stringify({
+        categories: ["cat1"],
+        icon: "icon.png",
+        state: "APPROVED",
+        tags: { env: "prod", team: "platform" },
+      }),
+    });
+    const record = buildAgentCacheRecord("agent-t1", resource);
+    expect(record.tags).toEqual({ env: "prod", team: "platform" });
+  });
+
+  test("tags undefined when metadata omits tags entirely", () => {
+    const resource = makeAgentResource({
+      customDescriptorContent: JSON.stringify({
+        categories: [],
+        icon: "",
+        state: "APPROVED",
+      }),
+    });
+    const record = buildAgentCacheRecord("agent-t2", resource);
+    expect(record.tags).toBeUndefined();
+  });
+
+  test("tags undefined when customDescriptorContent is absent", () => {
+    const record = buildAgentCacheRecord("agent-t3", { description: "desc" });
+    expect(record.tags).toBeUndefined();
+  });
+});
+
+describe("tags denormalization — legacy buildToolCacheRecord", () => {
+  test("tags written to cache record when present in metadata", () => {
+    const resource = makeToolResource({
+      customDescriptorContent: JSON.stringify({
+        categories: ["toolcat"],
+        icon: "tool-icon.png",
+        state: "active",
+        tags: { purpose: "data-ingestion" },
+      }),
+    });
+    const record = buildToolCacheRecord("tool-t1", resource);
+    expect(record.tags).toEqual({ purpose: "data-ingestion" });
+  });
+
+  test("tags undefined when metadata omits tags entirely", () => {
+    const resource = makeToolResource({
+      customDescriptorContent: JSON.stringify({
+        categories: [],
+        icon: "",
+        state: "active",
+      }),
+    });
+    const record = buildToolCacheRecord("tool-t2", resource);
+    expect(record.tags).toBeUndefined();
+  });
+});
+
+describe("tags denormalization — GA merge path", () => {
+  test("agent: tags SET when present in record metadata", async () => {
+    const taggedRecord: RegistryRecord = {
+      ...gaAgentRecord,
+      customDescriptorContent: JSON.stringify({
+        categories: ["cat1"],
+        icon: "icon.png",
+        state: "DRAFT",
+        tags: { env: "staging", owner: "alice" },
+      }),
+    };
+    mockGetResource.mockResolvedValueOnce(taggedRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain("#tags = :tags");
+    expect(input.ExpressionAttributeValues![":tags"]).toEqual({
+      env: "staging",
+      owner: "alice",
+    });
+  });
+
+  test("agent: tags NOT set when metadata omits tags — preserves existing cache value", async () => {
+    mockGetResource.mockResolvedValueOnce(gaAgentRecord);
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).not.toContain("#tags");
+    expect(input.ExpressionAttributeValues![":tags"]).toBeUndefined();
+  });
+
+  test("tool: tags SET when present in record metadata", async () => {
+    const taggedToolRecord: RegistryRecord = {
+      recordId: "RecDraft00001",
+      name: "TestTool",
+      description: JSON.stringify({ name: "TestTool" }),
+      status: "DRAFT",
+      customDescriptorContent: JSON.stringify({
+        categories: ["toolcat"],
+        icon: "tool-icon.png",
+        state: "active",
+        tags: { dept: "engineering" },
+      }),
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+    };
+    // First call: agent fetch fails with TypeMismatchError; second: tool resolves
+    mockGetResource.mockImplementation(async (type: string) => {
+      if (type === "agent") throw new TypeMismatchError("not an agent");
+      return taggedToolRecord;
+    });
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await handler(makeGaDraftEvent() as RegistryEvent);
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain("#tags = :tags");
+    expect(input.ExpressionAttributeValues![":tags"]).toEqual({
+      dept: "engineering",
+    });
+  });
+});

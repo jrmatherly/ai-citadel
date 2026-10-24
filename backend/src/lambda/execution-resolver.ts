@@ -1,0 +1,1025 @@
+import { AppSyncResolverHandler, AppSyncResolverEvent } from "aws-lambda";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  UpdateCommand,
+  QueryCommand,
+  ScanCommand,
+} from "@aws-sdk/lib-dynamodb";
+import {
+  EventBridgeClient,
+  PutEventsCommand,
+} from "@aws-sdk/client-eventbridge";
+import {
+  CloudWatchClient,
+  PutMetricDataCommand,
+} from "@aws-sdk/client-cloudwatch";
+import { v4 as uuidv4 } from "uuid";
+import { getUserId } from "../utils/appsync";
+import {
+  assertRowOrg,
+  isAdminFromEvent,
+  hasRoleFromEvent,
+  extractOrgFromEvent,
+} from "../utils/auth-event";
+import { mintRunId, buildDispatchContext } from "../utils/run-id";
+import {
+  METRIC_NAMESPACE,
+  METRIC_NODE_COLD_START,
+  UNIT_COUNT,
+} from "../utils/metrics-constants";
+
+const dynamoClient = new DynamoDBClient({});
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
+const eventBridgeClient = new EventBridgeClient({});
+const cloudWatchClient = new CloudWatchClient({});
+
+const EXECUTIONS_TABLE = process.env.EXECUTIONS_TABLE!;
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE!;
+const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME!;
+
+// Cold-start detection (module-scope flag): a Lambda execution environment
+// reuses this module across invocations, so a plain module-level boolean —
+// flipped to false the first time the handler runs in this container — is
+// the cheapest possible signal. `true` (the import-time default) only on the
+// FIRST invocation in a fresh container; every subsequent invocation in the
+// same (warm) container observes `false`.
+let isColdStart = true;
+
+/**
+ * Emit NodeColdStart exactly once per container lifetime, best-effort.
+ * Reads-then-flips `isColdStart` so a re-entrant/duplicate call within the
+ * same container never double-emits. Wrapped so a CloudWatch failure
+ * (throttling, missing PutMetricData permission, network) can never break
+ * the resolver — mirrors the step runner's `_emit_metric` best-effort
+ * contract (arbiter/stepRunner/executor.py) and this repo's emf.ts
+ * "never throws" convention.
+ */
+async function emitColdStartMetricIfApplicable(): Promise<void> {
+  if (!isColdStart) return;
+  isColdStart = false;
+  try {
+    await cloudWatchClient.send(
+      new PutMetricDataCommand({
+        Namespace: METRIC_NAMESPACE,
+        MetricData: [
+          {
+            MetricName: METRIC_NODE_COLD_START,
+            Value: 1,
+            Unit: UNIT_COUNT,
+          },
+        ],
+      }),
+    );
+  } catch (err) {
+    console.error("execution-resolver: cold-start metric emit failed", err);
+  }
+}
+
+/** Test-only: reset the cold-start flag to its fresh-container default. */
+export function __resetColdStartForTest(): void {
+  isColdStart = true;
+}
+
+/**
+ * Merged view of every argument shape this resolver's fields receive.
+ * `input` is an AWSJSON string for startExecution; publishWorkflowProgress
+ * receives a WorkflowProgressInput object and echoes it back unchanged.
+ */
+interface ExecutionResolverArguments {
+  executionId: string;
+  workflowId: string;
+  input?: string;
+  nodeId?: string;
+  reason?: string;
+  limit?: number;
+  nextToken?: string;
+}
+
+type ExecutionResolverEvent = AppSyncResolverEvent<ExecutionResolverArguments>;
+
+interface ExecutionNodeResult {
+  nodeId: string;
+  agentId?: string;
+  status: string;
+  retryCount: number;
+  /** Additive: sanitized per-node worker usage records (usage rollup). */
+  usage?: unknown[];
+  /** Additive: this node's precomputed usage totals (usage rollup). */
+  usageTotals?: UsageTotals;
+  [key: string]: unknown;
+}
+
+/** Usage rollup: per-node or execution-level aggregated token usage. */
+interface UsageTotals {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  callCount: number;
+}
+
+/** Shape of an execution item persisted in the executions table. */
+interface ExecutionRecord {
+  executionId: string;
+  workflowId: string;
+  appId?: string | null;
+  orgId: string;
+  status: string;
+  workflowVersion?: number;
+  currentNode?: string | null;
+  nodeResults?: Record<string, ExecutionNodeResult>;
+  input?: string | null;
+  output?: string | null;
+  startedAt?: string;
+  completedAt?: string | null;
+  triggeredBy?: string;
+  error?: string | null;
+  /** Additive: execution-level usage totals folded from nodeResults on read. */
+  usageTotals?: UsageTotals | null;
+  /** Additive, nullable: server-minted correlation id (Pass 1, decision f1cbd5ef). Absent on pre-runId rows. */
+  runId?: string;
+  /** CIT-030: per-node approval requests written by the step runner. */
+  approvalRequests?: Record<string, ApprovalRequestRecord>;
+  /** CIT-237: engine-maintained marker — 'Y' when any undecided approval request exists. */
+  pendingApproval?: string;
+}
+
+/** Shape of a per-node approval request stored in DDB (PR1). */
+interface ApprovalRequestRecord {
+  requestType: string;
+  reason?: string;
+  requestedBy?: string;
+  requestedAt?: string;
+  resumeToken?: string;
+  expiresAt?: string;
+  decidedBy?: string | null;
+  decidedAt?: string | null;
+  decision?: string | null;
+  orgId?: string;
+  metadata?: Record<string, unknown>;
+  /** CIT-237: "execution" for execution-scoped, absent/null for legacy per-node. */
+  scope?: string | null;
+  /** CIT-237: node ids parked under an execution-scoped request. */
+  nodeIds?: string[];
+}
+
+function _coerceNonNegativeInt(value: unknown): number {
+  const n = typeof value === "string" ? Number(value) : value;
+  if (typeof n !== "number" || Number.isNaN(n) || !Number.isFinite(n)) return 0;
+  return Math.max(0, Math.trunc(n));
+}
+
+/**
+ * Sum a single node's usage into a UsageTotals shape, or null if the node
+ * carries no usage source at all. Preference order: `usageTotals` (already
+ * aggregated by the step runner) → `usage` (a sanitized usage array) →
+ * `output.usage` (the pre-rollup-feature location, `output` possibly a JSON
+ * string). Never throws — malformed shapes at any level are skipped.
+ */
+function _nodeUsageTotals(node: unknown): UsageTotals | null {
+  if (!node || typeof node !== "object") return null;
+  const n = node as ExecutionNodeResult;
+
+  if (n.usageTotals && typeof n.usageTotals === "object") {
+    const t = n.usageTotals;
+    return {
+      inputTokens: _coerceNonNegativeInt(t.inputTokens),
+      outputTokens: _coerceNonNegativeInt(t.outputTokens),
+      totalTokens: _coerceNonNegativeInt(t.totalTokens),
+      callCount: _coerceNonNegativeInt(t.callCount),
+    };
+  }
+
+  const fromArray = (arr: unknown): UsageTotals | null => {
+    if (!Array.isArray(arr) || arr.length === 0) return null;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let callCount = 0;
+    for (const rec of arr) {
+      if (!rec || typeof rec !== "object") continue;
+      const r = rec as Record<string, unknown>;
+      inputTokens += _coerceNonNegativeInt(r.inputTokens);
+      outputTokens += _coerceNonNegativeInt(r.outputTokens);
+      callCount += 1;
+    }
+    if (callCount === 0) return null;
+    return {
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+      callCount,
+    };
+  };
+
+  const fromUsageField = fromArray(n.usage);
+  if (fromUsageField) return fromUsageField;
+
+  let output: unknown = n.output;
+  if (typeof output === "string") {
+    try {
+      output = JSON.parse(output);
+    } catch {
+      return null;
+    }
+  }
+  if (output && typeof output === "object") {
+    return fromArray((output as Record<string, unknown>).usage);
+  }
+  return null;
+}
+
+/**
+ * Pure, additive reduction: fold every node's usage into execution-level
+ * totals. Returns `null` when no node in `nodeResults` carries any usage
+ * source at all (legacy runs predating this feature render unchanged).
+ * Never throws — a malformed `nodeResults` map, or malformed individual node
+ * entries, are skipped rather than propagating an error. Idempotent: calling
+ * with the same input always yields an equal result (no I/O, no mutation),
+ * so redelivery of the underlying event has no bearing on this read-side
+ * computation.
+ */
+export function computeExecutionUsageTotals(
+  nodeResults: Record<string, unknown> | undefined | null,
+): UsageTotals | null {
+  if (!nodeResults || typeof nodeResults !== "object") return null;
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let callCount = 0;
+  let sawAny = false;
+
+  for (const node of Object.values(nodeResults)) {
+    const totals = _nodeUsageTotals(node);
+    if (!totals) continue;
+    sawAny = true;
+    inputTokens += totals.inputTokens;
+    outputTokens += totals.outputTokens;
+    callCount += totals.callCount;
+  }
+
+  if (!sawAny) return null;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    callCount,
+  };
+}
+
+export const handler: AppSyncResolverHandler<
+  ExecutionResolverArguments,
+  unknown
+> = async (event) => {
+  console.log("Execution resolver event:", JSON.stringify(event, null, 2));
+  // Best-effort: awaited (not fire-and-forget) so the metric call completes
+  // before the Lambda execution environment is frozen post-return. Wrapped
+  // internally so a CloudWatch failure can never fail the resolver.
+  await emitColdStartMetricIfApplicable();
+
+  const { info, arguments: args, identity } = event;
+  const fieldName = info.fieldName;
+  const userId = getUserId(identity);
+
+  try {
+    switch (fieldName) {
+      case "getExecution": {
+        const exec = await getExecution(args.executionId, userId, event);
+        return exec ? toApiExecution(exec) : null;
+      }
+      case "listExecutions":
+        return await listExecutions(args.workflowId, event);
+      case "startExecution":
+        return await startExecution(args.workflowId, args.input, userId, event);
+      case "cancelExecution":
+        return await cancelExecution(args.executionId, userId, event);
+      case "resumeExecution":
+        return await resumeExecution(args.executionId, userId, event);
+      case "pauseExecution":
+        return await pauseExecution(
+          args.executionId,
+          args.nodeId ?? null,
+          args.reason!,
+          userId,
+          event,
+        );
+      case "approveExecution":
+        return await approveExecution(
+          args.executionId,
+          args.nodeId!,
+          userId,
+          event,
+        );
+      case "denyExecution":
+        return await denyExecution(
+          args.executionId,
+          args.nodeId!,
+          args.reason!,
+          userId,
+          event,
+        );
+      case "listAwaitingApprovals":
+        return await listAwaitingApprovals(args.limit, args.nextToken, event);
+      case "publishWorkflowProgress":
+        // IAM-signed fan-out mutation: echo the input so AppSync delivers it
+        // to onWorkflowProgress subscribers.
+        return args.input;
+      default:
+        throw new Error(`Unknown field: ${fieldName}`);
+    }
+  } catch (error) {
+    console.error("Execution resolver error:", error);
+    throw error;
+  }
+};
+
+async function getExecution(
+  executionId: string,
+  userId: string,
+  event: ExecutionResolverEvent,
+): Promise<ExecutionRecord | null> {
+  const result = await docClient.send(
+    new GetCommand({
+      TableName: EXECUTIONS_TABLE,
+      Key: { executionId },
+    }),
+  );
+
+  if (!result.Item) {
+    return null;
+  }
+
+  // Admin cross-org read bypass (finding b7ef1a41), mirroring the shared
+  // assertRowOrg gate (auth-event.ts) already used by
+  // getWorkflow/listExecutions: admins may read any org's execution;
+  // non-admins are reconciled against their server-derived org and denied
+  // (fail-closed) when that org is unresolvable.
+  await assertRowOrg(result.Item as { orgId?: unknown }, event);
+
+  const item = result.Item as ExecutionRecord;
+  return item;
+}
+
+async function listExecutions(
+  workflowId: string,
+  event: ExecutionResolverEvent,
+): Promise<{ items: unknown[]; nextToken?: string }> {
+  // Org filter (finding 2c262386): listExecutions previously ran the
+  // WorkflowIndex query directly with no org check at all — any
+  // client-supplied workflowId exposed that workflow's executions
+  // (including input/output) across tenants. EXECUTIONS_TABLE carries no
+  // orgId GSI (only WorkflowIndex on workflowId+startedAt), so there is no
+  // direct org-filtered index available. Least-bad correct option: load
+  // the parent WORKFLOWS_TABLE row (the org source of truth for this
+  // workflowId — the same lookup startExecution already performs) and
+  // reconcile it against the caller's derived org BEFORE running the
+  // query. Refuse rather than return filtered/foreign data, matching
+  // get/start/cancel/resume's existing "Access denied" semantics exactly.
+  const workflowResult = await docClient.send(
+    new GetCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+    }),
+  );
+
+  const workflow = workflowResult.Item;
+  if (!workflow) {
+    throw new Error("Workflow not found");
+  }
+
+  // Admin cross-org read bypass (finding 4d69104a), mirroring the shared
+  // assertRowOrg gate (auth-event.ts): admins may list any org's
+  // executions; non-admins are reconciled against their server-derived org
+  // and denied (fail-closed) when that org is unresolvable, matching this
+  // function's existing fail-closed contract for an org-less caller.
+  await assertRowOrg(workflow as { orgId?: unknown }, event);
+
+  const result = await docClient.send(
+    new QueryCommand({
+      TableName: EXECUTIONS_TABLE,
+      IndexName: "WorkflowIndex",
+      KeyConditionExpression: "workflowId = :workflowId",
+      ExpressionAttributeValues: {
+        ":workflowId": workflowId,
+      },
+      ScanIndexForward: false,
+    }),
+  );
+
+  return {
+    items: (result.Items || []).map((item) =>
+      toApiExecution(item as ExecutionRecord),
+    ),
+    nextToken: result.LastEvaluatedKey
+      ? JSON.stringify(result.LastEvaluatedKey)
+      : undefined,
+  };
+}
+
+async function startExecution(
+  workflowId: string,
+  input: string | undefined,
+  userId: string,
+  event: ExecutionResolverEvent,
+): Promise<unknown> {
+  // 1. Get workflow, verify PUBLISHED + org access
+  const workflowResult = await docClient.send(
+    new GetCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+    }),
+  );
+
+  const workflow = workflowResult.Item;
+  if (!workflow) {
+    throw new Error("Workflow not found");
+  }
+
+  // Admin cross-org bypass (finding b7ef1a41), mirroring the shared
+  // assertRowOrg gate (auth-event.ts) already used by
+  // getWorkflow/listExecutions: admins may start executions of any org's
+  // workflow; non-admins are reconciled against their server-derived org
+  // and denied (fail-closed) when that org is unresolvable. This must run
+  // before the execution row is written (PutCommand below).
+  await assertRowOrg(workflow as { orgId?: unknown }, event);
+
+  if (workflow.status !== "PUBLISHED") {
+    throw new Error("Only published workflows can be executed");
+  }
+
+  // 2. Parse definition, initialize nodeResults
+  const definition = JSON.parse(workflow.definition);
+  const nodes = definition.nodes || [];
+  const nodeResults: Record<string, ExecutionNodeResult> = {};
+  for (const node of nodes) {
+    nodeResults[node.id] = {
+      nodeId: node.id,
+      agentId: node.agentId,
+      status: "pending",
+      retryCount: 0,
+    };
+  }
+
+  // 3. Create execution item
+  const now = new Date().toISOString();
+  const executionId = uuidv4();
+  // Server-minted only (Pass 1, decision f1cbd5ef) — no client input path
+  // exists for startExecution's arguments to carry a runId, so there is
+  // nothing to strip; this mint is the sole source.
+  const runId = mintRunId();
+
+  const execution = {
+    executionId,
+    workflowId,
+    appId: workflow.appId || null,
+    orgId: workflow.orgId,
+    status: "pending",
+    workflowVersion: workflow.version,
+    currentNode: null,
+    nodeResults,
+    input: input || null,
+    output: null,
+    startedAt: now,
+    completedAt: null,
+    triggeredBy: userId,
+    error: null,
+    runId,
+  };
+
+  await docClient.send(
+    new PutCommand({
+      TableName: EXECUTIONS_TABLE,
+      Item: execution,
+    }),
+  );
+
+  // 4. Publish execution.start.requested event
+  //
+  // Build-time durability guard (Pass 1, decision f1cbd5ef, design §3
+  // layer 1): route the outbound envelope through buildDispatchContext,
+  // whose `runId` parameter is REQUIRED — a future refactor that drops
+  // `runId` here fails `tsc`, not just a runtime check.
+  const dispatchContext = buildDispatchContext({
+    runId,
+    executionId,
+    workflowId,
+  });
+  await emitEvent("execution.start.requested", {
+    executionId: dispatchContext.executionId,
+    workflowId: dispatchContext.workflowId,
+    runId: dispatchContext.runId,
+  });
+
+  return toApiExecution(execution as ExecutionRecord);
+}
+
+async function cancelExecution(
+  executionId: string,
+  userId: string,
+  event: ExecutionResolverEvent,
+): Promise<unknown> {
+  // 1. Get execution, verify org access
+  const existing = await getExecution(executionId, userId, event);
+  if (!existing) {
+    throw new Error("Execution not found");
+  }
+
+  // 2. Update status to cancelled
+  const now = new Date().toISOString();
+  const result = await docClient.send(
+    new UpdateCommand({
+      TableName: EXECUTIONS_TABLE,
+      Key: { executionId },
+      UpdateExpression: "SET #status = :status, #completedAt = :completedAt",
+      ExpressionAttributeNames: {
+        "#status": "status",
+        "#completedAt": "completedAt",
+      },
+      ExpressionAttributeValues: {
+        ":status": "cancelled",
+        ":completedAt": now,
+      },
+      ReturnValues: "ALL_NEW",
+    }),
+  );
+
+  // 3. Publish execution.cancel.requested event
+  await emitEvent("execution.cancel.requested", {
+    executionId,
+    workflowId: existing.workflowId,
+  });
+
+  return toApiExecution(result.Attributes as ExecutionRecord);
+}
+
+async function resumeExecution(
+  executionId: string,
+  userId: string,
+  event: ExecutionResolverEvent,
+): Promise<unknown> {
+  // 1. Load execution + verify org access. getExecution enforces the org
+  //    IDOR check (throws "Access denied" when the target's orgId != caller
+  //    org), so a caller cannot resume another org's execution by guessing
+  //    its id. This runs BEFORE any event is emitted. RBAC parity with
+  //    startExecution/cancelExecution: same default Cognito auth surface
+  //    (resume re-drives real dispatch, so it is write-equivalent and must
+  //    not be reachable by a read-only principal).
+  const existing = await getExecution(executionId, userId, event);
+  if (!existing) {
+    throw new Error("Execution not found");
+  }
+
+  // 2. Reject terminal states (decision O5): completed/cancelled/failed are
+  //    not resumable. No event emitted; return the row unchanged.
+  const status = existing.status;
+  if (status === "completed" || status === "cancelled" || status === "failed") {
+    throw new Error(`Cannot resume execution in terminal state: ${status}`);
+  }
+
+  // 3. Publish execution.resume.requested. The payload carries ONLY locating
+  //    ids + the server-validated orgId (defense-in-depth so the Python
+  //    consumer re-checks org ownership) — NEVER a caller-supplied node list
+  //    or status. The step runner re-derives the entire frontier from the
+  //    persisted EXECUTIONS_TABLE row, so any extra payload fields would be
+  //    ignored regardless.
+  await emitEvent("execution.resume.requested", {
+    executionId,
+    workflowId: existing.workflowId,
+    orgId: existing.orgId,
+    ...(existing.runId ? { runId: existing.runId } : {}),
+  });
+
+  return toApiExecution(existing);
+}
+
+/**
+ * CIT-030 role gate: require admin OR architect group membership.
+ * Throws "Access denied" for any other role (including developer).
+ */
+function assertAdminOrArchitect(event: ExecutionResolverEvent): void {
+  if (isAdminFromEvent(event) || hasRoleFromEvent(event, "architect")) {
+    return;
+  }
+  throw new Error("Access denied: admin or architect role required");
+}
+
+/**
+ * Strip resumeToken from approvalRequests before returning to client (RC-2).
+ * Returns a new object; never mutates the input.
+ *
+ * Idempotent: if approvalRequests is already an array (i.e. previously
+ * transformed), each element is still scrubbed of resumeToken so a
+ * double-call is safe.
+ */
+function stripResumeTokens(
+  execution: ExecutionRecord | Record<string, unknown>,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...execution };
+  const ar = (execution as Record<string, unknown>).approvalRequests;
+  if (!ar || typeof ar !== "object") return result;
+
+  if (Array.isArray(ar)) {
+    // Already array-shaped (idempotent path): strip resumeToken from each.
+    result.approvalRequests = ar.map((entry: Record<string, unknown>) => {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { resumeToken, ...safeFields } = entry;
+      return safeFields;
+    });
+  } else {
+    // Map-shaped (raw DynamoDB): convert to array with nodeId injected.
+    // CIT-237: scope and nodeIds are passed through as-is (they are
+    // part of the approval request record written by the engine).
+    const stripped: Record<string, unknown>[] = [];
+    for (const [key, req] of Object.entries(
+      ar as Record<string, ApprovalRequestRecord>,
+    )) {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { resumeToken, ...safeFields } = req;
+      stripped.push({ nodeId: key, ...safeFields });
+    }
+    result.approvalRequests = stripped;
+  }
+  return result;
+}
+
+/**
+ * Normalise an execution record for the API surface: fold usage totals and
+ * strip resumeTokens (map → array without secrets). Applied on EVERY return
+ * path so AppSync never sees the raw DynamoDB shape.
+ */
+function toApiExecution(
+  item: ExecutionRecord | Record<string, unknown>,
+): Record<string, unknown> {
+  const rec = item as ExecutionRecord;
+  rec.usageTotals = computeExecutionUsageTotals(rec.nodeResults);
+  return stripResumeTokens(rec);
+}
+
+/**
+ * Write a structured audit log record (RC-3) for an approval decision.
+ * Synchronous (before conditional write returns), best-effort (never throws).
+ */
+function auditApprovalDecision(params: {
+  executionId: string;
+  nodeId: string;
+  decision: string;
+  decidedBy: string;
+  orgId: string;
+}): void {
+  console.log(
+    JSON.stringify({
+      auditType: "approval_decision",
+      executionId: params.executionId,
+      nodeId: params.nodeId,
+      decision: params.decision,
+      decidedBy: params.decidedBy,
+      decidedAt: new Date().toISOString(),
+      orgId: params.orgId,
+    }),
+  );
+}
+
+async function pauseExecution(
+  executionId: string,
+  nodeId: string | null,
+  reason: string,
+  userId: string,
+  event: ExecutionResolverEvent,
+): Promise<Record<string, unknown>> {
+  assertAdminOrArchitect(event);
+
+  const existing = await getExecution(executionId, userId, event);
+  if (!existing) {
+    throw new Error("Execution not found");
+  }
+
+  const status = existing.status;
+  if (status === "completed" || status === "cancelled" || status === "failed") {
+    throw new Error(`Cannot pause execution in terminal state: ${status}`);
+  }
+
+  // Write pauseRequested marker — the engine parks at the next dispatch.
+  const now = new Date().toISOString();
+  const result = await docClient.send(
+    new UpdateCommand({
+      TableName: EXECUTIONS_TABLE,
+      Key: { executionId },
+      UpdateExpression: "SET #pauseRequested = :pr",
+      ExpressionAttributeNames: {
+        "#pauseRequested": "pauseRequested",
+      },
+      ExpressionAttributeValues: {
+        ":pr": {
+          reason,
+          requestedBy: userId,
+          requestedAt: now,
+          ...(nodeId ? { nodeId } : {}),
+        },
+      },
+      ReturnValues: "ALL_NEW",
+    }),
+  );
+
+  await emitEvent("execution.pause.requested", {
+    executionId,
+    workflowId: existing.workflowId,
+    orgId: existing.orgId,
+    reason,
+    requestedBy: userId,
+    ...(nodeId ? { nodeId } : {}),
+  });
+
+  const updated = result.Attributes as ExecutionRecord;
+  return toApiExecution(updated);
+}
+
+async function approveExecution(
+  executionId: string,
+  nodeId: string,
+  userId: string,
+  event: ExecutionResolverEvent,
+): Promise<Record<string, unknown>> {
+  assertAdminOrArchitect(event);
+
+  const existing = await getExecution(executionId, userId, event);
+  if (!existing) {
+    throw new Error("Execution not found");
+  }
+
+  // CIT-237: For execution-scoped requests, accept status 'running' as well
+  // because the engine may flip the execution to 'running' while nodes are
+  // still parked under the __execution__ sentinel.
+  if (nodeId === "__execution__") {
+    if (
+      existing.status !== "awaiting_approval" &&
+      existing.status !== "running"
+    ) {
+      throw new Error(
+        `Cannot approve execution: status is '${existing.status}', expected 'awaiting_approval' or 'running'`,
+      );
+    }
+  } else if (existing.status !== "awaiting_approval") {
+    throw new Error(
+      `Cannot approve execution: status is '${existing.status}', expected 'awaiting_approval'`,
+    );
+  }
+
+  const approvalRequest = existing.approvalRequests?.[nodeId];
+  if (!approvalRequest) {
+    throw new Error(`No approval request found for node '${nodeId}'`);
+  }
+
+  // Pre-check: the "already decided" error applies only when the node is no
+  // longer awaiting (already resumed/denied by the engine) OR the stamped
+  // decision differs from the requested one. When the node is still
+  // awaiting_approval and the stamped decision is absent or identical to
+  // "approved", proceed — audit + re-emit the resume event so the engine
+  // picks up the decision (idempotent at the engine side).
+  //
+  // CIT-237: For execution-scoped requests, the "node still awaiting" check
+  // applies to ANY node in nodeIds — if at least one is still awaiting, proceed.
+  if (approvalRequest.decision) {
+    if (nodeId === "__execution__") {
+      const nodeIds = approvalRequest.nodeIds ?? [];
+      const anyStillAwaiting = nodeIds.some(
+        (nid: string) =>
+          existing.nodeResults?.[nid]?.status === "awaiting_approval",
+      );
+      if (!anyStillAwaiting || approvalRequest.decision !== "approved") {
+        throw new Error(
+          `Approval request for node '${nodeId}' already ${approvalRequest.decision}`,
+        );
+      }
+    } else {
+      const nodeStatus = existing.nodeResults?.[nodeId]?.status;
+      if (
+        nodeStatus !== "awaiting_approval" ||
+        approvalRequest.decision !== "approved"
+      ) {
+        throw new Error(
+          `Approval request for node '${nodeId}' already ${approvalRequest.decision}`,
+        );
+      }
+    }
+  }
+
+  const resumeToken = approvalRequest.resumeToken;
+  if (!resumeToken) {
+    throw new Error(`No resume token found for node '${nodeId}'`);
+  }
+
+  const callerOrgId = await extractOrgFromEvent(event);
+
+  // RC-3: Structured audit log
+  auditApprovalDecision({
+    executionId,
+    nodeId,
+    decision: "approved",
+    decidedBy: userId,
+    orgId: callerOrgId || existing.orgId,
+  });
+
+  // Decision write is delegated to the step runner so the resume fence can
+  // succeed — the API only validates, audits, and emits the event.
+  // CIT-237: event payload unchanged — node_id='__execution__' for execution scope.
+  await emitEvent("execution.resume.requested", {
+    executionId,
+    workflowId: existing.workflowId,
+    orgId: existing.orgId,
+    ...(existing.runId ? { runId: existing.runId } : {}),
+    approval_decision: {
+      decision: "approved",
+      node_id: nodeId,
+      resume_token: resumeToken,
+      decided_by: userId,
+      org_id: callerOrgId || existing.orgId,
+    },
+  });
+
+  // Return the execution with the request still undecided; the UI shows
+  // "decision submitted" via the approval_decision event payload.
+  return toApiExecution(existing);
+}
+
+async function denyExecution(
+  executionId: string,
+  nodeId: string,
+  reason: string,
+  userId: string,
+  event: ExecutionResolverEvent,
+): Promise<Record<string, unknown>> {
+  assertAdminOrArchitect(event);
+
+  const existing = await getExecution(executionId, userId, event);
+  if (!existing) {
+    throw new Error("Execution not found");
+  }
+
+  // CIT-237: For execution-scoped requests, accept status 'running' as well.
+  if (nodeId === "__execution__") {
+    if (
+      existing.status !== "awaiting_approval" &&
+      existing.status !== "running"
+    ) {
+      throw new Error(
+        `Cannot deny execution: status is '${existing.status}', expected 'awaiting_approval' or 'running'`,
+      );
+    }
+  } else if (existing.status !== "awaiting_approval") {
+    throw new Error(
+      `Cannot deny execution: status is '${existing.status}', expected 'awaiting_approval'`,
+    );
+  }
+
+  const approvalRequest = existing.approvalRequests?.[nodeId];
+  if (!approvalRequest) {
+    throw new Error(`No approval request found for node '${nodeId}'`);
+  }
+
+  // Pre-check: mirror the approveExecution logic — error only when the node
+  // is no longer awaiting OR the stamped decision differs from "denied".
+  // CIT-237: For execution-scoped requests, check ANY node in nodeIds.
+  if (approvalRequest.decision) {
+    if (nodeId === "__execution__") {
+      const nodeIds = approvalRequest.nodeIds ?? [];
+      const anyStillAwaiting = nodeIds.some(
+        (nid: string) =>
+          existing.nodeResults?.[nid]?.status === "awaiting_approval",
+      );
+      if (!anyStillAwaiting || approvalRequest.decision !== "denied") {
+        throw new Error(
+          `Approval request for node '${nodeId}' already ${approvalRequest.decision}`,
+        );
+      }
+    } else {
+      const nodeStatus = existing.nodeResults?.[nodeId]?.status;
+      if (
+        nodeStatus !== "awaiting_approval" ||
+        approvalRequest.decision !== "denied"
+      ) {
+        throw new Error(
+          `Approval request for node '${nodeId}' already ${approvalRequest.decision}`,
+        );
+      }
+    }
+  }
+
+  const resumeToken = approvalRequest.resumeToken;
+  if (!resumeToken) {
+    throw new Error(`No resume token found for node '${nodeId}'`);
+  }
+
+  const callerOrgId = await extractOrgFromEvent(event);
+
+  // RC-3: Structured audit log
+  auditApprovalDecision({
+    executionId,
+    nodeId,
+    decision: "denied",
+    decidedBy: userId,
+    orgId: callerOrgId || existing.orgId,
+  });
+
+  // Decision write is delegated to the step runner so the resume fence can
+  // succeed — the API only validates, audits, and emits the event.
+  // CIT-237: event payload unchanged — node_id='__execution__' for execution scope.
+  await emitEvent("execution.resume.requested", {
+    executionId,
+    workflowId: existing.workflowId,
+    orgId: existing.orgId,
+    ...(existing.runId ? { runId: existing.runId } : {}),
+    approval_decision: {
+      decision: "denied",
+      node_id: nodeId,
+      resume_token: resumeToken,
+      decided_by: userId,
+      org_id: callerOrgId || existing.orgId,
+      reason,
+    },
+  });
+
+  // Return the execution with the request still undecided; the UI shows
+  // "decision submitted" via the approval_decision event payload.
+  return toApiExecution(existing);
+}
+
+async function listAwaitingApprovals(
+  limit: number | undefined,
+  nextToken: string | undefined,
+  event: ExecutionResolverEvent,
+): Promise<{ items: Record<string, unknown>[]; nextToken?: string }> {
+  assertAdminOrArchitect(event);
+
+  const isAdmin = isAdminFromEvent(event);
+  const callerOrgId = await extractOrgFromEvent(event);
+
+  const scanLimit = Math.min(limit || 20, 100);
+
+  // CIT-237: filter on pendingApproval = 'Y' (engine-maintained marker) with
+  // a fallback OR status = 'awaiting_approval' for records parked before the
+  // engine change that sets the marker.
+  const filterParts: string[] = [
+    "(#pendingApproval = :pendingY OR #status = :awaitingApproval)",
+  ];
+  const exprNames: Record<string, string> = {
+    "#pendingApproval": "pendingApproval",
+    "#status": "status",
+  };
+  const exprValues: Record<string, unknown> = {
+    ":pendingY": "Y",
+    ":awaitingApproval": "awaiting_approval",
+  };
+
+  if (!isAdmin && callerOrgId) {
+    filterParts.push("#orgId = :orgId");
+    exprNames["#orgId"] = "orgId";
+    exprValues[":orgId"] = callerOrgId;
+  }
+
+  const result = await docClient.send(
+    new ScanCommand({
+      TableName: EXECUTIONS_TABLE,
+      FilterExpression: filterParts.join(" AND "),
+      ExpressionAttributeNames: exprNames,
+      ExpressionAttributeValues: exprValues,
+      Limit: scanLimit * 5, // overscan to compensate for filter
+      ...(nextToken ? { ExclusiveStartKey: JSON.parse(nextToken) } : {}),
+    }),
+  );
+
+  const items = (result.Items || [])
+    .slice(0, scanLimit)
+    .map((item) => toApiExecution(item as ExecutionRecord));
+
+  return {
+    items,
+    nextToken: result.LastEvaluatedKey
+      ? JSON.stringify(result.LastEvaluatedKey)
+      : undefined,
+  };
+}
+
+async function emitEvent(eventType: string, detail: unknown): Promise<void> {
+  const result = await eventBridgeClient.send(
+    new PutEventsCommand({
+      Entries: [
+        {
+          Source: "citadel.workflows",
+          DetailType: eventType,
+          Detail: JSON.stringify(detail),
+          EventBusName: EVENT_BUS_NAME,
+        },
+      ],
+    }),
+  );
+
+  if (result.FailedEntryCount && result.FailedEntryCount > 0) {
+    const entry = result.Entries?.[0];
+    const errorMsg =
+      `EventBridge publish failed for ${eventType}: ` +
+      `${entry?.ErrorCode ?? "unknown"} — ${entry?.ErrorMessage ?? "no message"}`;
+    console.error(errorMsg);
+    throw new Error(errorMsg);
+  }
+}

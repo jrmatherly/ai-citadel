@@ -1,0 +1,1837 @@
+
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
+
+import json
+import logging
+import sys
+from typing import Any
+import boto3
+from botocore.exceptions import ClientError
+import os
+
+# Tracing foundation (architect task 5459301e-1e7b-4bfd-bccb-b106aba2748c):
+# activate X-Ray patching of botocore BEFORE any boto3 client below is
+# constructed (sqs/dynamodb/bedrock-runtime/events at module scope just
+# below). Import path mirrors the sys.path insertion immediately following
+# this block — arbiter/conftest.py adds arbiter/supervisor/ to sys.path for
+# pytest; the Lambda asset layout needs the sys.path insert below for
+# `from common.tracing import configure` to resolve `common` as a sibling
+# of `supervisor/` (arbiter/common/), so the import is placed AFTER that
+# insertion rather than before.
+
+# Ensure this file's own directory is on sys.path before the flat
+# same-directory imports below. In the repo/pytest layout,
+# arbiter/conftest.py already inserts arbiter/supervisor/ onto sys.path, so
+# this is a no-op there. In the Lambda asset layout (entry=arbiter/,
+# index=supervisor/index.py) only /var/task is on sys.path by default —
+# /var/task/supervisor is not — so `from agent_config import ...` and
+# `from circuit_breaker import ...` would otherwise raise ModuleNotFoundError
+# at runtime. Inserting unconditionally keeps both layouts working from a
+# single code path.
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+
+from agent_config import load_config_from_dynamodb, load_app_scoped_agents, create_agent_specs, parse_decimals
+from circuit_breaker import CircuitBreaker, CircuitBreakerOpen
+import uuid
+import time
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Governance imports (US-ARB-008)
+#
+# arbiter/governance/ is a sibling package of arbiter/supervisor/. Its
+# submodules use relative imports (``from .models import ...``) so they MUST
+# be imported as the ``governance`` package, which in turn requires the
+# parent directory (arbiter/) to be on ``sys.path``.
+#
+# Fail-closed contract: the deployed Lambda asset MUST bundle
+# arbiter/governance/ alongside arbiter/supervisor/ (see
+# backend/lib/arbiter-stack.ts bundling commandHooks, and
+# backend/scripts/verify-supervisor-bundle.sh for a CI-enforced check). If
+# the package files are missing at runtime for any reason (packaging
+# regression, partial deploy), ``_GOVERNANCE_AVAILABLE`` is set to ``False``
+# below and ``governed_process_agent_call`` REFUSES every dispatch with a
+# structured denial result and an error-level log — it never falls through
+# to ungoverned dispatch. This module must still import successfully in that
+# case (the handler has to start) so the refusal itself is observable.
+#
+# ARBITER_GOVERNANCE_BYPASS semantics (documented here per Requirement 6):
+#   Default: unset / any value other than 'true' -> no effect.
+#   'true'  -> emergency override. Forces shadow-style behaviour (evaluate +
+#              record a finding + always proceed) even when the persisted
+#              enforcement mode resolved via ``hierarchy.load_governance_state``
+#              is 'strict'. Intended for a human operator to flip temporarily
+#              during an incident — NOT a default deployment posture. It has
+#              NO effect on the package-availability gate above: a missing
+#              governance package is refused unconditionally regardless of
+#              this variable.
+#
+# In tests, arbiter/conftest.py puts arbiter/supervisor/ on sys.path; we
+# add arbiter/ ourselves below so ``import governance`` resolves.
+# ---------------------------------------------------------------------------
+_supervisor_dir = os.path.dirname(os.path.abspath(__file__))
+_arbiter_dir = os.path.dirname(_supervisor_dir)
+if _arbiter_dir not in sys.path:
+    sys.path.insert(0, _arbiter_dir)
+
+from common.region import cross_region_prefix
+from model_config_loader import load_model_id
+
+# Shared usage-record schema/helpers (arbiter/common/usage.py). arbiter/ is
+# already on sys.path (inserted above for the governance package import), so
+# this resolves the same way as ``common.region``/``common.workflow_contract``
+# elsewhere in the codebase. Kept as a hard import (not defensively guarded)
+# because ``arbiter/common/`` ships alongside the supervisor Lambda asset
+# today — unlike workerWrapper's deferred-bundling situation for
+# ``tools_config``/``workflow_contract``.
+from common.usage import build_usage_record, extract_converse_usage, extract_request_id
+
+# arbiter/stepRunner/ is a sibling directory (no __init__.py — same layout
+# as arbiter/supervisor/). conftest.py seeds sys.path for tests; the
+# Lambda asset layout may not include it, so add it explicitly. Safe to
+# do unconditionally — duplicates are checked.
+_step_runner_dir = os.path.join(_arbiter_dir, 'stepRunner')
+if _step_runner_dir not in sys.path:
+    sys.path.insert(0, _step_runner_dir)
+
+from approval_requests import build_approval_request
+from common.metrics_constants import (
+    METRIC_NAMESPACE,
+    METRIC_RELEASE_DISPATCH_EVALUATED,
+    METRIC_RELEASE_DISPATCH_WOULD_BLOCK,
+    METRIC_RELEASE_DISPATCH_REFUSED,
+    UNIT_COUNT,
+    DIMENSION_WORKFLOW_ID,
+    DIMENSION_RELEASE_MODE,
+    DIMENSION_RELEASE_OUTCOME,
+    METRIC_CANARY_ASSIGNMENT,
+    DIMENSION_RELEASE_ARM,
+    METRIC_APPROVAL_DISPATCH_EVALUATED,
+    METRIC_APPROVAL_DISPATCH_WOULD_BLOCK,
+    METRIC_APPROVAL_DISPATCH_REFUSED,
+)
+
+# Tracing foundation (architect task 5459301e-1e7b-4bfd-bccb-b106aba2748c):
+# import BEFORE the sqs/dynamodb/bedrock-runtime/events boto3 clients are
+# constructed below so patch_all() instruments botocore ahead of client
+# creation. Ships alongside the supervisor Lambda asset the same way
+# common.usage does (see comment above); hard import, no defensive fallback.
+import common.tracing as tracing  # import activates tracing as a side effect
+
+
+def _load_governance_package():
+    """Load ``arbiter/governance/`` as a package under a private name.
+
+    arbiter/workerWrapper/governance.py is a flat module that also ends up on
+    sys.path under the name ``governance`` in test runs, and the Lambda
+    bundle may not ship the governance package at all. To keep both worlds
+    working we load the governance package explicitly from its filesystem
+    location under the private name ``_citadel_governance`` and expose the
+    submodules under that namespace, so ``sys.modules['governance']`` is
+    left untouched for any other consumer.
+
+    Returns the loaded package or ``None`` if the files are unavailable.
+    """
+    import importlib.util as _ilu
+    pkg_dir = os.path.join(_arbiter_dir, 'governance')
+    init_file = os.path.join(pkg_dir, '__init__.py')
+    if not os.path.isfile(init_file):
+        return None
+
+    pkg_name = '_citadel_governance'
+    if pkg_name in sys.modules:
+        return sys.modules[pkg_name]
+
+    spec = _ilu.spec_from_file_location(
+        pkg_name, init_file,
+        submodule_search_locations=[pkg_dir],
+    )
+    pkg = _ilu.module_from_spec(spec)
+    sys.modules[pkg_name] = pkg
+    spec.loader.exec_module(pkg)
+
+    # Explicitly load the submodules the supervisor needs. They use relative
+    # imports (``from .models import ...``) which need the parent package
+    # (``_citadel_governance``) to already be registered — done above.
+    for submod in ('models', 'hierarchy', 'engine', 'ledger', 'release_resolution', 'grandfathering', 'record_approval'):
+        sub_file = os.path.join(pkg_dir, f'{submod}.py')
+        if not os.path.isfile(sub_file):
+            continue
+        sub_spec = _ilu.spec_from_file_location(
+            f'{pkg_name}.{submod}', sub_file,
+        )
+        sub_mod = _ilu.module_from_spec(sub_spec)
+        sys.modules[f'{pkg_name}.{submod}'] = sub_mod
+        sub_spec.loader.exec_module(sub_mod)
+        setattr(pkg, submod, sub_mod)
+
+    return pkg
+
+
+try:
+    _gov_pkg = _load_governance_package()
+    if _gov_pkg is None:
+        raise ImportError("governance package files not found next to supervisor")
+    load_governance_state = _gov_pkg.hierarchy.load_governance_state
+    GovernanceEngine = _gov_pkg.engine.GovernanceEngine
+    write_finding = _gov_pkg.ledger.write_finding
+    LedgerWriteError = _gov_pkg.ledger.LedgerWriteError
+    DispatchRequest = _gov_pkg.models.DispatchRequest
+    ArbitrationDecision = _gov_pkg.models.ArbitrationDecision
+    GovernanceFinding = _gov_pkg.models.GovernanceFinding
+    # Release-aware dispatch: read-only pointer/release resolution + the
+    # ported pure grandfathering rule. Loaded the same way as the four
+    # symbols above — no code path exists where these load but the
+    # authority-gate symbols don't (a single try/except covers both), so a
+    # packaging regression that drops release_resolution.py or
+    # grandfathering.py surfaces as the SAME fail-closed
+    # governance_package_unavailable refusal the authority gate already
+    # has, not a silent release-gate bypass.
+    resolve_release = _gov_pkg.release_resolution.resolve_release
+    ReleaseResolution = _gov_pkg.release_resolution.ReleaseResolution
+    ReleaseResolutionStatus = _gov_pkg.release_resolution.ReleaseResolutionStatus
+    is_grandfathered_pure = _gov_pkg.grandfathering.is_grandfathered_pure
+    # Record-approval dispatch gate (step 5c, this story). Same
+    # single-try/except load as every other governance symbol above — a
+    # packaging regression that drops record_approval.py surfaces as the
+    # SAME fail-closed governance_package_unavailable refusal, never a
+    # silent approval-gate bypass.
+    resolve_record_approval = _gov_pkg.record_approval.resolve_record_approval
+    approval_decide = _gov_pkg.record_approval.decide
+    ApprovalStatus = _gov_pkg.record_approval.ApprovalStatus
+    _GOVERNANCE_AVAILABLE = True
+    _GOVERNANCE_IMPORT_ERROR: str | None = None
+except ImportError as e:
+    # Fail-closed (Requirement 6 / D9): the governance package is required
+    # to gate dispatch. If its files are not present in the deployed asset
+    # (e.g. a packaging regression that excludes arbiter/governance/), every
+    # dispatch must be REFUSED rather than silently allowed through. This
+    # branch must NOT crash the module — the handler still has to start so
+    # the Lambda remains invokable and observable (it will simply refuse
+    # every dispatch, which is itself actionable signal via the error log
+    # below and the structured denial result returned per-call).
+    _GOVERNANCE_AVAILABLE = False
+    _GOVERNANCE_IMPORT_ERROR = str(e)
+    logger.error(
+        "governance package unavailable (%s); ALL dispatches will be "
+        "refused fail-closed until the deployed asset includes "
+        "arbiter/governance/. This is not a bypass.",
+        e,
+    )
+
+_REGION = os.environ.get('AWS_REGION', 'us-west-2')
+MODEL_ID = load_model_id(
+    region=_REGION,
+    fallback_model_id=f"{cross_region_prefix(_REGION)}.anthropic.claude-sonnet-4-6",
+)
+
+EVENT_BUS_NAME = os.environ.get('EVENT_BUS_NAME')
+# Reserved Source for every event send_response() emits (finding 87a171ad,
+# item g). Pinned so a caller-supplied callback.source can never forge a
+# response event carrying the Supervisor's own dispatch-trigger source
+# ('task.request') or any other value.
+SUPERVISOR_RESPONSE_SOURCE = 'citadel.supervisor'
+ORCHESTRATION_TABLE = os.environ.get('ORCHESTRATION_TABLE')
+WORKER_STATE_TABLE = os.environ.get('WORKER_STATE_TABLE')
+# CIT-125 slice B: shared idempotency table (backend-stack.ts:178-ish,
+# `citadel-idempotency-${env}`, PK `eventId`, TTL attr `ttl`). Referenced by
+# NAME (Table.fromTableName in arbiter-stack.ts) rather than a cross-stack
+# construct import, so this env var is the only coupling to it.
+IDEMPOTENCY_TABLE = os.environ.get('IDEMPOTENCY_TABLE')
+# Dedupe claims only need to outlive the realistic redrive/triage window,
+# not the full 14-day DLQ retention (design B.1 tradeoff).
+IDEMPOTENCY_TTL_SECONDS = 7 * 24 * 60 * 60
+
+sqs = boto3.client('sqs')
+dynamodb = boto3.resource('dynamodb')
+bedrock = boto3.client('bedrock-runtime', region_name='us-west-2')
+events_client = boto3.client('events')
+
+# Circuit breaker for Bedrock API calls — shared across invocations within the same Lambda container
+bedrock_circuit_breaker = CircuitBreaker(
+    failure_threshold=3,
+    recovery_timeout=30.0,
+    max_retries=3,
+    base_delay=1.0,
+    max_delay=15.0,
+)
+
+
+
+SYSTEM_PROMPT = [{
+    "text": """You are the Supervisor Agent responsible for autonomously coordinating and completing workflows on behalf of the user. Your role is to translate user requests into actionable plans, delegate tasks to the most suitable agents, and ensure successful end-to-end delivery — even when all required steps are not known upfront.
+
+Your responsibilities:
+
+1. Interpret & Plan
+   - Convert the user’s request into a clear objective and a structured execution plan.
+   - If key details are missing, infer reasonable assumptions rather than asking the user.
+   - Break work into parallel tasks whenever possible to optimise speed and efficiency.
+
+2. Delegate & Orchestrate
+   - Select the most appropriate agents for each task based on their capabilities.
+   - Issue multiple agent calls in parallel when tasks are independent.
+   - If an agent requires information that the user did not provide, you must generate or infer the required input yourself.
+
+3. Monitor & Adapt
+   - Track progress, validate outputs, and handle failure or ambiguity autonomously.
+   - If a task returns unclear or incomplete results, refine the task or re-delegate.
+   - Adjust the plan as new information emerges—tasks may be iterative or exploratory.
+
+4. Quality & Completion**
+   - Ensure final output meets the user’s intent and quality expectations.
+   - Compile results, summarise outcomes, and deliver a coherent final response to the user.
+
+Rules of Engagement:
+- Do not ask the user follow-up questions after their initial request, unless clarification is absolutely required for safety or correctness.
+- Prefer autonomy, initiative, and inference over user re-engagement.
+- Use agents as the primary mechanism for action—not yourself.
+- Always aim to complete the request in the fewest number of interaction rounds.
+- If no agent exists for a required step, propose a workaround or simulated execution.
+
+Your goal is to behave as a highly autonomous supervisory system that can manage uncertainty, discover required tasks on the fly, and drive efficient, agent-based execution to fulfill the user's intent."""
+}]
+
+
+def create_workflow_tracking_record(nodes: list[str]):
+    request_id = str(uuid.uuid4())
+    if len(nodes) == 0:
+        return
+
+    item = {
+        "requestId": request_id,
+    }
+
+    data = {}
+
+    for node in nodes:
+        item[node] = False
+        data[node] = None
+
+    item['data'] = data
+
+    table = dynamodb.Table(WORKER_STATE_TABLE)
+    table.put_item(
+        TableName=WORKER_STATE_TABLE,
+        Item=item
+    )
+
+    return request_id
+
+
+def update_workflow_tracking(node: str, request_id: str, data: Any) -> bool:
+    table = dynamodb.Table(WORKER_STATE_TABLE)
+
+    response = table.update_item(
+        Key={
+            "requestId": request_id
+        },
+        UpdateExpression="SET #node = :completed, #data.#node = :node_data",
+        ExpressionAttributeNames={
+            "#node": node,
+            "#data": "data"
+        },
+        ExpressionAttributeValues={
+            ":completed": True,
+            ":node_data": data
+        },
+        ReturnValues="ALL_NEW"
+    )
+
+    updated_item = response.get("Attributes", {})
+    all_completed = True
+
+    for key, value in updated_item.items():
+        if key not in ["requestId", "data"] and value is False:
+            all_completed = False
+            break
+
+    return all_completed, response
+
+
+def create_orchestration(conversation, callback=None, run_id=None, org_id=None, eval_run_id=None,
+                          eval_context=None, forbidden_tools=None):
+    """Create a fresh orchestration row.
+
+    ``run_id`` is additive and optional (Pass 1, decision f1cbd5ef): the
+    durable carrier for the server-minted correlation id reaching the
+    arbiter (design §1 "Reaching the arbiter"). Persisted as ``runId`` on
+    the row ONLY when a non-empty string is supplied — omitted (not a null
+    key) otherwise, so a caller that never passes it produces a
+    byte-identical row to the pre-runId shape, mirroring the existing
+    ``callback`` omit-when-absent convention immediately below.
+    ``governed_process_agent_call`` later reads ``orchestration.get('runId')``
+    to stamp the finding, right where it already derives ``workflow_id``
+    from the same dict.
+
+    ``org_id`` (finding 87a171ad, high) follows the SAME additive,
+    omit-when-absent pattern: persisted as ``orgId`` on the row ONLY when a
+    non-empty string is supplied. Unlike ``run_id``, the production
+    ``task.request`` branch of ``handler()`` REQUIRES a non-empty
+    ``org_id`` before ``orchestrate()``/``create_orchestration`` is ever
+    reached — the parameter here stays optional so this function itself
+    remains a pure, non-gating constructor (the gate lives in
+    ``handler()``), and so the ``task.completion`` resume branch (which
+    loads an EXISTING row rather than creating one) and any other caller
+    that doesn't yet have an org concept do not break.
+
+    ``eval_run_id`` / ``eval_context`` / ``forbidden_tools`` (CIT-102 Pass B)
+    are the frozen-contract keys read off the inbound ``task.request``
+    detail by ``handler()`` and threaded here in the same additive,
+    omit-when-absent style: ``eval_run_id`` persists as ``evalRunId`` only
+    when a non-empty string, ``eval_context`` as ``evalContext`` only when
+    truthy, ``forbidden_tools`` as ``forbiddenTools`` only when a non-empty
+    list. A caller that never passes any of the three produces a
+    byte-identical row to the pre-CIT-102 shape (the additive-contract
+    guarantee).
+    """
+    instance = int(time.time())
+
+    item = {
+        'orchestrationId': str(uuid.uuid4()),
+        'instance': instance,
+        'conversation': conversation,
+    }
+
+    if callback:
+        item['callback'] = callback
+
+    if isinstance(run_id, str) and run_id:
+        item['runId'] = run_id
+
+    if isinstance(org_id, str) and org_id:
+        item['orgId'] = org_id
+
+    if isinstance(eval_run_id, str) and eval_run_id:
+        item['evalRunId'] = eval_run_id
+
+    if eval_context:
+        item['evalContext'] = True
+
+    if isinstance(forbidden_tools, list) and forbidden_tools:
+        item['forbiddenTools'] = forbidden_tools
+
+    return item
+
+
+def save_orchestration(orchestration):
+    table = dynamodb.Table(ORCHESTRATION_TABLE)
+    table.put_item(
+        TableName=ORCHESTRATION_TABLE,
+        Item=orchestration
+    )
+
+
+def load_orchestration(orchestration_id=None):
+    if orchestration_id is None:
+        return None
+    else:
+        table = dynamodb.Table(ORCHESTRATION_TABLE)
+        response = table.get_item(Key={'orchestrationId': orchestration_id})
+        return response['Item']
+
+
+# ---------------------------------------------------------------------------
+# Governance control surface (US-ARB-008)
+# ---------------------------------------------------------------------------
+
+# SNS client for escalations (lazy — avoids credential discovery at import).
+_sns_client = None
+
+
+def _get_sns():
+    global _sns_client
+    if _sns_client is None:
+        _sns_client = boto3.client('sns')
+    return _sns_client
+
+
+ESCALATION_TOPIC_ARN = os.environ.get('ESCALATION_TOPIC_ARN')
+
+# ---------------------------------------------------------------------------
+# Release-aware dispatch (this story)
+# ---------------------------------------------------------------------------
+#
+# RELEASE_DISPATCH_ENVIRONMENT is the feature switch: when unset, the
+# release gate is a complete no-op (resolve_release is never called) so an
+# existing deployment with no releases/pointers dispatches byte-identically
+# to pre-feature behaviour. When set, it names which EnvironmentLiteral
+# ("DEV" | "STAGING" | "PROD") this deployment's dispatch path checks
+# pointers for — the same literal set environment-release-pointer-store.ts
+# keys rows by (see backend/src/types/index.ts's EnvironmentLiteral).
+#
+# Read live (os.environ.get(...) at call time, in
+# governed_process_agent_call below) rather than snapshotted once at module
+# import — mirrors ARBITER_GOVERNANCE_BYPASS's own read-live pattern a few
+# lines below, and lets an operator flip this without a redeploy the same
+# way the emergency bypass can be flipped.
+
+# Named seam, not a fabricated multi-tenancy layer: the arbiter's dispatch
+# path (agent_config.py's load_config_from_dynamodb / load_app_scoped_agents,
+# and the orchestration dict itself) carries no orgId anywhere today —
+# org resolution in this codebase happens exclusively at the AppSync/
+# resolver layer from an authenticated Cognito caller (see
+# intake-orchestration-resolver.ts's resolveOrgId), which the arbiter's
+# EventBridge/SQS-driven dispatch has no equivalent of. Rather than
+# fabricate a per-request caller identity that doesn't exist, this env var
+# is the explicit, documented seam: a single org id the deployment's
+# release pointers are scoped under, until a future story threads real
+# per-request org identity into the arbiter. Unset -> the release gate
+# treats every environment as NO_POINTER (see governed_process_agent_call),
+# which is the same safe, backward-compatible outcome as the release
+# tables themselves being unprovisioned. Read live, same rationale as
+# RELEASE_DISPATCH_ENVIRONMENT above.
+
+
+def _resolve_agent_created_at(agent_name: str) -> str | None:
+    """Best-effort per-agent creation timestamp for the grandfathering
+    check. Returns None when no signal is available — which is the honest
+    default in this codebase today (see release_resolution.py's module
+    docstring and RELEASE_DEFAULT_ORG_ID's comment above): the arbiter's
+    agent config rows (agent_config.py) carry no createdAt field, and the
+    AgentCore Registry lookup that DOES expose one
+    (catalog.registry_client.get_agent_record) requires REGISTRY_ENABLED +
+    a resolvable recordId, which is optional and not guaranteed present.
+
+    A None return is not a special case for the grandfathering rule — see
+    grandfathering.py's module docstring: is_grandfathered_pure(None, ...)
+    already resolves via the same conservative-bypass branch defined for
+    any malformed/absent created_at, so no additional logic is needed here
+    to accommodate "the arbiter doesn't have this data yet".
+
+    This function is a single, named seam for a future story to fill in
+    (e.g. once REGISTRY_ENABLED + a resolvable recordId are available for
+    every agent) without touching the call site in
+    governed_process_agent_call.
+    """
+    if os.environ.get('REGISTRY_ENABLED') != 'true':
+        return None
+    registry_id = os.environ.get('REGISTRY_ID')
+    if not registry_id:
+        return None
+    try:
+        from catalog.registry_client import get_agent_record
+        record = get_agent_record(registry_id, agent_name)
+    except Exception:
+        return None
+    if record is None:
+        return None
+    created_at = record.get('createdAt')
+    return created_at if isinstance(created_at, str) and created_at else None
+
+
+_cloudwatch_client = None
+
+
+def _get_cloudwatch():
+    global _cloudwatch_client
+    if _cloudwatch_client is None:
+        _cloudwatch_client = boto3.client('cloudwatch')
+    return _cloudwatch_client
+
+
+def _emit_release_dispatch_metric(
+    *,
+    mode: str,
+    outcome: str,
+    would_block: bool,
+    workflow_id: str = '',
+) -> None:
+    """Best-effort CloudWatch telemetry for the release-aware dispatch
+    gate, emitted for every mode so the rollout can be measured before
+    strict is flipped (Req 5). Never raises — a telemetry backend failure
+    must not affect dispatch, same discipline as executor.py's
+    ``_emit_metric``.
+
+    Always emits METRIC_RELEASE_DISPATCH_EVALUATED (the gate ran).
+    Additionally emits METRIC_RELEASE_DISPATCH_WOULD_BLOCK when
+    ``would_block`` is True (permissive/shadow: what strict WOULD have
+    done), or METRIC_RELEASE_DISPATCH_REFUSED when ``outcome`` is
+    'refused' (strict: what actually happened).
+    """
+    try:
+        cw = _get_cloudwatch()
+        dimensions = [{'Name': DIMENSION_RELEASE_MODE, 'Value': mode}]
+        if workflow_id:
+            dimensions.append({'Name': DIMENSION_WORKFLOW_ID, 'Value': workflow_id})
+        outcome_dimensions = dimensions + [
+            {'Name': DIMENSION_RELEASE_OUTCOME, 'Value': outcome},
+        ]
+        metric_data = [{
+            'MetricName': METRIC_RELEASE_DISPATCH_EVALUATED,
+            'Value': 1.0,
+            'Unit': UNIT_COUNT,
+            'Dimensions': outcome_dimensions,
+        }]
+        if would_block:
+            metric_data.append({
+                'MetricName': METRIC_RELEASE_DISPATCH_WOULD_BLOCK,
+                'Value': 1.0,
+                'Unit': UNIT_COUNT,
+                'Dimensions': dimensions,
+            })
+        if outcome == 'refused':
+            metric_data.append({
+                'MetricName': METRIC_RELEASE_DISPATCH_REFUSED,
+                'Value': 1.0,
+                'Unit': UNIT_COUNT,
+                'Dimensions': dimensions,
+            })
+        cw.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=metric_data)
+    except Exception as exc:  # noqa: BLE001 — telemetry must never raise
+        logger.warning('release-dispatch metric emit failed: %s', exc)
+
+
+def _emit_canary_assignment_metric(arm: str, workflow_id: str = '') -> None:
+    """Best-effort CloudWatch counter of which canary arm a dispatch
+    resolved to (decision D2, attribution-only). Dimensioned ONLY by
+    low-cardinality keys — WorkflowId x ReleaseArm (stable|candidate).
+    releaseId is high-cardinality and is NEVER a dimension (it lives on
+    the usage row / cost ledger / findings). Never raises — telemetry must
+    not affect dispatch.
+    """
+    if arm not in ('stable', 'candidate'):
+        return
+    try:
+        cw = _get_cloudwatch()
+        dimensions = [{'Name': DIMENSION_RELEASE_ARM, 'Value': arm}]
+        if workflow_id:
+            dimensions.append({'Name': DIMENSION_WORKFLOW_ID, 'Value': workflow_id})
+        cw.put_metric_data(
+            Namespace=METRIC_NAMESPACE,
+            MetricData=[{
+                'MetricName': METRIC_CANARY_ASSIGNMENT,
+                'Value': 1.0,
+                'Unit': UNIT_COUNT,
+                'Dimensions': dimensions,
+            }],
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry must never raise
+        logger.warning('canary-assignment metric emit failed: %s', exc)
+
+
+def _emit_approval_dispatch_metric(
+    *,
+    mode: str,
+    outcome: str,
+    would_block: bool,
+    workflow_id: str = '',
+) -> None:
+    """Best-effort CloudWatch telemetry for the record-approval dispatch
+    gate (step 5c). Mirrors ``_emit_release_dispatch_metric`` exactly (same
+    never-raises discipline, same dimension shape) using the
+    ApprovalDispatch* metric names instead of ReleaseDispatch* — a separate
+    counter family so the two gates' rollout can be measured independently.
+    """
+    try:
+        cw = _get_cloudwatch()
+        dimensions = [{'Name': DIMENSION_RELEASE_MODE, 'Value': mode}]
+        if workflow_id:
+            dimensions.append({'Name': DIMENSION_WORKFLOW_ID, 'Value': workflow_id})
+        outcome_dimensions = dimensions + [
+            {'Name': DIMENSION_RELEASE_OUTCOME, 'Value': outcome},
+        ]
+        metric_data = [{
+            'MetricName': METRIC_APPROVAL_DISPATCH_EVALUATED,
+            'Value': 1.0,
+            'Unit': UNIT_COUNT,
+            'Dimensions': outcome_dimensions,
+        }]
+        if would_block:
+            metric_data.append({
+                'MetricName': METRIC_APPROVAL_DISPATCH_WOULD_BLOCK,
+                'Value': 1.0,
+                'Unit': UNIT_COUNT,
+                'Dimensions': dimensions,
+            })
+        if outcome == 'refused':
+            metric_data.append({
+                'MetricName': METRIC_APPROVAL_DISPATCH_REFUSED,
+                'Value': 1.0,
+                'Unit': UNIT_COUNT,
+                'Dimensions': dimensions,
+            })
+        cw.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=metric_data)
+    except Exception as exc:  # noqa: BLE001 — telemetry must never raise
+        logger.warning('approval-dispatch metric emit failed: %s', exc)
+
+
+def governed_process_agent_call(
+    agents_config: dict,
+    orchestration: dict,
+    agent_name: str,
+    agent_input: Any,
+    agent_use_id: str,
+    app_id: str | None = None,
+    supervisor_usage: dict | None = None,
+) -> Any:
+    """Control-surface wrapper around ``process_agent_call`` (US-ARB-008).
+
+    Fail-closed at the dispatch seam. Two independent gates apply, in order:
+
+    1. Governance package availability. If ``arbiter/governance/`` could not
+       be loaded at import time (``_GOVERNANCE_AVAILABLE`` is ``False`` —
+       see the module-level import block above), every dispatch is REFUSED
+       with a structured denial result and an error-level log. This applies
+       regardless of enforcement mode and regardless of
+       ``ARBITER_GOVERNANCE_BYPASS`` — a missing package means the engine
+       cannot be consulted at all, so there is nothing to evaluate against.
+       There is no code path from "package unavailable" to
+       ``process_agent_call`` — dispatch is refused, never bypassed.
+
+    2. Enforcement mode. The persisted mode is read from
+       ``GovernanceState.enforcement_mode`` (``hierarchy.load_governance_state``,
+       itself backed by the same SSM parameter
+       (``/citadel/governance/enforce/{ENVIRONMENT}``) the rest of the
+       platform reads) and controls how an engine DENY/ESCALATE/HALT
+       decision is handled once the package IS available:
+
+       * ``permissive`` / ``shadow`` — evaluate, write the finding, and
+         proceed regardless of the decision. This differs from a bypass:
+         the evaluation and ledger write still happen on every call: only
+         the block on DENY/ESCALATE/HALT is skipped.
+       * ``strict`` — enforce: PERMIT dispatches, DENY/ESCALATE/HALT block
+         (the ESCALATE/HALT branch also publishes to SNS per D7).
+       * If no mode is resolvable, ``load_governance_state`` itself already
+         defaults to ``'shadow'`` (see hierarchy.py), so this function
+         always receives a concrete literal.
+
+    ``ARBITER_GOVERNANCE_BYPASS`` (default unset / falsy) is kept ONLY as an
+    explicit emergency override: when set to ``'true'``, it forces
+    shadow-style behaviour (evaluate + record + proceed) even when the
+    resolved mode is ``'strict'``. It has NO effect on gate 1 above — a
+    missing governance package is refused unconditionally. It is intended
+    for a human operator to flip temporarily during an incident, not as a
+    default deployment posture.
+
+    Fail-closed per D9: any exception from ``write_finding`` propagates and
+    halts dispatch, in every mode.
+
+    ``app_id`` scopes the authority graph (D2). ``None`` means no app
+    filter.
+
+    Release-aware dispatch (additive, this story): after the authority
+    finding is written (step 5), a second and fully independent gate
+    resolves the (org, agent, environment) release pointer — see step 5b
+    below and ``arbiter/governance/release_resolution.py`` /
+    ``arbiter/governance/grandfathering.py``. It reuses this same
+    ``enforcement_mode`` (permissive/shadow telemetry-only,
+    strict-refuses-on-no-release-with-grandfathering) rather than a
+    parallel mode system, and is a no-op end to end when
+    ``RELEASE_DISPATCH_ENVIRONMENT`` is unset — the backward-compatibility
+    floor this story's top constraint requires.
+    """
+    # Gate 1 — package availability. Fail-closed: refuse, never fall through
+    # to ungoverned dispatch. This is intentionally unconditional; it must
+    # not be affected by ARBITER_GOVERNANCE_BYPASS or enforcement mode.
+    if not _GOVERNANCE_AVAILABLE:
+        workflow_id = (
+            orchestration.get('orchestrationId')
+            or orchestration.get('workflowId')
+            or 'unknown'
+        )
+        agent_use_id_for_log = agent_use_id
+        logger.error(
+            "governance dispatch refused: governance package unavailable "
+            "(%s); workflow_id=%s target_agent=%s agent_use_id=%s",
+            _GOVERNANCE_IMPORT_ERROR,
+            workflow_id,
+            agent_name,
+            agent_use_id_for_log,
+        )
+        return {
+            'denied': True,
+            'reason': 'governance_package_unavailable',
+            'detail': _GOVERNANCE_IMPORT_ERROR,
+            'workflow_id': workflow_id,
+            'target_agent': agent_name,
+            'agent_use_id': agent_use_id,
+        }
+
+    # Emergency override: forces shadow-style (evaluate + record + proceed)
+    # regardless of the resolved persisted mode. Documented as an incident
+    # escape hatch, not a default posture — see module docstring.
+    bypass_override = os.environ.get('ARBITER_GOVERNANCE_BYPASS', 'false').lower() == 'true'
+
+    # 1. Load governance state (with app-scoped filter per D2). Carries the
+    #    persisted enforcement mode alongside the four authority tables.
+    state = load_governance_state(registry_id=app_id)
+    enforcement_mode = getattr(state, 'enforcement_mode', 'shadow')
+
+    # 2. Build DispatchRequest. The orchestration dict uses
+    #    ``orchestrationId`` as its workflow identifier.
+    workflow_id = (
+        orchestration.get('orchestrationId')
+        or orchestration.get('workflowId')
+        or 'unknown'
+    )
+    # Domain from agent config (fallback to 'default' — not all agents
+    # declare one).
+    agent_cfg = None
+    for a in agents_config.get('agents', []):
+        if a.get('name') == agent_name:
+            agent_cfg = a
+            break
+    domain = (agent_cfg or {}).get('domain', 'default')
+    # Requester: we don't have an inter-agent requester concept yet, so the
+    # supervisor is the default requesting_agent_id.
+    requesting_agent_id = orchestration.get('requesting_agent_id', 'supervisor')
+
+    request = DispatchRequest(
+        requesting_agent_id=requesting_agent_id,
+        target_agent_id=agent_name,
+        action_type='invoke_agent',
+        domain=domain,
+        workflow_id=workflow_id,
+        agent_use_id=agent_use_id,
+        context={},
+        agent_input=agent_input if isinstance(agent_input, dict) else {'raw': agent_input},
+    )
+
+    # 3. Evaluate via engine.
+    engine = GovernanceEngine(
+        authority_units=state.authority_units,
+        composition_contracts=state.composition_contracts,
+        case_law=state.case_law,
+        constitutional_layers=state.constitutional_layers,
+    )
+    finding = engine.evaluate(request)
+
+    # 4. Default scope_evaluated if the engine didn't set one (Req 6 Notes).
+    if not finding.scope_evaluated:
+        finding.scope_evaluated = 'supervisor-dispatch'
+
+    # 4b. Stamp the active X-Ray trace id (decision<->runtime trace
+    # linking, architect task 9b3f4f78). Best-effort only: a missing trace
+    # context or any exception from active_trace_context() must NEVER deny
+    # dispatch or alter the finding's decision — it only leaves
+    # finding.trace_id as None, which write_finding/ledger already
+    # serialize as a byte-identical (untraced) item. Write order is
+    # unchanged: this stamp happens strictly before write_finding, and
+    # write_finding's call site/position below is untouched.
+    try:
+        _ctx = tracing.active_trace_context()
+        if _ctx and _ctx.get("traceId"):
+            finding.trace_id = _ctx["traceId"]
+    except Exception:
+        logger.debug("trace-id stamp failed; finding written untraced", exc_info=True)
+
+    # 4c. Stamp the server-minted run_id (Pass 1, decision f1cbd5ef), read
+    # from the orchestration row's 'runId' carrier (design §1 "Reaching the
+    # arbiter"). Best-effort only, same try/except discipline as the
+    # trace_id stamp immediately above: a missing runId or any exception
+    # from this read must NEVER deny dispatch or alter the finding's
+    # decision — it only leaves finding.run_id as None, which
+    # write_finding/ledger already serialize as a byte-identical
+    # (unstamped) item. Write order is unchanged: this stamp happens
+    # strictly before write_finding, and write_finding's call site/position
+    # below is untouched.
+    try:
+        _run_id = orchestration.get("runId")
+        if isinstance(_run_id, str) and _run_id:
+            finding.run_id = _run_id
+    except Exception:
+        logger.debug("run-id stamp failed; finding written without runId", exc_info=True)
+
+    # 4d. Stamp the eval-run correlation id (CIT-102 Pass B, frozen
+    # contract: detail.evalRunId ↔ finding.eval_run_id ↔ ledger evalRunId).
+    # Best-effort only, same try/except discipline as the trace_id/run_id
+    # stamps immediately above: a missing evalRunId or any exception from
+    # this read must NEVER deny dispatch or alter the finding's decision —
+    # it only leaves finding.eval_run_id as None, which write_finding/
+    # ledger already serialize as a byte-identical (non-eval) item. Write
+    # order is unchanged: this stamp happens strictly before write_finding,
+    # and write_finding's call site/position below is untouched.
+    try:
+        _eval_run_id = orchestration.get("evalRunId")
+        if isinstance(_eval_run_id, str) and _eval_run_id:
+            finding.eval_run_id = _eval_run_id
+    except Exception:
+        logger.debug(
+            "eval-run-id stamp failed; finding written without evalRunId",
+            exc_info=True,
+        )
+
+    # 5. Write finding (fail-closed per D9). Any exception halts dispatch,
+    # in every mode.
+    #
+    # Governance ledger SLICE 2 (decision 7b3f4fe2 / 2dd461f6): deliberately
+    # NOT stamping finding.org_id here. Unlike trace_id/run_id/eval_run_id
+    # immediately above, there is no genuine per-request org identity
+    # reaching this dispatch path today — see the "Named seam, not a
+    # fabricated multi-tenancy layer" comment near RELEASE_DEFAULT_ORG_ID's
+    # definition earlier in this module: neither `orchestration` nor
+    # load_config_from_dynamodb()/load_app_scoped_agents() (agent_config.py)
+    # carries an orgId anywhere. RELEASE_DEFAULT_ORG_ID is an explicit,
+    # documented DEPLOYMENT-WIDE seam (one org id per deployment's release
+    # pointers), not a per-request caller identity — stamping it onto every
+    # finding here would misrepresent a deployment-wide default as a
+    # genuine tenant attribution, which decision 2dd461f6's discipline
+    # (never invent/default an org) forbids. This finding is therefore
+    # written WITHOUT an org — admin-only by construction, consistent with
+    # the legacy-row ruling, until a future story threads real per-request
+    # org identity into the arbiter (the same future story
+    # RELEASE_DEFAULT_ORG_ID's own comment anticipates).
+    write_finding(finding)
+
+    # 5b. Release-aware dispatch (this story). A completely separate,
+    # additive gate from the authority-graph decision above — the two are
+    # AND'd, not either/or: a PERMIT from the authority engine can still be
+    # refused here, and vice versa is impossible (the authority gate's own
+    # DENY/ESCALATE/HALT branches return before reaching this point in
+    # strict mode; in permissive/shadow they fall through to here exactly
+    # like a PERMIT would).
+    #
+    # Backward-compatible no-op: RELEASE_DISPATCH_ENVIRONMENT unset means
+    # this deployment has not opted into release-aware dispatch at all —
+    # resolve_release is never called, so an existing deployment with no
+    # releases/pointers/env-var dispatches byte-identically to pre-feature
+    # behaviour, in every mode including strict.
+    if os.environ.get('RELEASE_DISPATCH_ENVIRONMENT'):
+        release_dispatch_environment = os.environ['RELEASE_DISPATCH_ENVIRONMENT']
+        # D1: the canary stickiness key is assigned ONCE at flow entry from
+        # a SERVER-MINTED envelope field — the orchestrationId (minted as
+        # str(uuid4()) when the orchestration row is created; runId
+        # precedent). It is NEVER read from a client-supplied field. Any
+        # externally-supplied arm/releaseId claim on the orchestration
+        # envelope is stripped here (boundary strip) so a replayed or
+        # spoofed envelope can never smuggle an arm — the arm is
+        # recomputed deterministically by resolve_release from this
+        # server-minted key alone. Interim key = orchestrationId (no
+        # conversationId threading yet).
+        orchestration.pop('releaseArm', None)
+        orchestration.pop('resolvedReleaseId', None)
+        canary_stickiness_key = orchestration.get('orchestrationId') or ''
+        release_result = resolve_release(
+            org_id=os.environ.get('RELEASE_DEFAULT_ORG_ID') or '',
+            agent_target_id=agent_name,
+            environment=release_dispatch_environment,
+            stickiness_key=canary_stickiness_key,
+        )
+
+        if release_result.status == ReleaseResolutionStatus.RESOLVED:
+            release_gate_outcome = 'proceed'
+            release_would_block = False
+            # Attribution-only canary metric: record which arm this
+            # dispatch resolved to (server-minted key). Stamp the
+            # server-computed arm/releaseId back onto the envelope as the
+            # authoritative, server-minted fields (never trusting an
+            # inbound claim).
+            orchestration['releaseArm'] = release_result.arm
+            if release_result.resolved_release_id:
+                orchestration['resolvedReleaseId'] = release_result.resolved_release_id
+            _emit_canary_assignment_metric(
+                arm=release_result.arm, workflow_id=workflow_id,
+            )
+        elif release_result.status == ReleaseResolutionStatus.LOOKUP_FAILED:
+            # Assert-or-refuse doctrine (this codebase's established
+            # posture — see hierarchy.py's SSM-failure handling and
+            # release_resolution.py's module docstring): the lookup itself
+            # failing (throttle, network, missing table, a dangling
+            # pointer) is NEVER treated the same as a clean "no release
+            # configured yet". Grandfathering does not apply here — a
+            # broken control-surface read is not the same class of thing
+            # as "this agent predates the gate", so bypassing it on
+            # grandfathering grounds would defeat the whole point of
+            # distinguishing LOOKUP_FAILED from NO_POINTER.
+            release_gate_outcome = 'refused' if enforcement_mode == 'strict' else 'proceed'
+            release_would_block = enforcement_mode != 'strict'
+        else:
+            # NO_POINTER — the clean, expected backward-compat state. In
+            # strict mode this refuses UNLESS the (org, agent, environment)
+            # triple is grandfathered, via the same ported pure rule the
+            # TS side owns (grandfathering.py's is_grandfathered_pure).
+            # _resolve_agent_created_at's honest None default (see its
+            # docstring) already routes through that rule's conservative-
+            # bypass branch, so an arbiter with no per-agent creation
+            # signal available today grandfathers by default rather than
+            # hardening into a block.
+            created_at = _resolve_agent_created_at(agent_name)
+            grandfathered = is_grandfathered_pure(created_at, state.effective_at)
+            if enforcement_mode == 'strict' and not grandfathered:
+                release_gate_outcome = 'refused'
+            else:
+                release_gate_outcome = 'proceed'
+            release_would_block = enforcement_mode != 'strict'
+
+        _emit_release_dispatch_metric(
+            mode=enforcement_mode,
+            outcome=release_gate_outcome,
+            would_block=release_would_block,
+            workflow_id=workflow_id,
+        )
+
+        if release_gate_outcome == 'refused':
+            refusal_reason = (
+                'release_lookup_failed'
+                if release_result.status == ReleaseResolutionStatus.LOOKUP_FAILED
+                else 'no_release_resolvable'
+            )
+            logger.error(
+                "release dispatch refused: %s; workflow_id=%s target_agent=%s "
+                "environment=%s detail=%s",
+                refusal_reason,
+                workflow_id,
+                agent_name,
+                release_dispatch_environment,
+                release_result.error,
+            )
+            return {
+                'denied': True,
+                'reason': refusal_reason,
+                'detail': release_result.error,
+                'workflow_id': workflow_id,
+                'target_agent': agent_name,
+                'agent_use_id': agent_use_id,
+            }
+
+    # 5c. Record-approval dispatch gate (this story). A separate, additive
+    # gate layered after the release gate: resolve_record_approval reads
+    # the SAME agent_cfg item already scanned out of agents_config at step
+    # 2 above (agent_config.py now passes through 'registryStatus' and
+    # 'createdAt' from the DynamoDB item onto that dict) — no second
+    # lookup. A missing agent_cfg item (agent not found in agents_config)
+    # resolves to UNKNOWN_RECORD, mirroring resolve_record_approval's own
+    # cache_item=None contract.
+    approval_resolution = resolve_record_approval(agent_cfg)
+    approval_decision = approval_decide(
+        approval_resolution, enforcement_mode, state.effective_at,
+    )
+
+    _emit_approval_dispatch_metric(
+        mode=enforcement_mode,
+        outcome='refused' if approval_decision.refused else 'proceed',
+        would_block=approval_decision.would_block,
+        workflow_id=workflow_id,
+    )
+
+    if approval_decision.would_block or approval_decision.refused:
+        # Deterministic finding id — same tuple-hash convention the
+        # authority gate's finding_id does NOT use (that one is a fresh
+        # uuid4 per GovernanceFinding.create call), because THIS finding
+        # must be safely re-write-attempted on a duplicate delivery
+        # (SQS-style at-least-once redelivery of the same dispatch) without
+        # producing two ledger rows for the same underlying refusal —
+        # write_finding's existing ConditionExpression='attribute_not_exists(findingId)'
+        # write-once semantics (ledger.py) already give us the "conditional
+        # put" the brief asks for, for free, once the id is deterministic
+        # rather than random.
+        approval_finding_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            '|'.join([
+                str(workflow_id),
+                str(agent_use_id),
+                str(agent_name),
+                'record_approval',
+                str(approval_resolution.registry_status),
+            ]),
+        ).hex
+        approval_finding = GovernanceFinding(
+            workflow_id=workflow_id,
+            decision=ArbitrationDecision.DENY if approval_decision.refused else ArbitrationDecision.PERMIT,
+            requesting_agent=requesting_agent_id,
+            target_agent=agent_name,
+            reason=approval_decision.reason or 'approval_would_block',
+            scope_evaluated=approval_resolution.status.value,
+            finding_id=approval_finding_id,
+        )
+        try:
+            write_finding(approval_finding)
+        except Exception as exc:  # noqa: BLE001 — mode-dependent handling below
+            # A ConditionalCheckFailedException means this exact
+            # deterministic finding_id was already written by a prior
+            # (redelivered) attempt at this same dispatch — the record
+            # exists, so the write's purpose is already satisfied. Treat
+            # it as success rather than a write failure: log INFO and
+            # fall through to proceed, in EVERY mode (including strict).
+            # write_finding wraps botocore's ClientError into
+            # LedgerWriteError, so inspect the wrapped cause's error code
+            # rather than the outer exception type.
+            cause = exc.__cause__
+            cause_code = getattr(cause, 'response', {}).get('Error', {}).get('Code') if cause is not None else None
+            if cause_code == 'ConditionalCheckFailedException':
+                logger.info(
+                    "approval-gate finding already recorded (redelivered "
+                    "dispatch); dispatch proceeds: workflow_id=%s "
+                    "target_agent=%s finding_id=%s",
+                    workflow_id, agent_name, approval_finding_id,
+                )
+            elif enforcement_mode == 'strict':
+                # Fail-closed per D9, same as the authority gate's own
+                # write_finding call: a finding-write failure must halt
+                # dispatch in strict mode rather than silently let a
+                # not-approved agent through unrecorded.
+                logger.error(
+                    "approval-gate finding write failed in strict mode; "
+                    "halting dispatch: workflow_id=%s target_agent=%s "
+                    "error=%s",
+                    workflow_id, agent_name, exc,
+                )
+                return {
+                    'denied': True,
+                    'reason': 'approval_finding_write_failed',
+                    'detail': str(exc),
+                    'workflow_id': workflow_id,
+                    'target_agent': agent_name,
+                    'agent_use_id': agent_use_id,
+                }
+            # shadow/permissive: log and proceed — the finding-write
+            # failure is observability-only outside strict mode, same
+            # posture as every other best-effort telemetry emitter in this
+            # module.
+            else:
+                logger.warning(
+                    "approval-gate finding write failed (mode=%s); dispatch "
+                    "proceeds: workflow_id=%s target_agent=%s error=%s",
+                    enforcement_mode, workflow_id, agent_name, exc,
+                )
+
+    if approval_decision.refused:
+        logger.error(
+            "approval dispatch refused: %s; workflow_id=%s target_agent=%s "
+            "registry_status=%s",
+            approval_decision.reason, workflow_id, agent_name,
+            approval_resolution.registry_status,
+        )
+        return {
+            'denied': True,
+            'reason': approval_decision.reason,
+            'workflow_id': workflow_id,
+            'target_agent': agent_name,
+            'agent_use_id': agent_use_id,
+        }
+
+    # 6. Branch on mode + decision.
+    #    permissive/shadow (or the emergency bypass override): evaluate +
+    #      record (already done above) + always proceed regardless of
+    #      decision.
+    #    strict: PERMIT -> call, DENY -> block, ESCALATE/HALT -> SNS + block.
+    if bypass_override or enforcement_mode in ('permissive', 'shadow'):
+        return process_agent_call(
+            agents_config, orchestration, agent_name, agent_input, agent_use_id,
+            supervisor_usage=supervisor_usage,
+        )
+
+    decision = finding.decision
+    if decision == ArbitrationDecision.PERMIT:
+        return process_agent_call(
+            agents_config, orchestration, agent_name, agent_input, agent_use_id,
+            supervisor_usage=supervisor_usage,
+        )
+    elif decision == ArbitrationDecision.DENY:
+        return {
+            'denied': True,
+            'finding_id': finding.finding_id,
+            'reason': finding.reason,
+        }
+    else:
+        # ESCALATE or HALT — SNS notification (kept in all paths).
+        _route_escalation(finding)
+
+        # CIT-030 insertion point 2: when APPROVAL_GATE_ENABLED is on and
+        # the decision is ESCALATE, park the orchestration as
+        # awaiting_approval instead of terminating. Resume of a parked
+        # supervisor orchestration is OUT OF SCOPE here — that is CIT-032
+        # (routing/resume for conversational dispatch). The existing SNS
+        # notification above stays in place regardless of the gate.
+        approval_gate_on = (
+            os.environ.get('APPROVAL_GATE_ENABLED', '') == 'true'
+            and decision == ArbitrationDecision.ESCALATE
+        )
+        if approval_gate_on:
+            # Mark the orchestration row awaiting_approval (additive attrs).
+            orchestration['status'] = 'awaiting_approval'
+            orchestration['approvalRequest'] = build_approval_request(
+                request_type='escalation',
+                reason=finding.reason,
+                requested_by=requesting_agent_id,
+                metadata={
+                    'finding_id': finding.finding_id,
+                    'target_agent': agent_name,
+                    'workflow_id': workflow_id,
+                },
+            )
+            save_orchestration(orchestration)
+
+            # Emit execution.paused event (mirrors stepRunner/executor.py's
+            # pattern: detail carries executionId/workflowId + requestType).
+            if EVENT_BUS_NAME:
+                try:
+                    events_client.put_events(
+                        Entries=[{
+                            'Source': SUPERVISOR_RESPONSE_SOURCE,
+                            'DetailType': 'execution.paused',
+                            'Detail': json.dumps({
+                                'orchestrationId': workflow_id,
+                                'requestType': 'escalation',
+                                'findingId': finding.finding_id,
+                                'reason': finding.reason,
+                            }, default=str),
+                            'EventBusName': EVENT_BUS_NAME,
+                        }],
+                    )
+                except Exception as exc:
+                    logger.error(
+                        'execution.paused event emit failed for %s: %s',
+                        workflow_id, exc,
+                    )
+
+            # Write the governance finding (already written at step 5
+            # above — this is the same finding, no duplicate write needed).
+
+            return {
+                'escalated': True,
+                'finding_id': finding.finding_id,
+                'reason': 'awaiting_approval:escalation',
+            }
+
+        # Gate off (or HALT) — terminal, byte-identical to pre-feature.
+        return {
+            'escalated': True,
+            'finding_id': finding.finding_id,
+            'reason': finding.reason,
+        }
+
+
+def _route_escalation(finding) -> None:
+    """Publish an SNS escalation notification. No-op if topic unset."""
+    if not ESCALATION_TOPIC_ARN:
+        logger.info(
+            'ESCALATION_TOPIC_ARN unset; skipping SNS publish for finding %s',
+            finding.finding_id,
+        )
+        return
+    subject = f'Governance Escalation: {finding.reason}'[:100]
+    message = json.dumps({
+        'finding_id': finding.finding_id,
+        'reason': finding.reason,
+        'decision': finding.decision.value if hasattr(finding.decision, 'value') else str(finding.decision),
+        'workflow_id': getattr(finding, 'workflow_id', None),
+    })
+    try:
+        _get_sns().publish(
+            TopicArn=ESCALATION_TOPIC_ARN,
+            Subject=subject,
+            Message=message,
+        )
+    except Exception as e:
+        # Escalation SNS failure must NOT break the dispatch return.
+        logger.error(
+            'Failed to publish escalation SNS for %s: %s',
+            finding.finding_id,
+            e,
+        )
+
+
+def process_agent_call(agents_config, orchestration, agent_name, agent_input, agent_use_id, *, supervisor_usage=None):
+    agent_config = next(
+        (agent for agent in agents_config['agents'] if agent['name'] == agent_name), None)
+
+    if agent_config is None:
+        print(f"Agent {agent_name} not found in configuration.")
+        return
+
+    # Wave-2a tenancy (finding 87a171ad, branch fix/chatter-tenancy):
+    # fail closed. `handler()` already refuses task.request dispatch
+    # without detail.orgId before an orchestration row is ever created, so
+    # in production this orchestration dict always carries a non-empty
+    # orgId by the time process_agent_call runs. This is still enforced
+    # here, one level down, so a caller of process_agent_call can never
+    # dispatch to the worker queue or emit chatter for an org-less
+    # orchestration — never silently proceed org-less.
+    org_id = orchestration.get('orgId')
+    if not isinstance(org_id, str) or not org_id:
+        logger.error(
+            "process_agent_call refused: orchestration %r carries no "
+            "orgId — refusing worker dispatch and chatter emission for "
+            "agent %r (no tenancy on this dispatch).",
+            orchestration.get("orchestrationId"),
+            agent_name,
+        )
+        return
+
+    action = agent_config["action"]
+    action_type = action["type"]
+    target = action["target"]
+    payload = {
+        "agent_input": agent_input,
+        "orchestration_id": orchestration["orchestrationId"],
+        "agent_use_id": agent_use_id,
+        "node": agent_name,
+        "orgId": org_id
+    }
+
+    # Additive: stamp the supervisor's own Converse-call usage record on the
+    # dispatch payload when one was captured. Omitted entirely (not a null
+    # key) when the caller didn't supply one — keeps the payload unchanged
+    # for existing callers/tests.
+    if supervisor_usage is not None:
+        payload['supervisorUsage'] = supervisor_usage
+
+    # CIT-102 Pass B: thread the eval-run frozen-contract keys onto the
+    # worker dispatch payload, read off the orchestration row (see
+    # create_orchestration). Omitted entirely (not null keys) when absent
+    # — byte-identical payload for every non-eval dispatch (the
+    # additive-contract guarantee). forbiddenTools rides here so the
+    # worker's GovernedToolHandler can ADD it to (never replace) the
+    # static DENIED_TOOLS deny set.
+    _eval_run_id = orchestration.get('evalRunId')
+    if isinstance(_eval_run_id, str) and _eval_run_id:
+        payload['evalRunId'] = _eval_run_id
+    if orchestration.get('evalContext'):
+        payload['evalContext'] = True
+    _forbidden_tools = orchestration.get('forbiddenTools')
+    if isinstance(_forbidden_tools, list) and _forbidden_tools:
+        payload['forbiddenTools'] = _forbidden_tools
+
+    # Activate the per-agent modelOverride binding: resolve the configured
+    # model key to a concrete inference-profile id and forward it in the
+    # dispatch payload so the worker can set MODEL_OVERRIDE. Dormant no-op
+    # unless a binding sets modelOverride AND it resolves against the catalog;
+    # any failure is swallowed so dispatch is never broken.
+    if agent_config.get('modelOverride'):
+        try:
+            from model_config_loader import resolve_agent_override
+            _resolved = resolve_agent_override(agent_config['modelOverride'], _REGION)
+            if _resolved:
+                payload['modelOverride'] = _resolved
+        except Exception as e:
+            logger.warning(
+                "modelOverride resolution failed for agent '%s' "
+                "(override key '%s', region '%s'): %s",
+                agent_name,
+                agent_config['modelOverride'],
+                _REGION,
+                str(e),
+            )
+
+    print(f"Sending payload to {action_type} queue: {target}")
+    print(f"Payload: {json.dumps(payload, default=str)}")
+
+    # Publish to EventBridge for chatter visibility
+    if EVENT_BUS_NAME:
+        try:
+            events_client.put_events(
+                Entries=[
+                    {
+                        'Source': 'supervisor',
+                        'DetailType': 'chatter',
+                        'Detail': json.dumps({
+                            'action': 'agent_call',
+                            'agent_name': agent_name,
+                            'agent_input': agent_input,
+                            'orchestration_id': orchestration["orchestrationId"],
+                            'agent_use_id': agent_use_id,
+                            'target': target,
+                            'timestamp': time.time(),
+                            'orgId': org_id
+                        }, default=str),
+                        'EventBusName': EVENT_BUS_NAME
+                    }
+                ]
+            )
+            print(f"Published supervisor message to EventBridge")
+        except Exception as e:
+            print(f"Error publishing to EventBridge: {e}")
+
+    if action_type == "sqs":
+        response = sqs.send_message(
+            QueueUrl=target,
+            MessageBody=json.dumps(payload)
+        )
+        print(f"SQS send_message response: {json.dumps(response, default=str)}")
+        return response
+
+
+def invoke_agents_from_conversation(orchestration, agents_config, app_id=None, supervisor_usage=None):
+    agent_ids = []
+    output_message = orchestration["conversation"][-1]
+    text_response = None
+
+    print(f'Invoking agents from message: {json.dumps(output_message, default=str)}')
+    print(f'Message content: {output_message.get("content", [])}')
+
+    for content in output_message.get('content', []):
+        print(f'Processing content item: {json.dumps(content, default=str)}')
+        if 'toolUse' in content:
+            tool_use = content['toolUse']
+            print(f'Found toolUse: {json.dumps(tool_use, default=str)}')
+            agent_ids.append(tool_use['name'])
+            result = governed_process_agent_call(
+                agents_config,
+                orchestration,
+                tool_use['name'],
+                tool_use['input'],
+                tool_use['toolUseId'],
+                app_id=app_id if app_id is not None else orchestration.get('app_id'),
+                supervisor_usage=supervisor_usage,
+            )
+            print(f'Agent call result: {result}')
+        elif 'text' in content:
+            text_response = content['text']
+            print(f"Text response from model: {text_response}")
+
+    print(f'Total agents invoked: {len(agent_ids)}')
+    print(f'Agent IDs: {agent_ids}')
+
+    if len(agent_ids) > 0:
+        request_id = create_workflow_tracking_record(agent_ids)
+        orchestration["request_id"] = request_id
+        print(f'Created workflow tracking with request_id: {request_id}')
+    else:
+        print('No agents were invoked - model may have responded with text only')
+        
+        # Send final response to callback if orchestration is complete
+        callback_info = orchestration.get('callback')
+        org_id = orchestration.get('orgId')
+        if text_response and callback_info:
+            print(f"Orchestration complete, sending response to callback")
+            send_response(text_response, callback=callback_info, org_id=org_id)
+        
+        # Publish supervisor feedback to EventBridge for chatter visibility.
+        # Wave-2a tenancy (finding 87a171ad): fail closed — never emit
+        # chatter without orgId. An org-less orchestration row skips this
+        # emission entirely rather than publishing untenanted feedback.
+        if EVENT_BUS_NAME and text_response:
+            if not isinstance(org_id, str) or not org_id:
+                logger.error(
+                    "supervisor.feedback emission refused: orchestration "
+                    "%r carries no orgId — refusing to publish chatter "
+                    "without tenancy.",
+                    orchestration.get("orchestrationId"),
+                )
+            else:
+                try:
+                    events_client.put_events(
+                        Entries=[
+                            {
+                                'Source': 'supervisor',
+                                'DetailType': 'supervisor.feedback',
+                                'Detail': json.dumps({
+                                    'action': 'direct_response',
+                                    'message': text_response,
+                                    'orchestration_id': orchestration["orchestrationId"],
+                                    'timestamp': time.time(),
+                                    'orgId': org_id
+                                }, default=str),
+                                'EventBusName': EVENT_BUS_NAME
+                            }
+                        ]
+                    )
+                    print(f"Published supervisor feedback to EventBridge")
+                except Exception as e:
+                    print(f"Error publishing supervisor feedback to EventBridge: {e}")
+
+
+def update_orchestration_with_results(results, orchestration):
+    tool_results = []
+    data_to_save = results['Attributes']['data']
+
+    for key in data_to_save:
+        data = data_to_save[key]
+        tool_result = {
+            "toolResult": {
+                "toolUseId": data['agent_use_id'],
+                "content": [{"json": {'data': data['data']}}],
+            }
+        }
+        tool_results.append(tool_result)
+
+    orchestration["conversation"].append({
+        "role": "user",
+        "content": tool_results
+    })
+
+
+def orchestrate(initial_message=None, orchestration=None, callback=None, app_id=None, run_id=None,
+                 org_id=None, eval_run_id=None, eval_context=None, forbidden_tools=None):
+    if orchestration is None:
+        # Pass 1, decision f1cbd5ef: forward the server-minted run_id (read
+        # from the inbound task.request detail by handler(), or None for
+        # not-yet-updated callers/fallback paths) onto the orchestration
+        # row. Additive/nullable — create_orchestration already treats
+        # run_id=None as "omit the runId key", so this is byte-identical
+        # to the pre-runId shape when run_id is None.
+        #
+        # org_id (finding 87a171ad): forwarded the same additive way.
+        # handler()'s task.request branch already REQUIRES a non-empty
+        # org_id before orchestrate() is ever reached — this function
+        # itself stays a pure pass-through so other callers (e.g. the
+        # task.completion resume branch, which never calls this
+        # constructor at all) are unaffected.
+        #
+        # CIT-102 Pass B: eval_run_id/eval_context/forbidden_tools are the
+        # same additive, absent-tolerant forwarding for the frozen eval
+        # contract (detail.evalRunId/evalContext/forbiddenTools).
+        orchestration = create_orchestration(
+            conversation=[{
+                "role": "user",
+                "content": [{"text": initial_message}],
+            }],
+            callback=callback,
+            run_id=run_id,
+            org_id=org_id,
+            eval_run_id=eval_run_id,
+            eval_context=eval_context,
+            forbidden_tools=forbidden_tools,
+        )
+
+    if app_id is not None:
+        agent_configs = load_app_scoped_agents(app_id)
+    else:
+        agent_configs = load_config_from_dynamodb()
+    print(f"Agent configs loaded: {json.dumps(agent_configs, default=str)}")
+
+    # Check if there are any active agents
+    if not agent_configs.get('agents') or len(agent_configs['agents']) == 0:
+        # Send response back to requester that there are no active agents
+        print("No active agents configured")
+        callback_info = orchestration.get('callback')
+        send_response("No active agents configured", callback=callback_info, org_id=orchestration.get('orgId'))
+        return
+    
+    agent_specs = create_agent_specs(agent_configs)
+    print(f"Agent specs created: {json.dumps(agent_specs, default=str)}")
+    print(f"Calling Bedrock with conversation: {json.dumps(orchestration['conversation'], default=str)}")
+
+    _converse_start = time.perf_counter()
+    response = bedrock_circuit_breaker.call(
+        bedrock.converse,
+        modelId=MODEL_ID,
+        messages=orchestration["conversation"],
+        system=SYSTEM_PROMPT,
+        inferenceConfig={
+            "maxTokens": 2048,
+        },
+        toolConfig={
+            "tools": agent_specs,
+            # Allow model to automatically select tools
+            "toolChoice": {"auto": {}}
+        }
+    )
+    _converse_latency_ms = int((time.perf_counter() - _converse_start) * 1000)
+
+    print(f"Bedrock response: {json.dumps(response, default=str)}")
+    print(f"Response output message: {json.dumps(response['output']['message'], default=str)}")
+
+    orchestration["conversation"].append(response['output']['message'])
+
+    # Capture this Converse call's usage as a source='supervisor' record.
+    # extract_converse_usage degrades to (0, 0, None) on a missing/malformed
+    # usage block rather than raising, so a provider response that omits
+    # usage still lets orchestration proceed — just logged as a WARN.
+    input_tokens, output_tokens, total_tokens = extract_converse_usage(response)
+    if 'usage' not in response:
+        logger.warning(
+            'Bedrock Converse response for orchestration %s carried no '
+            'usage block; recording a zeroed supervisor usage record.',
+            orchestration.get('orchestrationId', 'unknown'),
+        )
+    supervisor_usage = build_usage_record(
+        model_id=MODEL_ID,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_ms=_converse_latency_ms,
+        call_index=0,
+        source='supervisor',
+        total_tokens=total_tokens,
+        bedrock_request_id=extract_request_id(response),
+    )
+
+    invoke_agents_from_conversation(
+        orchestration, agent_configs, app_id=app_id, supervisor_usage=supervisor_usage
+    )
+
+    save_orchestration(orchestration=orchestration)
+
+def send_response(message, callback=None, org_id=None):
+    """Send response to the default event bus or to a specific callback address.
+
+    Security (finding 87a171ad, items g/h): every event this function emits
+    is pinned to the platform bus (EVENT_BUS_NAME), the reserved
+    SUPERVISOR_RESPONSE_SOURCE, and DetailType 'task.response' —
+    caller-supplied callback.eventBusName / source / detailType are never
+    honored. This makes it impossible for a callback to forge a Source of
+    'task.request' (the Supervisor's own dispatch-trigger rule) or target
+    an arbitrary event bus. Only the 'eventbridge' callback type is
+    supported; any other type (including the removed 'sqs') logs and
+    no-ops.
+
+    Wave-2a tenancy (finding 87a171ad, branch fix/chatter-tenancy):
+    ``org_id`` is the orchestration row's server-derived orgId, threaded in
+    by every call site. Fail closed — never emit chatter without orgId: an
+    absent/empty org_id skips the EventBridge put entirely (both the
+    default-bus and 'eventbridge' callback branches), logged at error
+    level, rather than publishing an org-less task.response.
+    """
+
+    if not isinstance(org_id, str) or not org_id:
+        logger.error(
+            "send_response refused: no orgId on this response — refusing "
+            "to publish task.response without tenancy. message=%r "
+            "callback=%r.",
+            message[:200] if isinstance(message, str) else message,
+            callback,
+        )
+        return
+
+    # If no callback specified, send to default event bus
+    if not callback:
+        if not EVENT_BUS_NAME:
+            print("EVENT_BUS_NAME not configured and no callback provided")
+            return
+        
+        try:
+            events_client.put_events(
+                Entries=[
+                    {
+                        'Source': SUPERVISOR_RESPONSE_SOURCE,
+                        'DetailType': 'task.response',
+                        'Detail': json.dumps({
+                            'message': message,
+                            'timestamp': time.time(),
+                            'orgId': org_id
+                        }, default=str),
+                        'EventBusName': EVENT_BUS_NAME
+                    }
+                ]
+            )
+            print(f"Published task response to EventBridge: {message}")
+        except Exception as e:
+            print(f"Error publishing task response to EventBridge: {e}")
+        return
+    
+    # Handle callback-specific routing
+    callback_type = callback.get('type')
+    
+    if callback_type == 'eventbridge':
+        try:
+            if not EVENT_BUS_NAME:
+                print("EVENT_BUS_NAME not configured; cannot send eventbridge callback")
+                return
+
+            events_client.put_events(
+                Entries=[
+                    {
+                        'Source': SUPERVISOR_RESPONSE_SOURCE,
+                        'DetailType': 'task.response',
+                        'Detail': json.dumps({
+                            'message': message,
+                            'timestamp': time.time(),
+                            'callback': callback,
+                            'orgId': org_id
+                        }, default=str),
+                        'EventBusName': EVENT_BUS_NAME
+                    }
+                ]
+            )
+            print(f"Published task response to EventBridge {EVENT_BUS_NAME}: {message}")
+        except Exception as e:
+            print(f"Error publishing to EventBridge callback: {e}")
+    
+    else:
+        # Removed: 'sqs' callback type (finding 87a171ad, item h — arbitrary
+        # caller-supplied queueUrl). Removed: 'mcp' callback type (DDB
+        # recon: 0 production rows referenced it). Unknown / removed types
+        # fall through to no-op log.
+        print(f"Unknown callback type: {callback_type}")
+
+
+def _idempotency_table():
+    """Return the shared idempotency table resource (CIT-125 slice B).
+
+    Lazily resolved on each call (not module-level) so tests can patch it
+    without needing IDEMPOTENCY_TABLE bound at import time, mirroring the
+    existing lazy-lookup style used elsewhere in this module (e.g.
+    store_agent_config_dynamo's `boto3.resource('dynamodb')` call).
+    """
+    return dynamodb.Table(IDEMPOTENCY_TABLE)
+
+
+def _claim_event_id(event_id: str, consumer: str = "supervisor") -> bool:
+    """Conditionally claim `event_id` in the shared idempotency table.
+
+    Mirrors the cost-ledger-writer pattern (backend/src/lambda/
+    cost-ledger-writer.ts): a single conditional PutItem keyed on the
+    EventBridge envelope id, which is stable across EB delivery retries AND
+    a DLQ redrive (design B.1). Returns True on first sight (proceed),
+    False when the id was already claimed (duplicate — no-op). Any other
+    ClientError (e.g. throttling) is rethrown so the message is redelivered/
+    DLQ'd rather than silently treated as success or duplicate.
+    """
+    now = int(time.time())
+    try:
+        _idempotency_table().put_item(
+            Item={
+                "eventId": event_id,
+                "ttl": now + IDEMPOTENCY_TTL_SECONDS,
+                "consumer": consumer,
+                "claimedAt": now,
+            },
+            ConditionExpression="attribute_not_exists(eventId)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def handler(event, lambda_context):
+    print(f"Received event: {json.dumps(event)}")
+
+    # CIT-125 slice B: dedupe on the EventBridge envelope id before any
+    # side-effecting work. At-least-once EB delivery and a DLQ redrive both
+    # redeliver the SAME event id, so a duplicate delivery must not
+    # double-dispatch (task.request) or double-continue (task.completion).
+    # Events without an `id` (defensive: should not occur on the real EB
+    # path) are NOT deduped — fail open rather than silently dropping work.
+    event_id = event.get('id')
+    if event_id and not _claim_event_id(event_id):
+        print(f"Duplicate event id={event_id}; already claimed, skipping")
+        return
+
+    # Check if this is a task completion event from a worker agent
+    if 'source' in event and event['source'] == 'task.completion':
+        orchestration_id = event['detail']['orchestration_id']
+        try:
+            orchestration = load_orchestration(orchestration_id)
+        except Exception as e:
+            print(f"Error loading orchestration: {e}")
+            return
+        request_id = orchestration['request_id']
+        print(f"request id: {request_id}")
+        node = event['detail']['node']
+        all_completed, results = update_workflow_tracking(
+            node, request_id, event['detail'])
+
+        if (all_completed):
+            update_orchestration_with_results(
+                results=results, orchestration=orchestration)
+            
+            # Check if this is the final completion and send callback
+            parsed_orchestration = parse_decimals(orchestration)
+            
+            # Continue orchestration to get final response from supervisor
+            orchestrate(orchestration=parsed_orchestration)
+    
+    # Check if this is a new task request
+    elif 'source' in event and event['source'] == 'task.request':
+        print("Processing new task request")
+        task_details = event['detail'].get('task', '')
+        callback = event['detail'].get('callback')
+        app_id = event['detail'].get('appId')
+        # Server-minted correlation id (Pass 1, decision f1cbd5ef): the
+        # runId already minted upstream (e.g. task-runner-resolver.ts
+        # submitTask) rides in on `detail.runId`. This is a READ of a
+        # value this same server tier minted moments earlier — not a
+        # trust boundary — so it is passed through as-is; additive/
+        # nullable, so its absence (pre-runId caller, or a fallback
+        # detail shape) must not raise or change behavior.
+        run_id = event['detail'].get('runId')
+
+        # Tenancy gate (finding 87a171ad, high). Unlike run_id/appId/
+        # callback above, orgId is NOT optional: every task.request MUST
+        # carry a server-derived organisation (stamped by the resolver
+        # side, e.g. task-runner-resolver.ts submitTask's `requireOrgId`)
+        # or dispatch is refused outright — no orchestrate() call, no
+        # orchestration row created. This is the consumer-side half of
+        # the fix; the producer-side half (the resolver) never accepts an
+        # orgId from client input, so a caller cannot forge this by
+        # crafting its own detail.orgId either — it can only be missing
+        # (an unfixed/legacy producer) or genuinely server-derived.
+        org_id = event['detail'].get('orgId')
+        if not isinstance(org_id, str) or not org_id:
+            logger.error(
+                "task.request refused: missing/empty detail.orgId — no "
+                "tenancy on this dispatch. task=%r appId=%r runId=%r. "
+                "Every task.request producer must stamp a server-derived "
+                "organisation before publishing (see "
+                "task-runner-resolver.ts submitTask's requireOrgId).",
+                task_details[:200] if isinstance(task_details, str) else task_details,
+                app_id,
+                run_id,
+            )
+            return
+
+        # CIT-102 Pass B: frozen contract keys (Pass A, detail.evalRunId /
+        # detail.evalContext / detail.forbiddenTools), absent-tolerant reads
+        # exactly like run_id immediately above — absence (a non-eval
+        # dispatch, the overwhelming majority) must not raise or change
+        # behavior.
+        eval_run_id = event['detail'].get('evalRunId')
+        eval_context = event['detail'].get('evalContext')
+        forbidden_tools = event['detail'].get('forbiddenTools')
+
+        if callback:
+            print(f"Task request includes callback: {json.dumps(callback, default=str)}")
+        
+        if task_details:
+            orchestrate(
+                initial_message=task_details, callback=callback, app_id=app_id, run_id=run_id,
+                org_id=org_id, eval_run_id=eval_run_id, eval_context=eval_context,
+                forbidden_tools=forbidden_tools,
+            )
+        else:
+            print("No task details found in event")
+
+    # Generic-detail fallback: REMOVED (finding 87a171ad, item 3, decision
+    # made explicit here rather than left as an unremarked bypass).
+    #
+    # The prior `elif 'detail' in event: orchestrate(initial_message=
+    # json.dumps(event["detail"]))` branch orchestrated ARBITRARY event
+    # detail with NO source check at all — any event reaching this Lambda
+    # with a `detail` key, regardless of source, triggered full Supervisor
+    # orchestration with zero tenancy and zero validation. That is a
+    # second, independent bypass of the org-tenancy rule just added above:
+    # an attacker (or a misconfigured EventBridge rule) could route a
+    # non-`task.request` event straight past the new orgId gate.
+    #
+    # Decision: REMOVE it, not restrict-by-source or add tenancy to it.
+    # Checked backend/lib/arbiter-stack.ts's EventBridge rules: the
+    # Supervisor Lambda is invoked ONLY by TaskRequestRule (source
+    # `task.request`) and TaskCompletionRule (source `task.completion`) —
+    # both already have dedicated, now-gated branches above. No third
+    # production source targets this Lambda, so restricting this branch
+    # to `source == 'task.request'` would make it exactly equivalent to
+    # removal (any event that would still reach it is already handled by
+    # the `task.request` branch above) while leaving dead code that reads
+    # like a supported path. Removing it outright is the more honest
+    # contract: an event with a `detail` key but an unrecognised/absent
+    # `source` is now a logged no-op, not a silent orchestration trigger.
+    # The `__main__` local-dev harness below was updated to send a proper
+    # `task.request`-shaped event (with detail.task + detail.orgId)
+    # instead of relying on this removed fallback.
+    else:
+        print(
+            f"Unrecognised event shape (source={event.get('source')!r}); "
+            "no matching dispatch branch — no-op."
+        )
+
+
+if __name__ == "__main__":
+    # Fixture updated for the org-tenancy contract (finding 87a171ad):
+    # `detail` must be a dict with a `task` string and a non-empty `orgId`
+    # — the prior harness passed a JSON-STRING `detail` (not a dict) with
+    # no `task`/`orgId` keys at all, which relied on the now-removed
+    # generic-detail fallback rather than exercising the real
+    # `task.request` contract. This shape mirrors what
+    # task-runner-resolver.ts submitTask actually stamps on the bus.
+    handler({
+        "source": "task.request",
+        "DetailType": "System-Task",
+        "detail": {
+            "task": json.dumps({
+                "orderId": "12345",
+                "customerId": "C-1234",
+                "items": ["cheesecake"],
+            }),
+            "orgId": "org-local-dev",
+        },
+        "EventBusName": "orchestration-bus"
+    }, {})

@@ -1,0 +1,250 @@
+import * as cdk from "aws-cdk-lib";
+import { Template, Match } from "aws-cdk-lib/assertions";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+import * as events from "aws-cdk-lib/aws-events";
+import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as appsync from "aws-cdk-lib/aws-appsync";
+import { Bucket } from "aws-cdk-lib/aws-s3";
+import * as path from "path";
+import {
+  scaffoldBackendAssetDirs,
+  scaffoldArbiterStubs,
+} from "./helpers/scaffold-stub-assets";
+import { CfnPolicyResourceLike } from "./helpers/registry-ssm";
+
+// Ensure asset directories exist for CDK synthesis
+scaffoldBackendAssetDirs(["dist/lambda", "src/schema"]);
+
+// PythonFunction resolves entry paths from backend/lib/ via a repo-anchored root.
+scaffoldArbiterStubs();
+
+import { ArbiterStack } from "../lib/arbiter-stack";
+
+/**
+ * Helper: find the single Supervisor Lambda logical ID by its unique env signature
+ * (ORCHESTRATION_TABLE + WORKER_STATE_TABLE are Supervisor-only).
+ */
+function findSupervisorLogicalId(template: Template): string {
+  const resources = template.findResources("AWS::Lambda::Function", {
+    Properties: Match.objectLike({
+      Environment: {
+        Variables: Match.objectLike({
+          ORCHESTRATION_TABLE: Match.anyValue(),
+          WORKER_STATE_TABLE: Match.anyValue(),
+        }),
+      },
+    }),
+  });
+  const ids = Object.keys(resources);
+  expect(ids).toHaveLength(1);
+  return ids[0];
+}
+
+/**
+ * Helper: find IAM policies attached to a given role logical ID.
+ */
+function findPoliciesForRole(
+  template: Template,
+  roleLogicalId: string,
+): CfnPolicyResourceLike[] {
+  const all = template.toJSON().Resources as Record<
+    string,
+    CfnPolicyResourceLike
+  >;
+  return Object.values(all).filter(
+    (r) =>
+      r.Type === "AWS::IAM::Policy" &&
+      r.Properties?.Roles?.some((role) => role.Ref === roleLogicalId),
+  );
+}
+
+/** Shared fixture: creates the BackendStack dependencies for ArbiterStack. */
+function createFixture(app: cdk.App) {
+  const backendStack = new cdk.Stack(app, "MockBackendStack", {
+    env: { account: "123456789012", region: "us-east-1" },
+  });
+
+  const agentEventBus = new events.EventBus(backendStack, "AgentEventBus", {
+    eventBusName: "citadel-agents-test",
+  });
+
+  const agentConfigTable = new dynamodb.Table(
+    backendStack,
+    "AgentConfigTable",
+    {
+      tableName: "citadel-agents-test",
+      partitionKey: { name: "agentId", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  const codeBucket = new Bucket(backendStack, "CodeBucket", {
+    bucketName: "citadel-code-test",
+  });
+
+  const workflowsTable = new dynamodb.Table(backendStack, "WorkflowsTable", {
+    tableName: "citadel-workflows-test",
+    partitionKey: { name: "workflowId", type: dynamodb.AttributeType.STRING },
+    billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+  });
+
+  const executionsTable = new dynamodb.Table(backendStack, "ExecutionsTable", {
+    tableName: "citadel-executions-test",
+    partitionKey: { name: "executionId", type: dynamodb.AttributeType.STRING },
+    billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+  });
+
+  const fanoutFunction = new lambda.Function(backendStack, "FanoutFunction", {
+    runtime: lambda.Runtime.NODEJS_24_X,
+    handler: "workflow-progress-fanout.handler",
+    code: lambda.Code.fromAsset("dist/lambda"),
+    timeout: cdk.Duration.seconds(30),
+  });
+
+  const appSyncApi = new appsync.GraphqlApi(backendStack, "MockApi", {
+    name: "mock-api",
+    schema: appsync.SchemaFile.fromAsset(
+      path.resolve(__dirname, "../src/schema/schema.graphql"),
+    ),
+  });
+
+  const appsTable = new dynamodb.Table(backendStack, "AppsTable", {
+    tableName: "citadel-apps-test",
+    partitionKey: { name: "appId", type: dynamodb.AttributeType.STRING },
+    billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+  });
+
+  const executionSpecificationsTable = new dynamodb.Table(
+    backendStack,
+    "ExecutionSpecificationsTable",
+    {
+      tableName: "citadel-execution-specifications-test",
+      partitionKey: { name: "specId", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  return {
+    agentEventBus,
+    agentConfigTable,
+    codeBucket,
+    workflowsTable,
+    executionsTable,
+    fanoutFunction,
+    appSyncEndpoint: appSyncApi.graphqlUrl,
+    appsTable,
+    executionSpecificationsTable,
+  };
+}
+
+describe("Supervisor registry wiring (SSM-resolved)", () => {
+  let template: Template;
+
+  beforeAll(() => {
+    const app = new cdk.App({ context: { "aws:cdk:bundling-stacks": [] } });
+    const fixture = createFixture(app);
+
+    const stack = new ArbiterStack(app, "TestArbiterStack", {
+      environment: "test",
+      env: { account: "123456789012", region: "us-east-1" },
+      ...fixture,
+    });
+
+    template = Template.fromStack(stack);
+  });
+
+  test("SupervisorAgent Lambda exists exactly once (pinned by env signature)", () => {
+    const id = findSupervisorLogicalId(template);
+    expect(id).toMatch(/^SupervisorAgent/);
+  });
+
+  test("Supervisor has APPS_TABLE environment variable (back-compat)", () => {
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      Environment: {
+        Variables: Match.objectLike({
+          ORCHESTRATION_TABLE: Match.anyValue(),
+          WORKER_STATE_TABLE: Match.anyValue(),
+          APPS_TABLE: Match.anyValue(),
+        }),
+      },
+    });
+  });
+
+  test("Supervisor has REGISTRY_ID environment variable", () => {
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      Environment: {
+        Variables: Match.objectLike({
+          ORCHESTRATION_TABLE: Match.anyValue(),
+          WORKER_STATE_TABLE: Match.anyValue(),
+          REGISTRY_ID: Match.anyValue(),
+        }),
+      },
+    });
+  });
+
+  test("Supervisor has REGISTRY_ENABLED = true", () => {
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      Environment: {
+        Variables: Match.objectLike({
+          ORCHESTRATION_TABLE: Match.anyValue(),
+          WORKER_STATE_TABLE: Match.anyValue(),
+          REGISTRY_ENABLED: "true",
+        }),
+      },
+    });
+  });
+
+  test("Supervisor has DynamoDB read-only IAM on AppsTable (back-compat)", () => {
+    const supervisorId = findSupervisorLogicalId(template);
+    const all = template.toJSON().Resources;
+    const roleRef = all[supervisorId].Properties.Role["Fn::GetAtt"][0];
+
+    const policies = findPoliciesForRole(template, roleRef);
+    expect(policies.length).toBeGreaterThan(0);
+
+    const hasDdbRead = policies.some((policy) =>
+      (policy.Properties?.PolicyDocument?.Statement ?? []).some(
+        (stmt) =>
+          stmt.Effect === "Allow" &&
+          Array.isArray(stmt.Action) &&
+          stmt.Action.includes("dynamodb:GetItem") &&
+          stmt.Action.includes("dynamodb:Query") &&
+          !stmt.Action.includes("dynamodb:PutItem"),
+      ),
+    );
+    expect(hasDdbRead).toBe(true);
+  });
+
+  test("Supervisor has Registry read IAM (GetRegistryRecord + ListRegistryRecords)", () => {
+    const supervisorId = findSupervisorLogicalId(template);
+    const all = template.toJSON().Resources;
+    const roleRef = all[supervisorId].Properties.Role["Fn::GetAtt"][0];
+
+    const policies = findPoliciesForRole(template, roleRef);
+    expect(policies.length).toBeGreaterThan(0);
+
+    const hasRegistryRead = policies.some((policy) =>
+      (policy.Properties?.PolicyDocument?.Statement ?? []).some(
+        (stmt) =>
+          stmt.Effect === "Allow" &&
+          Array.isArray(stmt.Action) &&
+          stmt.Action.includes("agent-registry:GetRegistryRecord") &&
+          stmt.Action.includes("agent-registry:ListRegistryRecords"),
+      ),
+    );
+    expect(hasRegistryRead).toBe(true);
+  });
+  test("Supervisor has REGISTRY_GENERATION beside REGISTRY_ID (redeploy pin)", () => {
+    const supervisorId = findSupervisorLogicalId(template);
+    const all = template.toJSON().Resources;
+    const envVars = all[supervisorId].Properties.Environment.Variables;
+
+    expect(envVars).toHaveProperty("REGISTRY_ID");
+    expect(envVars).toHaveProperty("REGISTRY_GENERATION");
+  });
+});

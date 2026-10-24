@@ -1,0 +1,1232 @@
+import { AppSyncResolverHandler, AppSyncResolverEvent } from "aws-lambda";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  UpdateCommand,
+  QueryCommand,
+  DeleteCommand,
+  BatchGetCommand,
+  QueryCommandInput,
+  UpdateCommandInput,
+} from "@aws-sdk/lib-dynamodb";
+import {
+  EventBridgeClient,
+  PutEventsCommand,
+} from "@aws-sdk/client-eventbridge";
+import { v4 as uuidv4 } from "uuid";
+import { getUserId } from "../utils/appsync";
+import {
+  extractOrgFromEvent,
+  isAdminFromEvent,
+  assertRowOrg,
+} from "../utils/auth-event";
+import { PermissionError } from "./adapters/errors";
+
+const dynamoClient = new DynamoDBClient({});
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
+const eventBridgeClient = new EventBridgeClient({});
+
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE!;
+const APPS_TABLE = process.env.APPS_TABLE!;
+const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME!;
+
+export interface CreateWorkflowInput {
+  orgId: string;
+  name: string;
+  description?: string;
+  isBlueprint?: boolean;
+  definition?: unknown;
+  configuration?: unknown;
+  metadata?: unknown;
+}
+
+interface UpdateWorkflowInput {
+  workflowId: string;
+  version: number;
+  name?: string;
+  description?: string;
+  definition?: unknown;
+  configuration?: unknown;
+  metadata?: unknown;
+}
+
+interface ImportWorkflowInput {
+  orgId: string;
+  workflowJson: string;
+  name?: string;
+}
+
+/**
+ * Merged view of every argument shape this resolver's fields receive.
+ * AppSync only populates the arguments relevant to the dispatched field.
+ */
+interface WorkflowResolverArguments {
+  workflowId: string;
+  orgId: string;
+  status?: string;
+  category?: string;
+  input: CreateWorkflowInput & UpdateWorkflowInput & ImportWorkflowInput;
+  configuration: string;
+  version: number;
+  blueprintId: string;
+  appId: string;
+  name?: string;
+  agentMapping?: string | Record<string, string>;
+}
+
+type WorkflowResolverEvent = AppSyncResolverEvent<WorkflowResolverArguments>;
+
+interface WorkflowVersionHistoryEntry {
+  version: number;
+  definition: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+/** Shape of a workflow item persisted in the workflows table. */
+interface WorkflowRecord {
+  workflowId: string;
+  orgId: string;
+  name: string;
+  description?: string;
+  status: string;
+  isBlueprint: string;
+  definition: string;
+  configuration?: string | Record<string, unknown> | null;
+  version: number;
+  versionHistory?: WorkflowVersionHistoryEntry[];
+  appId?: string | null;
+  createdBy?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  metadata?: string | Record<string, unknown> | null;
+}
+
+interface WorkflowDefinitionNode {
+  id: string;
+  agentId?: unknown;
+}
+
+interface WorkflowDefinitionEdge {
+  source: string;
+  target: string;
+}
+
+interface ParsedWorkflowDefinition {
+  nodes?: WorkflowDefinitionNode[];
+  edges?: WorkflowDefinitionEdge[];
+}
+
+export const handler: AppSyncResolverHandler<
+  WorkflowResolverArguments,
+  unknown
+> = async (event) => {
+  console.log("Workflow resolver event:", JSON.stringify(event, null, 2));
+
+  const { info, arguments: args, identity } = event;
+  const fieldName = info.fieldName;
+  const userId = getUserId(identity);
+
+  try {
+    switch (fieldName) {
+      case "getWorkflow":
+        return await getWorkflow(args.workflowId, userId, event);
+      case "listWorkflows":
+        return await listWorkflows(args.orgId, args.status, userId, event);
+      case "listBlueprints":
+        return await listBlueprints(args.category);
+      case "createWorkflow":
+        return await createWorkflow(args.input, userId, event);
+      case "updateWorkflow":
+        return await updateWorkflow(args.input, userId, event);
+      case "deleteWorkflow":
+        return await deleteWorkflow(args.workflowId, userId, event);
+      case "publishWorkflow":
+        return await publishWorkflow(args.workflowId, userId, event);
+      case "updateWorkflowConfiguration":
+        return await updateWorkflowConfiguration(
+          args.workflowId,
+          args.configuration,
+          args.version,
+          userId,
+          event,
+        );
+      case "importBlueprint":
+        return await importBlueprint(
+          args.blueprintId,
+          args.appId,
+          args.name,
+          args.agentMapping,
+          userId,
+          event,
+        );
+      case "importWorkflow":
+        return await importWorkflowFn(args.input, userId, event);
+      case "exportWorkflow":
+        return await exportWorkflow(args.workflowId, userId, event);
+      case "getWorkflowVersion":
+        return await getWorkflowVersion(
+          args.workflowId,
+          args.version,
+          userId,
+          event,
+        );
+      case "listAppWorkflows":
+        return await listAppWorkflows(args.appId, userId, event);
+      default:
+        throw new Error(`Unknown field: ${fieldName}`);
+    }
+  } catch (error) {
+    console.error("Workflow resolver error:", error);
+    throw error;
+  }
+};
+
+async function getWorkflow(
+  workflowId: string,
+  userId: string,
+  event: unknown,
+): Promise<WorkflowRecord | null> {
+  const result = await docClient.send(
+    new GetCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+    }),
+  );
+
+  if (!result.Item) {
+    return null;
+  }
+
+  // Admin cross-org read bypass (finding 4d69104a), mirroring the shared
+  // assertRowOrg gate (auth-event.ts): admins may read any org's workflow;
+  // non-admins are reconciled against their server-derived org and denied
+  // (fail-closed) when that org is unresolvable, matching assertRowOrg's
+  // own contract rather than this function's previous fail-open behavior
+  // for an org-less caller.
+  await assertRowOrg(result.Item as { orgId?: unknown }, event);
+
+  return result.Item as WorkflowRecord;
+}
+
+async function listWorkflows(
+  orgId: string,
+  status: string | undefined,
+  userId: string,
+  event: WorkflowResolverEvent,
+): Promise<{ items: unknown[]; nextToken?: string }> {
+  // Org scoping (finding f0ce2b00, high): fail closed, mirroring
+  // requireEffectiveOrgId in datastore-resolver.ts/integration-resolver.ts.
+  // An admin uses the supplied argument explicitly; a non-admin uses ONLY
+  // their own resolved org; an unresolved effective org is a hard denial —
+  // it must never fall through to the client-supplied orgId argument (the
+  // prior `userOrg || orgId` coercion did exactly that, handing a caller
+  // with no org claim any tenant's workflows on request).
+  let queryOrgId: string;
+  if (isAdminFromEvent(event)) {
+    queryOrgId = orgId;
+  } else {
+    const userOrg = await extractOrgFromEvent(event);
+    if (!userOrg) {
+      throw new PermissionError(
+        "Access denied: no organization is provisioned for your account. Contact an administrator.",
+      );
+    }
+    queryOrgId = userOrg;
+  }
+
+  const params: QueryCommandInput = {
+    TableName: WORKFLOWS_TABLE,
+    IndexName: "OrgStatusIndex",
+    KeyConditionExpression: status
+      ? "orgId = :orgId AND #status = :status"
+      : "orgId = :orgId",
+    ExpressionAttributeValues: {
+      ":orgId": queryOrgId,
+      ":isBlueprintFalse": "false",
+      ...(status ? { ":status": status } : {}),
+    },
+    FilterExpression: "isBlueprint = :isBlueprintFalse",
+    ...(status ? { ExpressionAttributeNames: { "#status": "status" } } : {}),
+  };
+
+  const result = await docClient.send(new QueryCommand(params));
+  return {
+    items: result.Items || [],
+    nextToken: result.LastEvaluatedKey
+      ? JSON.stringify(result.LastEvaluatedKey)
+      : undefined,
+  };
+}
+
+async function listBlueprints(
+  category?: string,
+): Promise<{ items: unknown[]; nextToken?: string }> {
+  const params: QueryCommandInput = {
+    TableName: WORKFLOWS_TABLE,
+    IndexName: "BlueprintIndex",
+    KeyConditionExpression: "isBlueprint = :isBlueprint",
+    ExpressionAttributeValues: {
+      ":isBlueprint": "true",
+    },
+    ScanIndexForward: false,
+  };
+
+  const result = await docClient.send(new QueryCommand(params));
+  let items = result.Items || [];
+
+  if (category) {
+    items = items.filter((item) => {
+      try {
+        const meta =
+          typeof item.metadata === "string"
+            ? JSON.parse(item.metadata)
+            : item.metadata;
+        return meta?.category === category;
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  return {
+    items,
+    nextToken: result.LastEvaluatedKey
+      ? JSON.stringify(result.LastEvaluatedKey)
+      : undefined,
+  };
+}
+
+// Exported for reuse by intake-orchestration-resolver (the IAM-only intake
+// blueprint mutation delegates here so definition-structure validation and
+// the workflow.created event stay in exactly one place). That caller has no
+// AppSync identity to extract an org from — it derives orgId itself via its
+// own session-based mechanism (resolveOrgId) and is IAM-signed, not a
+// client-facing mutation path — so `event` is optional: when omitted, the
+// caller-supplied orgId is trusted as-is (server-derived upstream); when an
+// `event` IS supplied (the AppSync dispatch path), the caller's identity org
+// is derived and a mismatched or unresolvable org is REJECTED (decision
+// b5d463f2 mutation convention: reject, don't coerce).
+export async function createWorkflow(
+  input: CreateWorkflowInput,
+  userId: string,
+  event?: unknown,
+): Promise<unknown> {
+  let orgId = input.orgId;
+  if (event !== undefined) {
+    // Org derivation (finding 2c262386 lower set): createWorkflow previously
+    // trusted input.orgId outright on the client-facing dispatch path.
+    const callerOrgId = await extractOrgFromEvent(event);
+    if (!callerOrgId) {
+      throw new Error("Access denied: unable to resolve caller organization");
+    }
+    if (input.orgId && input.orgId !== callerOrgId) {
+      throw new Error(
+        "Access denied: orgId does not match caller's organization",
+      );
+    }
+    orgId = callerOrgId;
+  }
+
+  const now = new Date().toISOString();
+  const workflowId = uuidv4();
+
+  // AppSync delivers AWSJSON as parsed objects — normalize to JSON strings first.
+  const definition = toJsonString(input.definition);
+  const configuration = toJsonString(input.configuration);
+  const metadata = toJsonString(input.metadata);
+
+  // Validate definition structure before persistence (WF-01 AC 12)
+  if (definition) {
+    const validation = validateDefinitionStructure(definition);
+    if (!validation.valid) {
+      throw new Error(
+        `Invalid workflow definition: ${validation.errors.join("; ")}`,
+      );
+    }
+  }
+
+  const workflow = {
+    workflowId,
+    orgId,
+    name: input.name,
+    description: input.description || "",
+    status: "DRAFT",
+    isBlueprint: input.isBlueprint ? "true" : "false",
+    definition,
+    configuration,
+    version: 1,
+    versionHistory: [],
+    appId: null,
+    createdBy: userId,
+    createdAt: now,
+    updatedAt: now,
+    metadata,
+  };
+
+  await docClient.send(
+    new PutCommand({
+      TableName: WORKFLOWS_TABLE,
+      Item: workflow,
+    }),
+  );
+
+  await emitEvent("workflow.created", {
+    workflowId,
+    orgId,
+    userId,
+  });
+
+  return workflow;
+}
+
+async function updateWorkflow(
+  input: UpdateWorkflowInput,
+  userId: string,
+  event: WorkflowResolverEvent,
+): Promise<unknown> {
+  // Verify org access first
+  const existing = await getWorkflow(input.workflowId, userId, event);
+  if (!existing) {
+    throw new Error("Workflow not found");
+  }
+
+  const now = new Date().toISOString();
+  const updateExpression: string[] = [];
+  const expressionAttributeNames: Record<string, string> = {};
+  const expressionAttributeValues: NonNullable<
+    UpdateCommandInput["ExpressionAttributeValues"]
+  > = {};
+
+  // Push current state to versionHistory before updating
+  const historyEntry = {
+    version: existing.version,
+    definition: existing.definition,
+    updatedAt: existing.updatedAt,
+    updatedBy: existing.createdBy || userId,
+  };
+  updateExpression.push(
+    "#versionHistory = list_append(if_not_exists(#versionHistory, :emptyList), :historyEntry)",
+  );
+  expressionAttributeNames["#versionHistory"] = "versionHistory";
+  expressionAttributeValues[":historyEntry"] = [historyEntry];
+  expressionAttributeValues[":emptyList"] = [];
+
+  if (input.name !== undefined) {
+    updateExpression.push("#name = :name");
+    expressionAttributeNames["#name"] = "name";
+    expressionAttributeValues[":name"] = input.name;
+  }
+  if (input.description !== undefined) {
+    updateExpression.push("#description = :description");
+    expressionAttributeNames["#description"] = "description";
+    expressionAttributeValues[":description"] = input.description;
+  }
+  if (input.definition !== undefined) {
+    // AppSync delivers AWSJSON as parsed objects — normalize to a JSON string first.
+    const definition = toJsonString(input.definition);
+    // Validate definition structure before persistence (WF-01 AC 12)
+    const validation = validateDefinitionStructure(definition);
+    if (!validation.valid) {
+      throw new Error(
+        `Invalid workflow definition: ${validation.errors.join("; ")}`,
+      );
+    }
+    updateExpression.push("#definition = :definition");
+    expressionAttributeNames["#definition"] = "definition";
+    expressionAttributeValues[":definition"] = definition;
+  }
+  if (input.configuration !== undefined) {
+    updateExpression.push("#configuration = :configuration");
+    expressionAttributeNames["#configuration"] = "configuration";
+    expressionAttributeValues[":configuration"] = toJsonString(
+      input.configuration,
+    );
+  }
+  if (input.metadata !== undefined) {
+    updateExpression.push("#metadata = :metadata");
+    expressionAttributeNames["#metadata"] = "metadata";
+    expressionAttributeValues[":metadata"] = toJsonString(input.metadata);
+  }
+
+  updateExpression.push("#updatedAt = :updatedAt");
+  expressionAttributeNames["#updatedAt"] = "updatedAt";
+  expressionAttributeValues[":updatedAt"] = now;
+
+  updateExpression.push("#version = :nextVersion");
+  expressionAttributeNames["#version"] = "version";
+  expressionAttributeValues[":nextVersion"] = input.version + 1;
+  expressionAttributeValues[":currentVersion"] = input.version;
+
+  try {
+    const result = await docClient.send(
+      new UpdateCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId: input.workflowId },
+        UpdateExpression: `SET ${updateExpression.join(", ")}`,
+        ConditionExpression: "version = :currentVersion",
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }),
+    );
+
+    await emitEvent("workflow.updated", {
+      workflowId: input.workflowId,
+      userId,
+      changes: input,
+    });
+
+    return result.Attributes;
+  } catch (error: unknown) {
+    if (
+      error instanceof Error &&
+      error.name === "ConditionalCheckFailedException"
+    ) {
+      throw new Error(
+        "Conflict: workflow was modified concurrently. Please retry.",
+      );
+    }
+    throw error;
+  }
+}
+
+async function deleteWorkflow(
+  workflowId: string,
+  userId: string,
+  event: WorkflowResolverEvent,
+): Promise<unknown> {
+  const workflow = await getWorkflow(workflowId, userId, event);
+  if (!workflow) {
+    throw new Error("Workflow not found");
+  }
+
+  if (workflow.status === "PUBLISHED") {
+    throw new Error("Cannot delete a published workflow. Unpublish it first.");
+  }
+
+  await docClient.send(
+    new DeleteCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+    }),
+  );
+
+  await emitEvent("workflow.deleted", {
+    workflowId,
+    orgId: workflow.orgId,
+    userId,
+  });
+
+  return { success: true, message: `Workflow ${workflowId} deleted` };
+}
+
+/**
+ * Normalizes an AWSJSON argument to a JSON string for persistence.
+ * AppSync delivers AWSJSON arguments to Lambda resolvers as parsed OBJECTS,
+ * but DynamoDB items (and downstream consumers) expect JSON STRINGS.
+ * null/undefined → null; string → as-is (no double-encoding); otherwise JSON.stringify.
+ */
+function toJsonString(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  return JSON.stringify(value);
+}
+
+//: Delimiter reserved for the arbiter's tool-execution ledger sort key
+// (`nodeId#callIndex#toolName#argsHash`, see
+// `arbiter/workerWrapper/tool_idempotency.py::build_sort_key`). A workflow
+// node id containing this character can derive a ledger key
+// indistinguishable from a DIFFERENT node's key (e.g. a node literally
+// named 'n1#comp' collides with the compensation pseudo-node derived from
+// node id 'n1') — see finding f9ceb38e. The Python message-build path
+// (`arbiter/common/workflow_contract.py::_validate_identity`) already
+// rejects '#' in execution_id/node_id/workflow_id/agent_id at message BUILD
+// time; this constant/check is the TS-side residual so a hostile or
+// careless workflow DEFINITION cannot even be STORED with such an id — it
+// would otherwise save successfully here and fail later at dispatch time,
+// a worse failure mode (breaks at runtime instead of at save time).
+// Only `nodes[].id` is checked: that field is the one copied verbatim into
+// the ledger key's nodeId segment. `agentId` and edge ids are not ledger
+// key segments (agentId is validated for existence elsewhere via
+// verifyAgentsExist; edge ids are not used to build ledger keys at all).
+const LEDGER_KEY_DELIMITER = "#";
+
+/**
+ * Validates workflow definition structure before persistence (WF-01 AC 12).
+ * Lightweight check: valid JSON, has nodes array and edges array, and no
+ * node id contains the reserved ledger-key delimiter '#' (f9ceb38e TS-side
+ * residual — see LEDGER_KEY_DELIMITER doc above).
+ * Accepts either a JSON string or an already-parsed object (AppSync AWSJSON).
+ * Exported for the intake Python-client contract test (envelope round-trip).
+ */
+export function validateDefinitionStructure(definitionValue: unknown): {
+  valid: boolean;
+  errors: string[];
+} {
+  const errors: string[] = [];
+  let definition: unknown;
+  if (typeof definitionValue === "string") {
+    try {
+      definition = JSON.parse(definitionValue);
+    } catch {
+      return { valid: false, errors: ["Invalid JSON in workflow definition"] };
+    }
+  } else {
+    definition = definitionValue;
+  }
+  if (typeof definition !== "object" || definition === null) {
+    errors.push("Workflow definition must be a JSON object");
+  } else {
+    const candidate = definition as { nodes?: unknown; edges?: unknown };
+    if (!Array.isArray(candidate.nodes)) {
+      errors.push("Workflow definition must contain a nodes array");
+    } else {
+      for (const node of candidate.nodes) {
+        const nodeId = (node as { id?: unknown } | null)?.id;
+        if (
+          typeof nodeId === "string" &&
+          nodeId.includes(LEDGER_KEY_DELIMITER)
+        ) {
+          errors.push(
+            `Node id '${nodeId}' must not contain the reserved delimiter '${LEDGER_KEY_DELIMITER}'`,
+          );
+        }
+      }
+    }
+    if (!Array.isArray(candidate.edges)) {
+      errors.push("Workflow definition must contain an edges array");
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+/**
+ * Validates a workflow definition for publishing.
+ * Returns { valid: boolean, errors: string[] }
+ */
+function validateDefinition(definitionJson: string): {
+  valid: boolean;
+  errors: string[];
+} {
+  const errors: string[] = [];
+
+  let definition: ParsedWorkflowDefinition;
+  try {
+    definition = JSON.parse(definitionJson);
+  } catch {
+    return { valid: false, errors: ["Invalid JSON in workflow definition"] };
+  }
+
+  const nodes: WorkflowDefinitionNode[] = definition.nodes || [];
+  const edges: WorkflowDefinitionEdge[] = definition.edges || [];
+
+  // Check all nodes have agentId (and reject placeholder template IDs)
+  for (const node of nodes) {
+    if (!node.agentId) {
+      errors.push(`Node "${node.id}" is missing agentId`);
+    } else if (
+      typeof node.agentId === "string" &&
+      node.agentId.startsWith("placeholder-")
+    ) {
+      errors.push(
+        `Workflow contains placeholder agentId '${node.agentId}' in node '${node.id}'. ` +
+          `Replace with real agent IDs before publishing. ` +
+          `(Blueprint templates contain placeholder agentIds for illustration; clone and re-map.)`,
+      );
+    }
+  }
+
+  // Check no disconnected nodes
+  if (nodes.length > 1) {
+    const connectedNodeIds = new Set<string>();
+    for (const edge of edges) {
+      connectedNodeIds.add(edge.source);
+      connectedNodeIds.add(edge.target);
+    }
+    for (const node of nodes) {
+      if (!connectedNodeIds.has(node.id)) {
+        errors.push(`Node "${node.id}" is disconnected`);
+      }
+    }
+  }
+
+  // Check no cycles (DFS-based)
+  if (edges.length > 0) {
+    const adjacency = new Map<string, string[]>();
+    for (const node of nodes) {
+      adjacency.set(node.id, []);
+    }
+    for (const edge of edges) {
+      adjacency.get(edge.source)?.push(edge.target);
+    }
+
+    const visited = new Set<string>();
+    const inStack = new Set<string>();
+
+    const hasCycle = (nodeId: string): boolean => {
+      visited.add(nodeId);
+      inStack.add(nodeId);
+      for (const neighbor of adjacency.get(nodeId) || []) {
+        if (!visited.has(neighbor)) {
+          if (hasCycle(neighbor)) return true;
+        } else if (inStack.has(neighbor)) {
+          return true;
+        }
+      }
+      inStack.delete(nodeId);
+      return false;
+    };
+
+    for (const node of nodes) {
+      if (!visited.has(node.id)) {
+        if (hasCycle(node.id)) {
+          errors.push("Workflow definition contains circular dependencies");
+          break;
+        }
+      }
+    }
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+/**
+ * Verifies that every node's agentId resolves to an existing agent in the
+ * agents table. This is the async companion to validateDefinition's pure checks:
+ * validateDefinition rejects missing/placeholder agentIds, while this confirms the
+ * referenced agents actually exist before a workflow may transition to PUBLISHED.
+ *
+ * Returns the list of { nodeId, agentId } references that do NOT resolve. An empty
+ * list means every referenced agent exists.
+ */
+async function verifyAgentsExist(
+  definitionJson: string,
+): Promise<{ ok: boolean; missing: { nodeId: string; agentId: string }[] }> {
+  let definition: ParsedWorkflowDefinition;
+  try {
+    definition = JSON.parse(definitionJson);
+  } catch {
+    // Malformed definitions are caught by the pure validator; nothing to check.
+    return { ok: true, missing: [] };
+  }
+
+  const nodes: WorkflowDefinitionNode[] = definition.nodes || [];
+  const agentIds = Array.from(
+    new Set(
+      nodes
+        .map((n) => n.agentId)
+        .filter((a): a is string => typeof a === "string" && a.length > 0),
+    ),
+  );
+
+  if (agentIds.length === 0) {
+    return { ok: true, missing: [] };
+  }
+
+  // BatchGetItem against the agents table, chunked to the 100-key limit.
+  // Read the table name at call time (module-load env may not be set under test).
+  const agentConfigTable = process.env.AGENT_CONFIG_TABLE!;
+  const existing = new Set<string>();
+  for (let i = 0; i < agentIds.length; i += 100) {
+    const chunk = agentIds.slice(i, i + 100);
+    const result = await docClient.send(
+      new BatchGetCommand({
+        RequestItems: {
+          [agentConfigTable]: {
+            Keys: chunk.map((agentId) => ({ agentId })),
+          },
+        },
+      }),
+    );
+    for (const item of result.Responses?.[agentConfigTable] || []) {
+      if (item && typeof item.agentId === "string") {
+        existing.add(item.agentId);
+      }
+    }
+  }
+
+  const missing: { nodeId: string; agentId: string }[] = [];
+  for (const node of nodes) {
+    if (
+      typeof node.agentId === "string" &&
+      node.agentId.length > 0 &&
+      !existing.has(node.agentId)
+    ) {
+      missing.push({ nodeId: node.id, agentId: node.agentId });
+    }
+  }
+
+  return { ok: missing.length === 0, missing };
+}
+
+// Exported for reuse by intake-orchestration-resolver (the IAM-only intake
+// blueprint mutation delegates here so the definition validator and the
+// agent-existence gate stay in exactly one place). The event parameter only
+// feeds extractOrgFromEvent(unknown), hence the wide type.
+export async function publishWorkflow(
+  workflowId: string,
+  userId: string,
+  event: unknown,
+): Promise<unknown> {
+  const workflow = await getWorkflow(workflowId, userId, event);
+  if (!workflow) {
+    throw new Error("Workflow not found");
+  }
+
+  const validation = validateDefinition(workflow.definition);
+  if (!validation.valid) {
+    throw new Error(`Validation failed: ${validation.errors.join("; ")}`);
+  }
+
+  // A workflow cannot reach PUBLISHED until every node's agentId resolves to an
+  // existing agent. If any reference is unresolved, reject and stay DRAFT.
+  const existence = await verifyAgentsExist(workflow.definition);
+  if (!existence.ok) {
+    const details = existence.missing
+      .map((m) => `node '${m.nodeId}' -> agentId '${m.agentId}'`)
+      .join("; ");
+    throw new Error(
+      `Validation failed: workflow references agents that do not exist: ${details}. ` +
+        `Map each node to an existing agent before publishing; the workflow remains DRAFT.`,
+    );
+  }
+
+  const now = new Date().toISOString();
+  const result = await docClient.send(
+    new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      UpdateExpression:
+        "SET #status = :status, #updatedAt = :updatedAt, #version = :nextVersion",
+      ExpressionAttributeNames: {
+        "#status": "status",
+        "#updatedAt": "updatedAt",
+        "#version": "version",
+      },
+      ExpressionAttributeValues: {
+        ":status": "PUBLISHED",
+        ":updatedAt": now,
+        ":nextVersion": workflow.version + 1,
+      },
+      ReturnValues: "ALL_NEW",
+    }),
+  );
+
+  await emitEvent("workflow.published", {
+    workflowId,
+    orgId: workflow.orgId,
+    userId,
+  });
+
+  return result.Attributes;
+}
+
+async function updateWorkflowConfiguration(
+  workflowId: string,
+  configurationJson: string,
+  version: number,
+  userId: string,
+  event: WorkflowResolverEvent,
+): Promise<unknown> {
+  const existing = await getWorkflow(workflowId, userId, event);
+  if (!existing) {
+    throw new Error("Workflow not found");
+  }
+
+  const existingConfig = existing.configuration
+    ? typeof existing.configuration === "string"
+      ? JSON.parse(existing.configuration)
+      : existing.configuration
+    : {};
+  const newConfig = JSON.parse(configurationJson);
+
+  // Shallow merge at top-level keys
+  const merged = { ...existingConfig, ...newConfig };
+
+  const now = new Date().toISOString();
+
+  try {
+    const result = await docClient.send(
+      new UpdateCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId },
+        UpdateExpression:
+          "SET #configuration = :configuration, #updatedAt = :updatedAt, #version = :nextVersion",
+        ConditionExpression: "version = :currentVersion",
+        ExpressionAttributeNames: {
+          "#configuration": "configuration",
+          "#updatedAt": "updatedAt",
+          "#version": "version",
+        },
+        ExpressionAttributeValues: {
+          ":configuration": JSON.stringify(merged),
+          ":updatedAt": now,
+          ":nextVersion": version + 1,
+          ":currentVersion": version,
+        },
+        ReturnValues: "ALL_NEW",
+      }),
+    );
+
+    await emitEvent("workflow.updated", {
+      workflowId,
+      userId,
+      changes: { configuration: merged },
+    });
+
+    return result.Attributes;
+  } catch (error: unknown) {
+    if (
+      error instanceof Error &&
+      error.name === "ConditionalCheckFailedException"
+    ) {
+      throw new Error(
+        "Conflict: workflow was modified concurrently. Please retry.",
+      );
+    }
+    throw error;
+  }
+}
+
+// Exported for reuse by intake-orchestration-resolver (the IAM-only intake
+// import mutation delegates here so the published-only gate, agentMapping
+// rewrite, app.workflowIds append and workflow.imported event stay in
+// exactly one place). The event parameter only feeds
+// extractOrgFromEvent(unknown), hence the wide type.
+export async function importBlueprint(
+  blueprintId: string,
+  appId: string,
+  name: string | undefined,
+  agentMapping: string | Record<string, string> | undefined,
+  userId: string,
+  event: unknown,
+): Promise<unknown> {
+  // Get the blueprint
+  const blueprintResult = await docClient.send(
+    new GetCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId: blueprintId },
+    }),
+  );
+
+  const blueprint = blueprintResult.Item;
+  if (!blueprint) {
+    throw new Error("Blueprint not found");
+  }
+
+  if (blueprint.status !== "PUBLISHED") {
+    throw new Error("Only published blueprints can be imported");
+  }
+
+  // Get the target app
+  const appResult = await docClient.send(
+    new GetCommand({
+      TableName: APPS_TABLE,
+      Key: { appId },
+    }),
+  );
+
+  const app = appResult.Item;
+  if (!app) {
+    throw new Error("App not found");
+  }
+
+  // Admin cross-org bypass (finding b7ef1a41), mirroring the shared
+  // assertRowOrg gate (auth-event.ts) already used by getWorkflow: admins
+  // may import a blueprint into any org's app; non-admins are reconciled
+  // against their server-derived org and denied (fail-closed) when that
+  // org is unresolvable.
+  await assertRowOrg(app as { orgId?: unknown }, event);
+
+  const now = new Date().toISOString();
+  const workflowId = uuidv4();
+
+  // Deep-copy the definition (stored as JSON string in DynamoDB), then apply the
+  // optional agentMapping to rewrite each node's placeholder/slot agentId to the
+  // caller-chosen real agentId. Nodes whose agentId is not present in the mapping
+  // are left unchanged. Contract: agentMapping = { [placeholderAgentId]: realAgentId }.
+  const definitionStr =
+    typeof blueprint.definition === "string"
+      ? blueprint.definition
+      : JSON.stringify(blueprint.definition);
+  const parsedDefinition = JSON.parse(definitionStr);
+
+  const mapping: Record<string, string> =
+    typeof agentMapping === "string"
+      ? agentMapping.trim()
+        ? JSON.parse(agentMapping)
+        : {}
+      : agentMapping || {};
+
+  if (
+    parsedDefinition &&
+    Array.isArray(parsedDefinition.nodes) &&
+    Object.keys(mapping).length > 0
+  ) {
+    for (const node of parsedDefinition.nodes) {
+      if (
+        node &&
+        typeof node.agentId === "string" &&
+        Object.prototype.hasOwnProperty.call(mapping, node.agentId)
+      ) {
+        node.agentId = mapping[node.agentId];
+      }
+    }
+  }
+
+  const definition = JSON.stringify(parsedDefinition);
+
+  const workflow = {
+    workflowId,
+    orgId: app.orgId,
+    name: name || `${blueprint.name} (Copy)`,
+    description: blueprint.description || "",
+    status: "DRAFT",
+    isBlueprint: "false",
+    definition,
+    configuration: blueprint.configuration || null,
+    version: 1,
+    versionHistory: [],
+    appId,
+    createdBy: userId,
+    createdAt: now,
+    updatedAt: now,
+    metadata: blueprint.metadata || null,
+  };
+
+  // Put the new workflow
+  await docClient.send(
+    new PutCommand({
+      TableName: WORKFLOWS_TABLE,
+      Item: workflow,
+    }),
+  );
+
+  // Append workflowId to app's workflowIds
+  await docClient.send(
+    new UpdateCommand({
+      TableName: APPS_TABLE,
+      Key: { appId },
+      UpdateExpression:
+        "SET #workflowIds = list_append(if_not_exists(#workflowIds, :emptyList), :newWorkflowId)",
+      ExpressionAttributeNames: {
+        "#workflowIds": "workflowIds",
+      },
+      ExpressionAttributeValues: {
+        ":newWorkflowId": [workflowId],
+        ":emptyList": [],
+      },
+    }),
+  );
+
+  await emitEvent("workflow.imported", {
+    blueprintId,
+    workflowId,
+    appId,
+    userId,
+  });
+
+  return workflow;
+}
+
+async function importWorkflowFn(
+  input: ImportWorkflowInput,
+  userId: string,
+  event?: unknown,
+): Promise<unknown> {
+  const { orgId: inputOrgId, workflowJson, name } = input;
+
+  // Org derivation (finding 2c262386 — primary case): importWorkflow let a
+  // caller plant a DRAFT workflow into ANOTHER tenant's workspace by setting
+  // orgId=victim. Same reject-not-coerce convention as createWorkflow/
+  // decision b5d463f2: derive the caller's org server-side and refuse a
+  // mismatched client value BEFORE any DynamoDB write. Fail closed when the
+  // caller's org cannot be resolved at all.
+  const callerOrgId = await extractOrgFromEvent(event);
+  if (!callerOrgId) {
+    throw new Error("Access denied: unable to resolve caller organization");
+  }
+  if (inputOrgId && inputOrgId !== callerOrgId) {
+    throw new Error(
+      "Access denied: orgId does not match caller's organization",
+    );
+  }
+  const orgId = callerOrgId;
+
+  let parsed: {
+    name?: string;
+    description?: string;
+    definition?: string;
+    configuration?: string | null;
+    metadata?: string | null;
+  };
+  try {
+    parsed = JSON.parse(workflowJson);
+  } catch {
+    throw new Error("Invalid JSON in workflow import");
+  }
+
+  // Validate the definition exists
+  if (!parsed.definition) {
+    throw new Error("Imported workflow must contain a definition");
+  }
+
+  // Validate definition structure, incl. no reserved ledger-key delimiter
+  // in node ids (WF-01 AC 12 / f9ceb38e TS-side residual — this write site
+  // previously bypassed validateDefinitionStructure entirely).
+  const importValidation = validateDefinitionStructure(parsed.definition);
+  if (!importValidation.valid) {
+    throw new Error(
+      `Invalid workflow definition: ${importValidation.errors.join("; ")}`,
+    );
+  }
+
+  const now = new Date().toISOString();
+  const workflowId = uuidv4();
+
+  const workflow = {
+    workflowId,
+    orgId,
+    name: name || parsed.name || "Imported Workflow",
+    description: parsed.description || "",
+    status: "DRAFT",
+    isBlueprint: "false",
+    definition: parsed.definition,
+    configuration: parsed.configuration || null,
+    version: 1,
+    versionHistory: [],
+    appId: null,
+    createdBy: userId,
+    createdAt: now,
+    updatedAt: now,
+    metadata: parsed.metadata || null,
+  };
+
+  await docClient.send(
+    new PutCommand({
+      TableName: WORKFLOWS_TABLE,
+      Item: workflow,
+    }),
+  );
+
+  return workflow;
+}
+
+async function exportWorkflow(
+  workflowId: string,
+  userId: string,
+  event: WorkflowResolverEvent,
+): Promise<unknown> {
+  const workflow = await getWorkflow(workflowId, userId, event);
+  if (!workflow) {
+    throw new Error("Workflow not found");
+  }
+
+  return JSON.stringify({
+    name: workflow.name,
+    description: workflow.description,
+    definition: workflow.definition,
+    configuration: workflow.configuration,
+    metadata: workflow.metadata,
+    status: workflow.status,
+    version: workflow.version,
+  });
+}
+
+async function getWorkflowVersion(
+  workflowId: string,
+  version: number,
+  userId: string,
+  event: WorkflowResolverEvent,
+): Promise<unknown> {
+  const workflow = await getWorkflow(workflowId, userId, event);
+  if (!workflow) {
+    throw new Error("Workflow not found");
+  }
+
+  // If requesting current version, return as-is
+  if (workflow.version === version) {
+    return workflow;
+  }
+
+  // Look in versionHistory
+  const history = workflow.versionHistory || [];
+  const entry = history.find((h) => h.version === version);
+  if (!entry) {
+    throw new Error(`Version ${version} not found`);
+  }
+
+  return {
+    ...workflow,
+    definition: entry.definition,
+    version: entry.version,
+  };
+}
+
+async function listAppWorkflows(
+  appId: string,
+  userId: string,
+  event: WorkflowResolverEvent,
+): Promise<unknown[]> {
+  // Get the app first
+  const appResult = await docClient.send(
+    new GetCommand({
+      TableName: APPS_TABLE,
+      Key: { appId },
+    }),
+  );
+
+  const app = appResult.Item;
+  if (!app) {
+    throw new Error("App not found");
+  }
+
+  // Admin cross-org read bypass (finding b7ef1a41), mirroring the shared
+  // assertRowOrg gate (auth-event.ts) already used by getWorkflow: admins
+  // may list any org's app workflows; non-admins are reconciled against
+  // their server-derived org and denied (fail-closed) when that org is
+  // unresolvable.
+  await assertRowOrg(app as { orgId?: unknown }, event);
+
+  const workflowIds: string[] = app.workflowIds || [];
+  if (workflowIds.length === 0) {
+    return [];
+  }
+
+  // BatchGetItem for workflows
+  const keys = workflowIds.map((id) => ({ workflowId: id }));
+  const tableName = process.env.WORKFLOWS_TABLE!;
+  const result = await docClient.send(
+    new BatchGetCommand({
+      RequestItems: {
+        [tableName]: {
+          Keys: keys,
+        },
+      },
+    }),
+  );
+
+  return result.Responses?.[tableName] || [];
+}
+
+async function emitEvent(eventType: string, detail: unknown): Promise<void> {
+  await eventBridgeClient.send(
+    new PutEventsCommand({
+      Entries: [
+        {
+          Source: "citadel.workflows",
+          DetailType: eventType,
+          Detail: JSON.stringify(detail),
+          EventBusName: EVENT_BUS_NAME,
+        },
+      ],
+    }),
+  );
+}

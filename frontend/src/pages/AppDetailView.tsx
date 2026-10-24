@@ -1,0 +1,2708 @@
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import {
+  ArrowLeft,
+  Bot,
+  GitBranch,
+  Shield,
+  Settings,
+  Play,
+  Loader2,
+  Trash2,
+  Pencil,
+  ExternalLink,
+  MessageSquare,
+  Wrench,
+  Cpu,
+  CheckCircle2,
+  XCircle,
+  AlertTriangle,
+  Archive,
+  RotateCcw,
+  Clock,
+  Plus,
+  Globe,
+  Copy,
+  Check,
+  Activity,
+  BarChart3,
+  Upload,
+  ChevronRight,
+  Pause,
+} from 'lucide-react';
+import {
+  ResponsiveContainer,
+  LineChart,
+  AreaChart,
+  Line,
+  Area,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+} from 'recharts';
+import { Button } from '../components/ui/button';
+import { Badge } from '../components/ui/badge';
+import { Card } from '../components/ui/card';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '../components/ui/tabs';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '../components/ui/dialog';
+import { Textarea } from '../components/ui/textarea';
+import { Input } from '../components/ui/input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '../components/ui/select';
+import { ModelOverrideSelect } from '../components/ModelOverrideSelect';
+import { MAX_SYSTEM_PROMPT_ADDITION_CHARS } from '../utils/promptLimits';
+import { appApiService } from '../services/appApiService';
+import { workflowApiService } from '../services/workflowApiService';
+import { executionApiService } from '../services/executionApiService';
+import { agentConfigService } from '../services/agentConfigService';
+import { useExecutionSubscription } from '../hooks/useExecutionSubscription';
+import { toast } from 'sonner';
+import serverService from '../services/server';
+import { replayService } from '../services/replayService';
+import { useOrganization } from '../contexts/OrganizationContext';
+import { cn } from '../components/ui/utils';
+import {
+  getHealthStatus,
+  shouldEnablePublish,
+  type HealthStatus,
+} from '../utils/publishUtils';
+import { PageContainer } from '../components/PageContainer';
+import { ExecutionDetailSheet } from '../components/ExecutionDetailSheet';
+import { ExecutionDecisionDialog, ExecutionDecisionKind } from '../components/ExecutionDecisionDialog';
+import { normalizeExecutionStatus, isRunning, isAwaitingApproval } from '../lib/execution-status';
+
+// ---- Types ----
+
+interface AppDetailViewProps {
+  appId: string;
+  onBack: () => void;
+  onNavigate?: (view: string) => void;
+  onPublishSuccess?: (data: { appId: string; appName: string; endpointUrl: string; apiKey: string }) => void;
+  /** Optional initial tab — one of the valid tab values (e.g. 'workflows'). */
+  initialTab?: string;
+}
+
+interface RegistryAgentBinding {
+  agentId: string;
+  name?: string;
+  status: 'DESIGN' | 'READY';
+  systemPromptAddition?: string;
+  toolRestrictions?: string[];
+  modelOverride?: string;
+  addedAt: string;
+}
+
+interface RegistryAgentRecordPermission {
+  permissionId: string;
+  actions: string[];
+  resources: string[];
+  description?: string;
+}
+
+interface WorkflowInfo {
+  workflowId: string;
+  name: string;
+  status: string;
+  nodeCount: number;
+}
+
+interface ApprovalRequest {
+  nodeId: string;
+  requestType: string;
+  reason?: string | null;
+  requestedBy?: string | null;
+  requestedAt?: string | null;
+  expiresAt?: string | null;
+  decidedBy?: string | null;
+  decidedAt?: string | null;
+  decision?: string | null;
+  scope?: string | null;
+  nodeIds?: string[] | null;
+}
+
+interface Execution {
+  executionId: string;
+  workflowId: string;
+  status: string;
+  startedAt: string;
+  completedAt?: string | null;
+  workflowVersion?: number | null;
+  triggeredBy?: string | null;
+  input?: string | null;
+  output?: string | null;
+  error?: string | null;
+  nodeResults?: string | Record<string, unknown> | null;
+  currentNode?: string | null;
+  approvalRequests?: ApprovalRequest[] | null;
+  /** DDB-level marker set by pauseExecution; engine parks at next dispatch boundary. */
+  pauseRequested?: boolean | null;
+}
+
+interface RegistryAgentRecordDetail {
+  appId: string;
+  orgId: string;
+  name: string;
+  description: string;
+  status: 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'REJECTED' | 'DEPRECATED' | 'CREATING' | 'UPDATING' | 'CREATE_FAILED' | 'UPDATE_FAILED' | 'PUBLISHED';
+  workflowIds: string[];
+  agentBindings: RegistryAgentBinding[];
+  permissions: RegistryAgentRecordPermission[];
+  configSchema: string | null;
+  configValues: string | null;
+  createdBy: string;
+  createdByName?: string;
+  createdAt: string;
+  updatedAt: string;
+  version: number;
+  endpointUrl?: string;
+  apiId?: string;
+  authMode?: string;
+}
+
+interface AppApiKey {
+  keyId: string;
+  name: string;
+  prefix: string;
+  status: string;
+  createdAt: string;
+  expiresAt?: string | null;
+  lastUsedAt?: string | null;
+}
+
+interface AppMetrics {
+  totalRequests: number;
+  successCount: number;
+  clientErrorCount: number;
+  serverErrorCount: number;
+  p50Latency: number;
+  p95Latency: number;
+  p99Latency: number;
+  timeSeries: Array<{
+    timestamp: string;
+    requestCount: number;
+    errorCount: number;
+    avgLatency: number;
+  }>;
+}
+
+interface StatusTransition {
+  label: string;
+  targetStatus: string;
+  icon: typeof Play;
+  className: string;
+  disabled?: boolean;
+  /** Shown as the button's title (tooltip) when disabled. */
+  disabledReason?: string;
+}
+
+interface Precondition {
+  label: string;
+  passed: boolean;
+  detail?: string;
+  /** Advisory only — rendered as a warning and never blocks the transition. */
+  warning?: boolean;
+}
+
+// ---- Constants ----
+
+const STATUS_COLORS: Record<string, { bg: string; text: string }> = {
+  DRAFT: { bg: 'bg-primary/20', text: 'text-primary' },
+  APPROVED: { bg: 'bg-chart-2/20', text: 'text-chart-2' },
+  PUBLISHED: { bg: 'bg-chart-5/20', text: 'text-chart-5' },
+  DEPRECATED: { bg: 'bg-muted/20', text: 'text-muted-foreground' },
+};
+
+const COMPONENT_STATUS_COLORS: Record<string, { bg: string; text: string }> = {
+  DESIGN: { bg: 'bg-chart-4/20', text: 'text-chart-4' },
+  READY: { bg: 'bg-chart-2/20', text: 'text-chart-2' },
+};
+
+const EXECUTION_STATUS_COLORS: Record<string, { bg: string; text: string }> = {
+  running: { bg: 'bg-primary/20', text: 'text-primary' },
+  succeeded: { bg: 'bg-chart-2/20', text: 'text-chart-2' },
+  failed: { bg: 'bg-destructive/20', text: 'text-destructive' },
+  pending: { bg: 'bg-chart-4/20', text: 'text-chart-4' },
+  completed: { bg: 'bg-chart-2/20', text: 'text-chart-2' },
+  cancelled: { bg: 'bg-muted/20', text: 'text-muted-foreground' },
+  awaiting_approval: { bg: 'bg-chart-4/20', text: 'text-chart-4' },
+};
+
+// ---- Helpers ----
+
+function getStatusTransition(status: string): StatusTransition | null {
+  switch (status) {
+    case 'DRAFT':
+      // Backend note (registry-agent-record-resolver.ts): the only legal
+      // path from DRAFT towards approval is submitting for approval
+      // (status: 'PENDING_APPROVAL'), which the backend's `isSubmit`
+      // special-case routes to RegistryService.submitForApproval rather
+      // than the validated-transition UpdateRegistryRecordStatus gate.
+      // DRAFT -> APPROVED directly is never a legal target
+      // (REGISTRY_TRANSITIONS['DRAFT'] === ['DEPRECATED'] only) — the AWS
+      // registry itself rejects it. "Activate" therefore submits for
+      // approval; the record lands on PENDING_APPROVAL (or APPROVED
+      // directly if the registry has autoApproval configured, which this
+      // deployment does not enable).
+      return { label: 'Activate', targetStatus: 'PENDING_APPROVAL', icon: Play, className: 'bg-chart-1 hover:bg-chart-1/90' };
+    case 'PENDING_APPROVAL':
+      return { label: 'Awaiting Approval', targetStatus: 'PENDING_APPROVAL', icon: Play, className: 'bg-chart-4 opacity-50 cursor-not-allowed', disabled: true };
+    case 'APPROVED':
+      return { label: 'Archive', targetStatus: 'DEPRECATED', icon: Archive, className: 'bg-chart-3 hover:bg-chart-3/90' };
+    case 'DEPRECATED':
+      // DEPRECATED is terminal (REGISTRY_TRANSITIONS['DEPRECATED'] === []) —
+      // the validated-transition gate rejects DEPRECATED -> DRAFT, so
+      // Reactivate must not be offered here. Deactivating an APPROVED record
+      // instead returns it to DRAFT (decision a3fb5542), which keeps its own
+      // 'Activate' transition and is reversible; DEPRECATED (Archive) is the
+      // one-way path.
+      return { label: 'Reactivate', targetStatus: 'DRAFT', icon: RotateCcw, className: 'bg-chart-2 opacity-50 cursor-not-allowed', disabled: true, disabledReason: 'Deprecated records cannot be reactivated' };
+    case 'REJECTED':
+      // No resubmit path: REGISTRY_TRANSITIONS['REJECTED'] === ['DEPRECATED']
+      // only. A rejected record's sole status-update target is DEPRECATED —
+      // there is no DRAFT (or any other) target the backend will accept, so
+      // "Resubmit" is removed rather than offered as a dead action. Archive
+      // is offered instead, mirroring the APPROVED -> DEPRECATED path.
+      return { label: 'Archive', targetStatus: 'DEPRECATED', icon: Archive, className: 'bg-chart-3 hover:bg-chart-3/90' };
+    case 'CREATING':
+    case 'UPDATING':
+      return { label: 'In Progress...', targetStatus: status, icon: Play, className: 'bg-muted opacity-50 cursor-not-allowed', disabled: true };
+    case 'CREATE_FAILED':
+    case 'UPDATE_FAILED':
+      // No backend-supported retry target: REGISTRY_TRANSITIONS has no
+      // CREATE_FAILED/UPDATE_FAILED entries at all, and updateApp's
+      // validated-transition gate would reject any target from these
+      // statuses. There is no "Retry to DRAFT" the backend will accept, so
+      // no transition action is offered for these statuses.
+      return null;
+    default:
+      return null;
+  }
+}
+
+function formatDate(dateStr: string): string {
+  try {
+    return new Date(dateStr).toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return dateStr;
+  }
+}
+
+function computeDuration(startedAt: string, completedAt?: string): string {
+  try {
+    const start = new Date(startedAt).getTime();
+    const end = completedAt ? new Date(completedAt).getTime() : Date.now();
+    const diffMs = end - start;
+    if (diffMs < 1000) return `${diffMs}ms`;
+    if (diffMs < 60000) return `${Math.round(diffMs / 1000)}s`;
+    return `${Math.round(diffMs / 60000)}m`;
+  } catch {
+    return '—';
+  }
+}
+
+/**
+ * Derive the nodeId that is awaiting approval. The resolver strips the
+ * map key when converting DDB approvalRequests (keyed by nodeId) to a
+ * flat array, so `currentNode` may be null for awaiting_approval
+ * executions. Fall back to scanning nodeResults for a node whose status
+ * is 'awaiting_approval'.
+ *
+ * For execution-scoped requests (scope === 'execution'), return the
+ * sentinel '__execution__' — the backend routes that to the bulk handler.
+ */
+function deriveAwaitingNodeId(exec: Execution): string | null {
+  const pending = exec.approvalRequests?.find((r) => !r.decision);
+  if (pending?.scope === 'execution') return '__execution__';
+  if (exec.currentNode) return exec.currentNode;
+  // Prefer the nodeId from the first undecided approval request.
+  if (pending?.nodeId) return pending.nodeId;
+  try {
+    const nr: Record<string, any> =
+      typeof exec.nodeResults === 'string'
+        ? JSON.parse(exec.nodeResults)
+        : exec.nodeResults;
+    if (nr && typeof nr === 'object') {
+      for (const [key, val] of Object.entries(nr)) {
+        if (val && typeof val === 'object' && (val as any).status === 'awaiting_approval') {
+          return (val as any).nodeId ?? key;
+        }
+      }
+    }
+  } catch {
+    // Unparseable nodeResults — give up.
+  }
+  return null;
+}
+
+function buildPreconditions(
+  app: RegistryAgentRecordDetail,
+  workflows: WorkflowInfo[] = [],
+): Precondition[] {
+  const preconditions: Precondition[] = [];
+
+  // Check agent bindings — all should be READY
+  const designAgents = (app.agentBindings || []).filter((b) => b.status === 'DESIGN');
+  preconditions.push({
+    label: 'All agents are READY',
+    passed: designAgents.length === 0 && (app.agentBindings || []).length > 0,
+    detail: designAgents.length > 0
+      ? `${designAgents.length} agent(s) still in DESIGN status`
+      : (app.agentBindings || []).length === 0
+        ? 'No agents bound to this app'
+        : undefined,
+  });
+
+  // Check at least one workflow bound (optional — single-agent apps don't need workflows)
+  const hasWorkflows = (app.workflowIds || []).length > 0;
+  if (!hasWorkflows && (app.agentBindings || []).length > 1) {
+    preconditions.push({
+      label: 'Workflow bound (required for multi-agent apps)',
+      passed: false,
+      detail: 'Multi-agent apps require at least one workflow to define orchestration',
+    });
+  }
+
+  // Warn (non-blocking) when bound workflows are not PUBLISHED — they cannot run
+  if (workflows.length > 0) {
+    const unpublished = workflows.filter((w) => w.status !== 'PUBLISHED');
+    preconditions.push({
+      label: unpublished.length > 0
+        ? `${unpublished.length} workflow(s) not PUBLISHED`
+        : 'All bound workflows are PUBLISHED',
+      passed: true,
+      warning: unpublished.length > 0,
+      detail: unpublished.length > 0
+        ? `Draft workflows cannot run — publish ${unpublished.length === 1 ? 'it' : 'them'} from the Workflows tab`
+        : undefined,
+    });
+  }
+
+  // Check config: if schema exists, values must exist and be valid
+  if (app.configSchema) {
+    preconditions.push({
+      label: 'Configuration values provided',
+      passed: !!app.configValues,
+      detail: !app.configValues ? 'Config schema defined but no values provided' : undefined,
+    });
+  }
+
+  // Admin email is optional — informational hint
+  const configValues = typeof app.configValues === 'string'
+    ? (() => { try { return JSON.parse(app.configValues as string); } catch { return null; } })()
+    : app.configValues;
+  const adminEmail = configValues?.adminEmail;
+  preconditions.push({
+    label: adminEmail ? 'Admin email provided' : 'Admin email (optional)',
+    passed: true,
+    detail: !adminEmail ? 'Add an admin email in the Configuration tab for notifications' : undefined,
+  });
+
+  return preconditions;
+}
+
+// ---- Pure helpers for publish flow (moved to publishUtils.ts, re-exported for backward compatibility) ----
+
+export { getHealthStatus, shouldEnablePublish, type HealthStatus };
+
+const HEALTH_COLORS: Record<HealthStatus, { bg: string; text: string; label: string }> = {
+  green: { bg: 'bg-chart-2/20', text: 'text-chart-2', label: 'Healthy' },
+  yellow: { bg: 'bg-chart-4/20', text: 'text-chart-4', label: 'Degraded' },
+  red: { bg: 'bg-destructive/20', text: 'text-destructive', label: 'Unhealthy' },
+};
+
+const TIME_RANGES = [
+  { label: '1h', hours: 1 },
+  { label: '6h', hours: 6 },
+  { label: '24h', hours: 24 },
+  { label: '7d', hours: 168 },
+];
+
+// ---- Component ----
+
+// Tab values accepted via the initialTab prop
+const VALID_TABS = ['agents', 'workflows', 'permissions', 'configuration', 'executions', 'api'];
+
+export function AppDetailView({ appId, onBack, onNavigate, onPublishSuccess, initialTab }: AppDetailViewProps) {
+  const [app, setApp] = useState<RegistryAgentRecordDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [workflows, setWorkflows] = useState<WorkflowInfo[]>([]);
+  const [executions, setExecutions] = useState<Execution[]>([]);
+  const [selectedExecution, setSelectedExecution] = useState<Execution | null>(null);
+  const [detailSheetOpen, setDetailSheetOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState(
+    initialTab && VALID_TABS.includes(initialTab) ? initialTab : 'agents',
+  );
+
+  // Display server-resolved creator name — app.createdByName is populated
+  // by registry-agent-record-resolver's getApp via Cognito AdminGetUser.
+  // No client-side resolution needed.
+
+  // Workflow run state — one live run tracked at a time
+  const [activeRun, setActiveRun] = useState<{ executionId: string; workflowId: string } | null>(null);
+  const [startingRun, setStartingRun] = useState<string | null>(null);
+  const [publishingWorkflowId, setPublishingWorkflowId] = useState<string | null>(null);
+  const { events: runEvents } = useExecutionSubscription(activeRun?.executionId ?? null);
+  const runToastRef = useRef<string | null>(null);
+
+  // Status transition dialog
+  const [transitionDialogOpen, setTransitionDialogOpen] = useState(false);
+  const [pendingTransition, setPendingTransition] = useState<StatusTransition | null>(null);
+  const [transitionLoading, setTransitionLoading] = useState(false);
+  const [transitionError, setTransitionError] = useState<string | null>(null);
+  const [failedPreconditions, setFailedPreconditions] = useState<Precondition[]>([]);
+
+  // Config editing
+  const [editingConfigValues, setEditingConfigValues] = useState(false);
+  const [configValuesInput, setConfigValuesInput] = useState('');
+  const [configSaveError, setConfigSaveError] = useState<string | null>(null);
+  const [configSaving, setConfigSaving] = useState(false);
+
+  // Add agent dialog
+  const [addAgentDialogOpen, setAddAgentDialogOpen] = useState(false);
+  const [availableAgents, setAvailableAgents] = useState<Array<{ agentId: string; name: string; description: string }>>([]);
+  const [loadingAgents, setLoadingAgents] = useState(false);
+  const [addingAgent, setAddingAgent] = useState<string | null>(null);
+
+  // Edit binding dialog
+  const [editingBinding, setEditingBinding] = useState<RegistryAgentBinding | null>(null);
+  const [editBindingForm, setEditBindingForm] = useState({ systemPromptAddition: '', toolRestrictions: '', modelOverride: '', status: 'DESIGN' as string });
+  const [editBindingSaving, setEditBindingSaving] = useState(false);
+
+  // Bind workflow dialog
+  const { selectedOrganization, canApproveExecutions, loading: orgLoading } = useOrganization();
+  const [bindWorkflowDialogOpen, setBindWorkflowDialogOpen] = useState(false);
+  const [unboundWorkflows, setUnboundWorkflows] = useState<Array<{ workflowId: string; name: string; status: string }>>([]);
+  const [loadingUnboundWorkflows, setLoadingUnboundWorkflows] = useState(false);
+  const [bindingWorkflow, setBindingWorkflow] = useState<string | null>(null);
+
+  // Add permission dialog
+  const [addPermDialogOpen, setAddPermDialogOpen] = useState(false);
+  const [permForm, setPermForm] = useState({ description: '', actions: '', resources: '' });
+  const [addingPerm, setAddingPerm] = useState(false);
+
+  // Publish flow state
+  const [publishDialogOpen, setPublishDialogOpen] = useState(false);
+  const [publishLoading, setPublishLoading] = useState(false);
+  const [publishError, setPublishError] = useState<string | null>(null);
+  const [publishResult, setPublishResult] = useState<{ endpointUrl: string; apiKey: string } | null>(null);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+
+  // API tab state
+  const [apiKeys, setApiKeys] = useState<AppApiKey[]>([]);
+  const [apiKeysLoading, setApiKeysLoading] = useState(false);
+  const [metrics, setMetrics] = useState<AppMetrics | null>(null);
+  const [metricsLoading, setMetricsLoading] = useState(false);
+  const [timeRange, setTimeRange] = useState('24h');
+  const [createKeyDialogOpen, setCreateKeyDialogOpen] = useState(false);
+  const [newKeyName, setNewKeyName] = useState('');
+  const [creatingKey, setCreatingKey] = useState(false);
+
+  // Unpublish flow state
+  const [unpublishDialogOpen, setUnpublishDialogOpen] = useState(false);
+  const [unpublishLoading, setUnpublishLoading] = useState(false);
+  const [unpublishWarnings, setUnpublishWarnings] = useState<string[]>([]);
+
+  // Execution decision dialog state (pause/deny)
+  const [decisionDialog, setDecisionDialog] = useState<{ kind: ExecutionDecisionKind; executionId: string; scope?: 'execution' | 'node' | null; count?: number } | null>(null);
+
+  // Subscribe to onAppStatusChange for real-time status updates (Req 11 AC 12)
+  useEffect(() => {
+    const ON_APP_STATUS_CHANGE = `
+      subscription OnAppStatusChange($appId: ID!) {
+        onAppStatusChange(appId: $appId) {
+          appId
+          previousStatus
+          newStatus
+          timestamp
+        }
+      }
+    `;
+
+    let unsubscribe: (() => void) | null = null;
+    try {
+      unsubscribe = serverService.subscribe(
+        ON_APP_STATUS_CHANGE,
+        { appId },
+        (data: any) => {
+          const event = data?.onAppStatusChange;
+          if (event?.newStatus) {
+            setApp((prev) =>
+              prev ? { ...prev, status: event.newStatus, updatedAt: event.timestamp } : prev,
+            );
+          }
+        },
+      );
+    } catch (err) {
+      console.warn('Failed to subscribe to app status changes:', err);
+    }
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [appId]);
+
+  const loadApp = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      const data = await appApiService.getApp(appId);
+      setApp(data);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to load app';
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
+  }, [appId]);
+
+  const loadWorkflows = useCallback(async (workflowIds: string[]) => {
+    if (!workflowIds || workflowIds.length === 0) {
+      setWorkflows([]);
+      return;
+    }
+    try {
+      const results = await Promise.allSettled(
+        workflowIds.map((id) => workflowApiService.getWorkflow(id)),
+      );
+      const loaded: WorkflowInfo[] = results
+        .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value)
+        .map((r) => ({
+          workflowId: r.value.workflowId,
+          name: r.value.name || r.value.workflowId,
+          status: r.value.status || 'UNKNOWN',
+          nodeCount: r.value.nodes?.length ?? 0,
+        }));
+      setWorkflows(loaded);
+    } catch {
+      setWorkflows([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadApp();
+  }, [loadApp]);
+
+  useEffect(() => {
+    if (app?.workflowIds) {
+      loadWorkflows(app.workflowIds);
+    }
+  }, [app?.workflowIds, loadWorkflows]);
+
+  // Aggregate executions across all bound workflows, newest first
+  const loadExecutions = useCallback(async (workflowIds: string[]) => {
+    if (!workflowIds || workflowIds.length === 0) {
+      setExecutions([]);
+      return;
+    }
+    try {
+      const results = await Promise.allSettled(
+        workflowIds.map((id) => executionApiService.listExecutions(id)),
+      );
+      const items: Execution[] = results
+        .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && !!r.value)
+        .flatMap((r) => r.value.items || []);
+      items.sort((a, b) => (b.startedAt || '').localeCompare(a.startedAt || ''));
+      setExecutions(items);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to load executions';
+      toast.error(message);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (app?.workflowIds) {
+      loadExecutions(app.workflowIds);
+    }
+  }, [app?.workflowIds, loadExecutions]);
+
+  // Poll executions every 3s while any execution is RUNNING or awaiting_approval.
+  // Single interval, cleared when no active executions or on unmount. Max 10 min.
+  useEffect(() => {
+    const hasActive = executions.some(
+      (e) => isRunning(e.status) || isAwaitingApproval(e.status),
+    );
+    if (!hasActive || !app?.workflowIds) return;
+    const workflowIds = app.workflowIds;
+    const startedAt = Date.now();
+    const MAX_POLL_MS = 10 * 60 * 1000; // 10 minutes
+    const interval = setInterval(() => {
+      if (Date.now() - startedAt > MAX_POLL_MS) {
+        clearInterval(interval);
+        return;
+      }
+      loadExecutions(workflowIds);
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [executions, app?.workflowIds, loadExecutions]);
+
+  // Derive the current run's status strictly from its own subscription events
+  // (the hook accumulates events across executions, so filter by executionId).
+  const runStatus = useMemo<string | null>(() => {
+    if (!activeRun) return null;
+    const evts = runEvents.filter((e: any) => e.executionId === activeRun.executionId);
+    if (evts.some((e: any) => e.eventType === 'workflow.failed')) return 'failed';
+    if (evts.some((e: any) => e.eventType === 'workflow.completed')) return 'completed';
+    if (evts.length > 0) return 'running';
+    return 'pending';
+  }, [runEvents, activeRun]);
+
+  // Toast once per terminal state and refresh the executions list
+  useEffect(() => {
+    if (!activeRun || (runStatus !== 'completed' && runStatus !== 'failed')) return;
+    const key = `${activeRun.executionId}:${runStatus}`;
+    if (runToastRef.current === key) return;
+    runToastRef.current = key;
+    if (runStatus === 'completed') {
+      toast.success('Workflow run completed');
+    } else {
+      toast.error('Workflow run failed');
+    }
+    if (app?.workflowIds) {
+      loadExecutions(app.workflowIds);
+    }
+  }, [runStatus, activeRun, app?.workflowIds, loadExecutions]);
+
+  // While the detail sheet shows a RUNNING/PENDING execution, refresh the
+  // executions on each onWorkflowProgress event so the sheet stays live.
+  const processedRunEventCountRef = useRef(0);
+  useEffect(() => {
+    if (runEvents.length === 0 || runEvents.length === processedRunEventCountRef.current) return;
+    processedRunEventCountRef.current = runEvents.length;
+    if (!detailSheetOpen || !selectedExecution || !app?.workflowIds) return;
+    const status = selectedExecution.status || '';
+    if (!isRunning(status) && normalizeExecutionStatus(status) !== 'pending') return;
+    const hasEventForSelected = runEvents.some(
+      (e: any) => e?.executionId === selectedExecution.executionId,
+    );
+    if (!hasEventForSelected) return;
+    loadExecutions(app.workflowIds);
+  }, [runEvents, detailSheetOpen, selectedExecution, app?.workflowIds, loadExecutions]);
+
+  // Keep the selected execution object in sync with the refreshed list so the
+  // open detail sheet never shows stale data.
+  useEffect(() => {
+    if (!selectedExecution) return;
+    const refreshed = executions.find(
+      (e) => e.executionId === selectedExecution.executionId,
+    );
+    if (refreshed && refreshed !== selectedExecution) {
+      setSelectedExecution(refreshed);
+    }
+  }, [executions, selectedExecution]);
+
+  const openExecutionDetail = (exec: Execution) => {
+    setSelectedExecution(exec);
+    setDetailSheetOpen(true);
+  };
+
+  /**
+   * Deep-link handler for the CIT-026 execution replay package (design's
+   * "Download replay package" button on execution inspection). Ownership
+   * is enforced server-side — this handler never pre-checks ownership
+   * client-side, it just surfaces whatever the API decides via
+   * replayService's typed result:
+   *   - success -> trigger the browser download of the presigned url
+   *   - unauthorized (403) / gateRefused (5xx) / unconfigured -> an honest
+   *     toast message, never a crash (design invariant: "graceful
+   *     handling when the gate refuses").
+   */
+  const handleDownloadReplayPackage = async (executionId: string) => {
+    const result = await replayService.getByExecution(executionId);
+    if (!result.available) {
+      toast.error('Replay package download is not available in this environment.');
+      return;
+    }
+    if (result.unauthorized) {
+      toast.error(result.reason);
+      return;
+    }
+    if (result.gateRefused) {
+      toast.error(result.reason);
+      return;
+    }
+    replayService.downloadReplayPackage(result.data.url);
+  };
+
+  const handleRunWorkflow = async (workflowId: string) => {
+    try {
+      setStartingRun(workflowId);
+      const exec = await executionApiService.startExecution(workflowId);
+      setActiveRun({ executionId: exec.executionId, workflowId });
+      // Optimistically prepend the started execution so the Executions tab
+      // shows it immediately without waiting for a full reload.
+      setExecutions((prev) => [
+        {
+          executionId: exec.executionId,
+          workflowId,
+          status: 'running',
+          startedAt: new Date().toISOString(),
+          triggeredBy: 'user',
+        },
+        ...prev.filter((e) => e.executionId !== exec.executionId),
+      ]);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to start workflow run';
+      toast.error(message);
+    } finally {
+      setStartingRun(null);
+    }
+  };
+
+  const handlePublishWorkflow = async (workflowId: string) => {
+    try {
+      setPublishingWorkflowId(workflowId);
+      const published = await workflowApiService.publishWorkflow(workflowId);
+      setWorkflows((prev) =>
+        prev.map((wf) =>
+          wf.workflowId === workflowId
+            ? { ...wf, status: published?.status || 'PUBLISHED' }
+            : wf,
+        ),
+      );
+      toast.success('Workflow published');
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      toast.error('Failed to publish workflow', { description: message });
+    } finally {
+      setPublishingWorkflowId(null);
+    }
+  };
+
+  // Load API tab data when app is PUBLISHED
+  const loadApiData = useCallback(async (selectedRange: string) => {
+    if (!app || app.status !== 'PUBLISHED') return;
+    const rangeConfig = TIME_RANGES.find((r) => r.label === selectedRange) || TIME_RANGES[2];
+    const endTime = new Date().toISOString();
+    const startTime = new Date(Date.now() - rangeConfig.hours * 3600000).toISOString();
+
+    setApiKeysLoading(true);
+    setMetricsLoading(true);
+
+    try {
+      const keys = await appApiService.listAppApiKeys(app.appId);
+      setApiKeys(keys || []);
+    } catch {
+      setApiKeys([]);
+    } finally {
+      setApiKeysLoading(false);
+    }
+
+    try {
+      const m = await appApiService.getAppMetrics(app.appId, startTime, endTime);
+      setMetrics(m);
+    } catch {
+      setMetrics(null);
+    } finally {
+      setMetricsLoading(false);
+    }
+  }, [app]);
+
+  useEffect(() => {
+    if (app?.status === 'PUBLISHED') {
+      loadApiData(timeRange);
+    }
+  }, [app?.status, app?.appId, loadApiData, timeRange]);
+
+  // ---- Actions ----
+
+  const loadAvailableAgents = async () => {
+    try {
+      setLoadingAgents(true);
+      const configs = await agentConfigService.listAgentConfigs();
+      const boundIds = new Set((app?.agentBindings || []).map((b: RegistryAgentBinding) => b.agentId));
+      setAvailableAgents(
+        configs
+          .filter((c: any) => c.state === 'active' && !boundIds.has(c.agentId))
+          .map((c: any) => {
+            const config = typeof c.config === 'object' && c.config !== null ? c.config : {};
+            return {
+              agentId: c.agentId,
+              // Prefer Registry top-level name, then legacy config.name, then agentId.
+              name: c.name || config.name || c.agentId,
+              // Prefer top-level description (record field), then config.description (legacy).
+              description:
+                (typeof c.description === 'string' && c.description) ||
+                (typeof config.description === 'string' ? config.description : ''),
+            };
+          }),
+      );
+    } catch {
+      setAvailableAgents([]);
+    } finally {
+      setLoadingAgents(false);
+    }
+  };
+
+  const handleAddAgent = async (agentId: string) => {
+    if (!app) return;
+    try {
+      setAddingAgent(agentId);
+      await appApiService.addAppComponent(app.appId, {
+        type: 'agent',
+        data: JSON.stringify({ agentId }),
+      });
+      setAddAgentDialogOpen(false);
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to add agent';
+      setError(message);
+    } finally {
+      setAddingAgent(null);
+    }
+  };
+
+  const handleRemoveAgent = async (agentId: string) => {
+    if (!app) return;
+    try {
+      await appApiService.removeAppComponent(app.appId, 'agent', agentId);
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to remove agent';
+      setError(message);
+    }
+  };
+
+  const handleUpdateBinding = async () => {
+    if (!app || !editingBinding) return;
+    try {
+      setEditBindingSaving(true);
+      const toolRestrictionsArray = editBindingForm.toolRestrictions
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      await appApiService.updateAgentBinding({
+        appId: app.appId,
+        agentId: editingBinding.agentId,
+        systemPromptAddition: editBindingForm.systemPromptAddition || undefined,
+        toolRestrictions: toolRestrictionsArray.length > 0 ? toolRestrictionsArray : undefined,
+        modelOverride: editBindingForm.modelOverride || undefined,
+        status: editBindingForm.status || undefined,
+      });
+      setEditingBinding(null);
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to update binding';
+      setError(message);
+    } finally {
+      setEditBindingSaving(false);
+    }
+  };
+
+  const loadUnboundWorkflows = async () => {
+    if (!app) return;
+    try {
+      setLoadingUnboundWorkflows(true);
+      const orgId = app.orgId || selectedOrganization || 'default';
+      const result = await workflowApiService.listWorkflows(orgId);
+      const boundIds = new Set(app.workflowIds || []);
+      setUnboundWorkflows(
+        (result.items || [])
+          .filter((w: any) => !boundIds.has(w.workflowId))
+          .map((w: any) => ({ workflowId: w.workflowId, name: w.name || w.workflowId, status: w.status || 'UNKNOWN' })),
+      );
+    } catch {
+      setUnboundWorkflows([]);
+    } finally {
+      setLoadingUnboundWorkflows(false);
+    }
+  };
+
+  const handleBindWorkflow = async (workflowId: string) => {
+    if (!app) return;
+    try {
+      setBindingWorkflow(workflowId);
+      await appApiService.bindWorkflowToApp(app.appId, workflowId);
+      setBindWorkflowDialogOpen(false);
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to bind workflow';
+      setError(message);
+    } finally {
+      setBindingWorkflow(null);
+    }
+  };
+
+  const handleUnbindWorkflow = async (workflowId: string) => {
+    if (!app) return;
+    try {
+      await appApiService.unbindWorkflowFromApp(app.appId, workflowId);
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to unbind workflow';
+      setError(message);
+    }
+  };
+
+  const handleRemovePermission = async (permissionId: string) => {
+    if (!app) return;
+    try {
+      await appApiService.removeAppComponent(app.appId, 'permission', permissionId);
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to remove permission';
+      setError(message);
+    }
+  };
+
+  const handleAddPermission = async () => {
+    if (!app) return;
+    const actions = permForm.actions.split(',').map((s) => s.trim()).filter(Boolean);
+    const resources = permForm.resources.split(',').map((s) => s.trim()).filter(Boolean);
+    if (actions.length === 0) {
+      setError('At least one IAM action is required (e.g. s3:GetObject)');
+      return;
+    }
+    if (resources.length === 0) {
+      setError('At least one resource ARN is required');
+      return;
+    }
+    try {
+      setAddingPerm(true);
+      const permissionId = crypto.randomUUID();
+      await appApiService.addAppComponent(app.appId, {
+        type: 'permission',
+        data: JSON.stringify({
+          permissionId,
+          actions,
+          resources,
+          description: permForm.description || undefined,
+        }),
+      });
+      setAddPermDialogOpen(false);
+      setPermForm({ description: '', actions: '', resources: '' });
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to add permission';
+      setError(message);
+    } finally {
+      setAddingPerm(false);
+    }
+  };
+
+  const handleSaveConfigValues = async () => {
+    if (!app) return;
+    try {
+      setConfigSaving(true);
+      setConfigSaveError(null);
+      await appApiService.setAppConfigValues(app.appId, configValuesInput, app.version);
+      setEditingConfigValues(false);
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to save config values';
+      setConfigSaveError(message);
+    } finally {
+      setConfigSaving(false);
+    }
+  };
+
+  const openTransitionDialog = (transition: StatusTransition) => {
+    setPendingTransition(transition);
+    setTransitionError(null);
+    setFailedPreconditions([]);
+    setTransitionDialogOpen(true);
+  };
+
+  // ---- Publish Flow Handlers ----
+
+  const handlePublish = async () => {
+    if (!app) return;
+    try {
+      setPublishLoading(true);
+      setPublishError(null);
+      const result = await appApiService.publishApp(app.appId);
+      if (onPublishSuccess) {
+        setPublishDialogOpen(false);
+        onPublishSuccess({
+          appId: app.appId,
+          appName: app.name,
+          endpointUrl: result.endpointUrl,
+          apiKey: result.apiKey,
+        });
+      } else {
+        setPublishResult({
+          endpointUrl: result.endpointUrl,
+          apiKey: result.apiKey,
+        });
+      }
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Publishing failed';
+      setPublishError(message);
+    } finally {
+      setPublishLoading(false);
+    }
+  };
+
+  const handleCopyToClipboard = async (text: string, field: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedField(field);
+      setTimeout(() => setCopiedField(null), 2000);
+    } catch {
+      // Silently fail
+    }
+  };
+
+  const handleCreateApiKey = async () => {
+    if (!app || !newKeyName.trim()) return;
+    try {
+      setCreatingKey(true);
+      await appApiService.createAppApiKey(app.appId, newKeyName.trim());
+      setCreateKeyDialogOpen(false);
+      setNewKeyName('');
+      await loadApiData(timeRange);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to create API key';
+      setError(message);
+    } finally {
+      setCreatingKey(false);
+    }
+  };
+
+  const handleRevokeApiKey = async (keyId: string) => {
+    if (!app) return;
+    try {
+      await appApiService.revokeAppApiKey(app.appId, keyId);
+      await loadApiData(timeRange);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to revoke API key';
+      setError(message);
+    }
+  };
+
+  const handleUnpublish = async () => {
+    if (!app) return;
+    try {
+      setUnpublishLoading(true);
+      setUnpublishWarnings([]);
+      const result = await appApiService.unpublishApp(app.appId);
+      if (result?.warnings && result.warnings.length > 0) {
+        setUnpublishWarnings(result.warnings);
+      } else {
+        setUnpublishDialogOpen(false);
+      }
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Unpublish failed';
+      setError(message);
+    } finally {
+      setUnpublishLoading(false);
+    }
+  };
+
+  // ---- Execution actions (pause / approve / deny) ----
+
+  const handlePauseExecution = (exec: Execution) => {
+    const pending = exec.approvalRequests?.find((r) => !r.decision);
+    const scope = pending?.scope === 'execution' ? 'execution' as const : pending?.scope === 'node' ? 'node' as const : null;
+    setDecisionDialog({
+      kind: 'pause',
+      executionId: exec.executionId,
+      scope,
+      count: scope === 'execution' ? (pending?.nodeIds?.length ?? 0) : undefined,
+    });
+  };
+
+  const handleApproveExecution = async (exec: Execution) => {
+    const nodeId = deriveAwaitingNodeId(exec);
+    if (!nodeId) {
+      toast.error('Cannot determine the node to approve');
+      return;
+    }
+    try {
+      await executionApiService.approveExecution(exec.executionId, nodeId);
+      if (app?.workflowIds) await loadExecutions(app.workflowIds);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to approve execution';
+      toast.error(message);
+    }
+  };
+
+  const handleDenyExecution = (exec: Execution) => {
+    const pending = exec.approvalRequests?.find((r) => !r.decision);
+    const scope = pending?.scope === 'execution' ? 'execution' as const : pending?.scope === 'node' ? 'node' as const : null;
+    setDecisionDialog({
+      kind: 'deny',
+      executionId: exec.executionId,
+      scope,
+      count: scope === 'execution' ? (pending?.nodeIds?.length ?? 0) : undefined,
+    });
+  };
+
+  const handleDecisionConfirm = async (reason: string) => {
+    if (!decisionDialog) return;
+    const exec = executions.find((e) => e.executionId === decisionDialog.executionId);
+    if (!exec) return;
+    const nodeId = deriveAwaitingNodeId(exec);
+    try {
+      if (decisionDialog.kind === 'pause') {
+        await executionApiService.pauseExecution(exec.executionId, reason, nodeId ?? undefined);
+      } else {
+        if (!nodeId) {
+          toast.error('Cannot determine the node to deny');
+          return;
+        }
+        await executionApiService.denyExecution(exec.executionId, nodeId, reason);
+      }
+      setDecisionDialog(null);
+      if (app?.workflowIds) await loadExecutions(app.workflowIds);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : `Failed to ${decisionDialog.kind} execution`;
+      toast.error(message);
+    }
+  };
+
+  const executeTransition = async () => {
+    if (!app || !pendingTransition) return;
+
+    // For submit-for-approval, check preconditions first (frontend-only UX
+    // gate — the backend's isSubmit special-case bypasses
+    // REGISTRY_TRANSITIONS entirely for DRAFT -> PENDING_APPROVAL, so this
+    // is advisory, not a mirror of a server-side check).
+    if (pendingTransition.targetStatus === 'PENDING_APPROVAL') {
+      const preconditions = buildPreconditions(app, workflows);
+      const failing = preconditions.filter((p) => !p.passed);
+      if (failing.length > 0) {
+        setFailedPreconditions(preconditions);
+        return;
+      }
+    }
+
+    try {
+      setTransitionLoading(true);
+      setTransitionError(null);
+      await appApiService.updateApp({
+        appId: app.appId,
+        version: app.version,
+        status: pendingTransition.targetStatus,
+      });
+      setTransitionDialogOpen(false);
+      await loadApp();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Status transition failed';
+      setTransitionError(message);
+    } finally {
+      setTransitionLoading(false);
+    }
+  };
+
+  // ---- Tab Renderers ----
+
+  const renderAgentsTab = () => {
+    const bindings = app?.agentBindings || [];
+    return (
+      <div className="flex flex-col gap-4">
+        {/* Add Agent button */}
+        <div className="flex justify-end">
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1 text-xs"
+            onClick={() => {
+              loadAvailableAgents();
+              setAddAgentDialogOpen(true);
+            }}
+          >
+            <Plus className="size-3" /> Add Agent
+          </Button>
+        </div>
+
+        {bindings.length === 0 ? (
+          <div className="text-center py-12">
+            <Bot className="size-10 text-muted-foreground mx-auto mb-3" />
+            <p className="text-muted-foreground text-sm mb-3">No agents bound to this app.</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1 text-xs"
+              onClick={() => {
+                loadAvailableAgents();
+                setAddAgentDialogOpen(true);
+              }}
+            >
+              <Plus className="size-3" /> Add Agent
+            </Button>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {bindings.map((binding) => {
+          const statusColors = COMPONENT_STATUS_COLORS[binding.status] || COMPONENT_STATUS_COLORS.DESIGN;
+          const hasOverrides = !!(binding.systemPromptAddition || binding.toolRestrictions?.length || binding.modelOverride);
+          return (
+            <Card key={binding.agentId} className="rounded-lg border-border/50 p-4 gap-0">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Bot className="size-4 text-muted-foreground flex-shrink-0" />
+                  <span className="text-sm font-medium text-foreground truncate">{binding.name || binding.agentId}</span>
+                </div>
+                <Badge className={cn(statusColors.bg, statusColors.text, 'text-xs border-0 flex-shrink-0')}>
+                  {binding.status}
+                </Badge>
+              </div>
+              {/* Override indicators */}
+              {hasOverrides && (
+                <div className="flex gap-2 mb-2">
+                  {binding.systemPromptAddition && (
+                    <span title="System prompt addition" className="text-muted-foreground"><MessageSquare className="w-3.5 h-3.5" /></span>
+                  )}
+                  {binding.toolRestrictions && binding.toolRestrictions.length > 0 && (
+                    <span title={`${binding.toolRestrictions.length} tool restriction(s)`} className="text-muted-foreground"><Wrench className="w-3.5 h-3.5" /></span>
+                  )}
+                  {binding.modelOverride && (
+                    <span title={`Model: ${binding.modelOverride}`} className="text-muted-foreground"><Cpu className="w-3.5 h-3.5" /></span>
+                  )}
+                </div>
+              )}
+              <div className="flex items-center gap-2 mt-3">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-xs text-muted-foreground hover:text-foreground h-7 px-2"
+                  onClick={() => {
+                    setEditingBinding(binding);
+                    setEditBindingForm({
+                      systemPromptAddition: binding.systemPromptAddition || '',
+                      toolRestrictions: (binding.toolRestrictions || []).join(', '),
+                      modelOverride: binding.modelOverride || '',
+                      status: binding.status,
+                    });
+                  }}
+                >
+                  <Pencil className="size-3 mr-1" /> Edit
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-xs text-destructive hover:text-destructive h-7 px-2"
+                  onClick={() => handleRemoveAgent(binding.agentId)}
+                >
+                  <Trash2 className="size-3 mr-1" /> Remove
+                </Button>
+              </div>
+            </Card>
+          );
+        })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderWorkflowsTab = () => {
+    return (
+      <div className="flex flex-col gap-4">
+        {/* Bind Workflow button */}
+        <div className="flex justify-end">
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1 text-xs"
+            onClick={() => {
+              loadUnboundWorkflows();
+              setBindWorkflowDialogOpen(true);
+            }}
+          >
+            <Plus className="size-3" /> Bind Workflow
+          </Button>
+        </div>
+
+        {workflows.length === 0 ? (
+          <div className="text-center py-12">
+            <GitBranch className="size-10 text-muted-foreground mx-auto mb-3" />
+            <p className="text-muted-foreground text-sm mb-3">No workflows bound to this app.</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1 text-xs"
+              onClick={() => {
+                loadUnboundWorkflows();
+                setBindWorkflowDialogOpen(true);
+              }}
+            >
+              <Plus className="size-3" /> Bind Workflow
+            </Button>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {workflows.map((wf) => {
+              const isPublished = wf.status === 'PUBLISHED';
+              const isActiveRun = activeRun?.workflowId === wf.workflowId;
+              const runIndicator = isActiveRun && runStatus
+                ? runStatus === 'completed'
+                  ? { label: 'Completed', bg: 'bg-chart-2/20', text: 'text-chart-2' }
+                  : runStatus === 'failed'
+                    ? { label: 'Failed', bg: 'bg-destructive/20', text: 'text-destructive' }
+                    : runStatus === 'running'
+                      ? { label: 'Running', bg: 'bg-primary/20', text: 'text-primary' }
+                      : { label: 'Pending', bg: 'bg-chart-4/20', text: 'text-chart-4' }
+                : null;
+              return (
+                <Card key={wf.workflowId} className="rounded-lg border-border/50 p-4 gap-0">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-sm font-medium text-foreground truncate mr-2">{wf.name}</span>
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      {runIndicator && (
+                        <Badge className={cn(runIndicator.bg, runIndicator.text, 'text-xs border-0')}>
+                          {runIndicator.label}
+                        </Badge>
+                      )}
+                      <Badge className="text-xs border-0 bg-muted/20 text-muted-foreground">{wf.status}</Badge>
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground mb-3">{wf.nodeCount} node{wf.nodeCount !== 1 ? 's' : ''}</p>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-xs text-muted-foreground hover:text-foreground h-7 px-2"
+                      aria-label={`Run ${wf.name}`}
+                      disabled={!isPublished || startingRun === wf.workflowId || (isActiveRun && (runStatus === 'running' || runStatus === 'pending'))}
+                      onClick={() => handleRunWorkflow(wf.workflowId)}
+                    >
+                      {startingRun === wf.workflowId
+                        ? <Loader2 className="size-3 mr-1 animate-spin" />
+                        : <Play className="size-3 mr-1" />} Run
+                    </Button>
+                    {isActiveRun && runStatus === 'running' && canApproveExecutions && !orgLoading && activeRun && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="text-xs h-7 px-2"
+                        data-testid="pause-active-run"
+                        onClick={() => {
+                          const exec = executions.find((e) => e.executionId === activeRun.executionId);
+                          if (exec) handlePauseExecution(exec);
+                        }}
+                      >
+                        <Pause className="size-3 mr-1" /> Pause
+                      </Button>
+                    )}
+                    {!isPublished && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="text-xs h-7 px-2"
+                        aria-label={`Publish ${wf.name}`}
+                        disabled={publishingWorkflowId === wf.workflowId}
+                        onClick={() => handlePublishWorkflow(wf.workflowId)}
+                      >
+                        {publishingWorkflowId === wf.workflowId
+                          ? <Loader2 className="size-3 mr-1 animate-spin" />
+                          : <Upload className="size-3 mr-1" />} Publish
+                      </Button>
+                    )}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-xs text-muted-foreground hover:text-foreground h-7 px-2"
+                      onClick={() => onNavigate?.(`workflow-editor:${wf.workflowId}`)}
+                    >
+                      <ExternalLink className="size-3 mr-1" /> Open
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-xs text-destructive hover:text-destructive h-7 px-2"
+                      onClick={() => handleUnbindWorkflow(wf.workflowId)}
+                    >
+                      <Trash2 className="size-3 mr-1" /> Unbind
+                    </Button>
+                  </div>
+                  {!isPublished && (
+                    <p className="text-xs text-chart-4 mt-2">Draft — publish to enable Run</p>
+                  )}
+                </Card>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderPermissionsTab = () => {
+    const perms = app?.permissions || [];
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="flex justify-end">
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1 text-xs"
+            onClick={() => setAddPermDialogOpen(true)}
+          >
+            <Plus className="size-3" /> Add Permission
+          </Button>
+        </div>
+
+        {perms.length === 0 ? (
+          <div className="text-center py-12">
+            <Shield className="size-10 text-muted-foreground mx-auto mb-3" />
+            <p className="text-muted-foreground text-sm mb-1">No permissions declared for this app.</p>
+            <p className="text-muted-foreground text-xs mb-3">Permissions are optional — agent tool bindings handle most credential scoping automatically.</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1 text-xs"
+              onClick={() => setAddPermDialogOpen(true)}
+            >
+              <Plus className="size-3" /> Add Permission
+            </Button>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border/50">
+                  <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Description</th>
+                  <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Actions</th>
+                  <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Resources</th>
+                  <th className="text-right py-2 px-3 text-muted-foreground font-medium text-xs">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {perms.map((perm) => (
+                  <tr key={perm.permissionId} className="border-b border-border/50 hover:bg-card">
+                    <td className="py-2 px-3 text-foreground text-xs">{perm.description || '—'}</td>
+                    <td className="py-2 px-3">
+                      <div className="flex flex-wrap gap-1">
+                        {perm.actions.map((action) => (
+                          <Badge key={action} className="text-xs border-0 bg-primary/10 text-primary">{action}</Badge>
+                        ))}
+                      </div>
+                    </td>
+                    <td className="py-2 px-3 text-xs text-muted-foreground font-mono max-w-xs truncate">{perm.resources.join(', ')}</td>
+                    <td className="py-2 px-3 text-right">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-destructive hover:text-destructive h-7 px-2"
+                        onClick={() => handleRemovePermission(perm.permissionId)}
+                      >
+                        <Trash2 className="size-3" />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderConfigurationTab = () => {
+    const hasSchema = !!app?.configSchema;
+    const hasValues = !!app?.configValues;
+    const parsedValues = (() => {
+      try {
+        return typeof app?.configValues === 'string' ? JSON.parse(app.configValues) : (app?.configValues || {});
+      } catch { return {}; }
+    })();
+
+    return (
+      <div className="flex flex-col gap-6">
+        {/* Admin Email quick-set */}
+        <Card className="rounded-lg border-border/50 bg-background p-4 gap-0">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-medium text-foreground">Admin Email</h3>
+              <p className="text-xs text-muted-foreground mt-1">Contact email for notifications about this app</p>
+            </div>
+            {parsedValues.adminEmail ? (
+              <span className="text-xs text-chart-2">{parsedValues.adminEmail}</span>
+            ) : null}
+          </div>
+          <div className="flex gap-2 mt-2">
+            <Input
+              type="email"
+              placeholder="admin@example.com"
+              defaultValue={parsedValues.adminEmail || ''}
+              className="text-xs h-8 bg-transparent border-border text-foreground"
+              onKeyDown={async (e) => {
+                if (e.key === 'Enter' && app) {
+                  const email = (e.target as HTMLInputElement).value.trim();
+                  if (!email) return;
+                  try {
+                    const newValues = { ...parsedValues, adminEmail: email };
+                    await appApiService.setAppConfigValues(app.appId, JSON.stringify(newValues), app.version);
+                    await loadApp();
+                  } catch (err: any) {
+                    console.error('Failed to save admin email:', err);
+                  }
+                }
+              }}
+              id="admin-email-input"
+            />
+            <Button
+              size="sm"
+              className="text-xs h-8 bg-primary hover:bg-primary text-foreground"
+              onClick={async () => {
+                const input = document.getElementById('admin-email-input') as HTMLInputElement;
+                const email = input?.value?.trim();
+                if (!email || !app) return;
+                try {
+                  const newValues = { ...parsedValues, adminEmail: email };
+                  await appApiService.setAppConfigValues(app.appId, JSON.stringify(newValues), app.version);
+                  await loadApp();
+                } catch (err: any) {
+                  console.error('Failed to save admin email:', err);
+                }
+              }}
+            >
+              Save
+            </Button>
+          </div>
+        </Card>
+        {/* Schema (read-only) */}
+        <div>
+          <h3 className="text-sm font-medium text-foreground mb-2">Configuration Schema</h3>
+          {hasSchema ? (
+            <Card className="rounded-lg border-border/50 bg-background p-4 text-xs text-muted-foreground font-mono overflow-x-auto max-h-64 overflow-y-auto whitespace-pre gap-0">
+              {typeof app?.configSchema === 'string'
+                ? JSON.stringify(JSON.parse(app.configSchema), null, 2)
+                : JSON.stringify(app?.configSchema, null, 2)}
+            </Card>
+          ) : (
+            <p className="text-xs text-muted-foreground">No configuration schema defined.</p>
+          )}
+        </div>
+
+        {/* Values (editable) */}
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-medium text-foreground">Configuration Values</h3>
+            {hasValues && !editingConfigValues && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-xs text-muted-foreground hover:text-foreground h-7 px-2"
+                onClick={() => {
+                  const raw = app?.configValues;
+                  try {
+                    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                    setConfigValuesInput(JSON.stringify(parsed, null, 2));
+                  } catch {
+                    setConfigValuesInput(raw || '');
+                  }
+                  setEditingConfigValues(true);
+                  setConfigSaveError(null);
+                }}
+              >
+                <Pencil className="size-3 mr-1" /> Edit
+              </Button>
+            )}
+          </div>
+          {editingConfigValues ? (
+            <div className="flex flex-col gap-2">
+              <Textarea
+                value={configValuesInput}
+                onChange={(e) => setConfigValuesInput(e.target.value)}
+                className="bg-transparent border border-input text-foreground font-mono text-xs"
+                rows={8}
+              />
+              {configSaveError && <p className="text-xs text-destructive">{configSaveError}</p>}
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  className="text-xs bg-primary hover:bg-primary text-foreground h-7"
+                  onClick={handleSaveConfigValues}
+                  disabled={configSaving}
+                >
+                  {configSaving ? <Loader2 className="size-3 animate-spin mr-1" /> : null}
+                  Save
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-xs h-7"
+                  onClick={() => setEditingConfigValues(false)}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : hasValues ? (
+            <Card className="rounded-lg border-border/50 bg-background p-4 text-xs text-muted-foreground font-mono overflow-x-auto max-h-64 overflow-y-auto whitespace-pre gap-0">
+              {typeof app?.configValues === 'string'
+                ? JSON.stringify(JSON.parse(app.configValues), null, 2)
+                : JSON.stringify(app?.configValues, null, 2)}
+            </Card>
+          ) : (
+            <p className="text-xs text-muted-foreground">No configuration values set.</p>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const renderExecutionsTab = () => {
+    if (executions.length === 0) {
+      return (
+        <div className="text-center py-12">
+          <Clock className="size-10 text-muted-foreground mx-auto mb-3" />
+          <div className="flex items-center justify-center gap-3">
+            <p className="text-muted-foreground text-sm">No executions recorded yet.</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-xs h-7 px-2"
+              onClick={() => setActiveTab('workflows')}
+            >
+              <GitBranch className="size-3 mr-1" /> Go to Workflows
+            </Button>
+          </div>
+        </div>
+      );
+    }
+
+    const showActions = canApproveExecutions && !orgLoading;
+
+    return (
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-border/50">
+              <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Execution ID</th>
+              <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Workflow</th>
+              <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Status</th>
+              <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Started</th>
+              <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Completed</th>
+              <th className="text-right py-2 px-3 text-muted-foreground font-medium text-xs">Duration</th>
+              {showActions && (
+                <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Actions</th>
+              )}
+              <th className="py-2 px-3 w-8"><span className="sr-only">View details</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {executions.map((exec) => {
+              const colors = EXECUTION_STATUS_COLORS[normalizeExecutionStatus(exec.status)] || EXECUTION_STATUS_COLORS.pending;
+              const pendingApproval = exec.approvalRequests?.find((r) => !r.decision);
+              const isExecScoped = pendingApproval?.scope === 'execution';
+              const execScopedCount = isExecScoped ? (pendingApproval?.nodeIds?.length ?? 0) : 0;
+              const execScopedNodeWord = execScopedCount === 1 ? 'node' : 'nodes';
+              return (
+                <tr
+                  key={exec.executionId}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`View execution ${exec.executionId}`}
+                  className="border-b border-border/50 hover:bg-card cursor-pointer transition-colors"
+                  onClick={() => openExecutionDetail(exec)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      openExecutionDetail(exec);
+                    }
+                  }}
+                >
+                  <td className="py-2 px-3 text-foreground text-xs font-mono">{exec.executionId.slice(0, 12)}...</td>
+                  <td className="py-2 px-3 text-muted-foreground text-xs">{exec.workflowId}</td>
+                  <td className="py-2 px-3">
+                    <div className="flex flex-col gap-1">
+                      <Badge className={cn(colors.bg, colors.text, 'text-xs border-0')}>{exec.status}</Badge>
+                      {isAwaitingApproval(exec.status) && isExecScoped && (
+                        <span className="text-xs text-muted-foreground" data-testid="exec-scoped-label">
+                          Execution paused — {execScopedCount} {execScopedNodeWord}
+                        </span>
+                      )}
+                      {isAwaitingApproval(exec.status) && pendingApproval?.reason && (
+                        <span className="text-xs text-muted-foreground" data-testid="approval-reason">
+                          {pendingApproval.reason}
+                        </span>
+                      )}
+                      {isRunning(exec.status) && exec.pauseRequested && (
+                        <span className="text-xs text-chart-4" data-testid="pause-requested-hint">
+                          Pause requested
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="py-2 px-3 text-muted-foreground text-xs">{formatDate(exec.startedAt)}</td>
+                  <td className="py-2 px-3 text-muted-foreground text-xs">{exec.completedAt ? formatDate(exec.completedAt) : '—'}</td>
+                  <td className="py-2 px-3 text-right text-muted-foreground text-xs">{computeDuration(exec.startedAt, exec.completedAt ?? undefined)}</td>
+                  {showActions && (
+                    <td className="py-2 px-3" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-center gap-1">
+                        {isRunning(exec.status) && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="text-xs h-7 px-2"
+                            data-testid="pause-execution-action"
+                            onClick={(e) => { e.stopPropagation(); handlePauseExecution(exec); }}
+                          >
+                            <Pause className="size-3 mr-1" /> Pause
+                          </Button>
+                        )}
+                        {isAwaitingApproval(exec.status) && (
+                          <>
+                            <Button
+                              variant="default"
+                              size="sm"
+                              className="text-xs h-7 px-2"
+                              data-testid="approve-execution-action"
+                              onClick={(e) => { e.stopPropagation(); handleApproveExecution(exec); }}
+                            >
+                              {isExecScoped ? 'Resume' : 'Approve'}
+                            </Button>
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              className="text-xs h-7 px-2"
+                              data-testid="deny-execution-action"
+                              onClick={(e) => { e.stopPropagation(); handleDenyExecution(exec); }}
+                            >
+                              Deny
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                    </td>
+                  )}
+                  <td className="py-2 px-3 text-right">
+                    <ChevronRight className="size-3 text-muted-foreground inline-block" aria-hidden="true" />
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  const renderApiTab = () => {
+    if (!app || app.status !== 'PUBLISHED') return null;
+
+    const errorRate = metrics && metrics.totalRequests > 0
+      ? (metrics.clientErrorCount + metrics.serverErrorCount) / metrics.totalRequests
+      : 0;
+    const health = getHealthStatus(errorRate);
+    const healthStyle = HEALTH_COLORS[health];
+
+    return (
+      <div className="flex flex-col gap-6">
+        {/* Endpoint URL */}
+        <div>
+          <h3 className="text-sm font-medium text-foreground mb-2">Endpoint URL</h3>
+          <Card className="flex-row items-center gap-2 rounded-lg border-border/50 bg-background p-3">
+            <Globe className="size-4 text-muted-foreground flex-shrink-0" />
+            <code className="text-sm text-muted-foreground font-mono flex-1 truncate">{app.endpointUrl}</code>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-xs text-muted-foreground hover:text-foreground h-7 px-2 flex-shrink-0"
+              onClick={() => handleCopyToClipboard(app.endpointUrl || '', 'endpoint')}
+            >
+              {copiedField === 'endpoint' ? <Check className="size-3 text-chart-2" /> : <Copy className="size-3" />}
+              {copiedField === 'endpoint' ? ' Copied' : ' Copy'}
+            </Button>
+          </Card>
+        </div>
+
+        {/* Health Indicator */}
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-muted-foreground">Health:</span>
+          <Badge className={cn(healthStyle.bg, healthStyle.text, 'text-xs border-0')}>
+            {healthStyle.label}
+          </Badge>
+          {metrics && metrics.totalRequests > 0 && (
+            <span className="text-xs text-muted-foreground">{(errorRate * 100).toFixed(1)}% error rate</span>
+          )}
+        </div>
+
+        {/* Time Range Selector */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground">Time range:</span>
+          {TIME_RANGES.map((r) => (
+            <Button
+              key={r.label}
+              variant="ghost"
+              size="sm"
+              className={cn(
+                'text-xs h-7 px-2',
+                timeRange === r.label ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground',
+              )}
+              onClick={() => setTimeRange(r.label)}
+            >
+              {r.label}
+            </Button>
+          ))}
+        </div>
+
+        {/* Metrics Charts */}
+        {metricsLoading ? (
+          <div className="flex flex-col gap-4">
+            <div className="h-40 bg-accent rounded animate-pulse" />
+            <div className="h-40 bg-accent rounded animate-pulse" />
+          </div>
+        ) : metrics && metrics.timeSeries.length > 0 ? (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <Card className="rounded-lg border-border/50 bg-background p-4 gap-0">
+              <h4 className="text-xs font-medium text-muted-foreground mb-3">Request Count</h4>
+              <ResponsiveContainer width="100%" height={150}>
+                <LineChart data={metrics.timeSeries}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1f1f1f" />
+                  <XAxis dataKey="timestamp" tick={false} stroke="#333" />
+                  {/* Recharts requires inline style objects for tick/tooltip configuration */}
+                  <YAxis stroke="#333" tick={{ fontSize: 10, fill: '#666' }} />
+                  <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', fontSize: 12 }} />
+                  <Line type="monotone" dataKey="requestCount" stroke="#3b82f6" strokeWidth={2} dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </Card>
+            <Card className="rounded-lg border-border/50 bg-background p-4 gap-0">
+              <h4 className="text-xs font-medium text-muted-foreground mb-3">Error Rate</h4>
+              <ResponsiveContainer width="100%" height={150}>
+                <LineChart data={metrics.timeSeries.map((b) => ({
+                  ...b,
+                  errorRate: b.requestCount > 0 ? (b.errorCount / b.requestCount) * 100 : 0,
+                }))}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1f1f1f" />
+                  <XAxis dataKey="timestamp" tick={false} stroke="#333" />
+                  {/* Recharts requires inline style objects for tick/tooltip configuration */}
+                  <YAxis stroke="#333" tick={{ fontSize: 10, fill: '#666' }} />
+                  <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', fontSize: 12 }} />
+                  <Line type="monotone" dataKey="errorRate" stroke="#ef4444" strokeWidth={2} dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </Card>
+            <Card className="rounded-lg border-border/50 bg-background p-4 gap-0">
+              <h4 className="text-xs font-medium text-muted-foreground mb-3">Latency</h4>
+              <ResponsiveContainer width="100%" height={150}>
+                <AreaChart data={metrics.timeSeries}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1f1f1f" />
+                  <XAxis dataKey="timestamp" tick={false} stroke="#333" />
+                  {/* Recharts requires inline style objects for tick/tooltip configuration */}
+                  <YAxis stroke="#333" tick={{ fontSize: 10, fill: '#666' }} />
+                  <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', fontSize: 12 }} />
+                  <Area type="monotone" dataKey="avgLatency" stroke="#8b5cf6" fill="#8b5cf6" fillOpacity={0.2} strokeWidth={2} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </Card>
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground">No metrics data available for the selected time range.</p>
+        )}
+
+        {/* API Keys */}
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-medium text-foreground">API Keys</h3>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1 text-xs"
+              onClick={() => setCreateKeyDialogOpen(true)}
+            >
+              <Plus className="size-3" /> Create API Key
+            </Button>
+          </div>
+
+          {apiKeysLoading ? (
+            <p className="text-xs text-muted-foreground">Loading API keys...</p>
+          ) : apiKeys.length === 0 ? (
+            <p className="text-xs text-muted-foreground">No API keys found.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border/50">
+                    <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Name</th>
+                    <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Prefix</th>
+                    <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Status</th>
+                    <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Created</th>
+                    <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Expires</th>
+                    <th className="text-left py-2 px-3 text-muted-foreground font-medium text-xs">Last Used</th>
+                    <th className="text-right py-2 px-3 text-muted-foreground font-medium text-xs">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {apiKeys.map((key) => {
+                    const keyStatusColors = key.status === 'ACTIVE'
+                      ? { bg: 'bg-chart-2/20', text: 'text-chart-2' }
+                      : { bg: 'bg-destructive/20', text: 'text-destructive' };
+                    return (
+                      <tr key={key.keyId} className="border-b border-border/50 hover:bg-card">
+                        <td className="py-2 px-3 text-foreground text-xs">{key.name}</td>
+                        <td className="py-2 px-3 text-muted-foreground text-xs font-mono">{key.prefix}</td>
+                        <td className="py-2 px-3">
+                          <Badge className={cn(keyStatusColors.bg, keyStatusColors.text, 'text-xs border-0')}>{key.status}</Badge>
+                        </td>
+                        <td className="py-2 px-3 text-muted-foreground text-xs">{formatDate(key.createdAt)}</td>
+                        <td className="py-2 px-3 text-muted-foreground text-xs">{key.expiresAt ? formatDate(key.expiresAt) : '—'}</td>
+                        <td className="py-2 px-3 text-muted-foreground text-xs">{key.lastUsedAt ? formatDate(key.lastUsedAt) : '—'}</td>
+                        <td className="py-2 px-3 text-right">
+                          {key.status === 'ACTIVE' && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="text-destructive hover:text-destructive h-7 px-2 text-xs"
+                              onClick={() => handleRevokeApiKey(key.keyId)}
+                            >
+                              Revoke
+                            </Button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const renderPublishDialog = () => {
+    if (!app || app.status !== 'APPROVED') return null;
+
+    const preconditions = buildPreconditions(app, workflows);
+    const allPassed = shouldEnablePublish(preconditions);
+
+    return (
+      <Dialog open={publishDialogOpen} onOpenChange={(open) => {
+        setPublishDialogOpen(open);
+        if (!open) {
+          setPublishError(null);
+          setPublishResult(null);
+        }
+      }}>
+        <DialogContent className="bg-card border-border/50 max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">
+              {publishResult ? 'Published Successfully' : 'Publish App'}
+            </DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              {publishResult
+                ? 'Your app has been published. Save the API key — it will not be shown again.'
+                : `Review configuration for "${app.name}" before publishing.`}
+            </DialogDescription>
+          </DialogHeader>
+
+          {publishResult ? (
+            <div className="flex flex-col gap-4 my-2">
+              <div>
+                <label className="text-xs text-muted-foreground mb-1 block">Endpoint URL</label>
+                <Card className="flex-row items-center gap-2 rounded-md border-border/50 bg-background p-2">
+                  <code className="text-xs text-muted-foreground font-mono flex-1 truncate">{publishResult.endpointUrl}</code>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs h-6 px-2 text-muted-foreground hover:text-foreground flex-shrink-0"
+                    onClick={() => handleCopyToClipboard(publishResult.endpointUrl, 'pub-endpoint')}
+                  >
+                    {copiedField === 'pub-endpoint' ? <Check className="size-3 text-chart-2" /> : <Copy className="size-3" />}
+                    {copiedField === 'pub-endpoint' ? ' Copied' : ' Copy'}
+                  </Button>
+                </Card>
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground mb-1 block">API Key (shown once)</label>
+                <Card className="flex-row items-center gap-2 rounded-md border-border/50 bg-background p-2">
+                  <code className="text-xs text-muted-foreground font-mono flex-1 truncate">{publishResult.apiKey}</code>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs h-6 px-2 text-muted-foreground hover:text-foreground flex-shrink-0"
+                    onClick={() => handleCopyToClipboard(publishResult.apiKey, 'pub-apikey')}
+                  >
+                    {copiedField === 'pub-apikey' ? <Check className="size-3 text-chart-2" /> : <Copy className="size-3" />}
+                    {copiedField === 'pub-apikey' ? ' Copied' : ' Copy'}
+                  </Button>
+                </Card>
+              </div>
+              <DialogFooter>
+                <Button size="sm" className="text-xs" onClick={() => setPublishDialogOpen(false)}>
+                  Done
+                </Button>
+              </DialogFooter>
+            </div>
+          ) : (
+            <>
+              {/* App summary */}
+              <div className="flex flex-col gap-2 my-2 text-xs">
+                <div className="flex justify-between"><span className="text-muted-foreground">App Name</span><span className="text-foreground">{app.name}</span></div>
+                <div className="flex justify-between"><span className="text-muted-foreground">Agents</span><span className="text-foreground">{app.agentBindings.length} bound</span></div>
+                <div className="flex justify-between"><span className="text-muted-foreground">Workflows</span><span className="text-foreground">{app.workflowIds.length} bound</span></div>
+                <div className="flex justify-between"><span className="text-muted-foreground">Permissions</span><span className="text-foreground">{app.permissions.length} declared</span></div>
+                <div className="flex justify-between"><span className="text-muted-foreground">Config</span><span className="text-foreground">{app.configValues ? 'Provided' : 'None'}</span></div>
+              </div>
+
+              {/* Precondition checklist */}
+              <div className="flex flex-col gap-2 my-2">
+                <p className="text-xs font-medium text-muted-foreground">Preconditions:</p>
+                {preconditions.map((pc, idx) => (
+                  <div
+                    key={idx}
+                    className={cn(
+                      'flex items-start gap-2 rounded-md p-2 text-xs',
+                      pc.warning
+                        ? 'bg-chart-4/10 text-chart-4'
+                        : pc.passed ? 'bg-chart-2/10 text-chart-2' : 'bg-destructive/10 text-destructive',
+                    )}
+                  >
+                    {pc.warning
+                      ? <AlertTriangle className="size-4 flex-shrink-0 mt-0.5" />
+                      : pc.passed ? <CheckCircle2 className="size-4 flex-shrink-0 mt-0.5" /> : <XCircle className="size-4 flex-shrink-0 mt-0.5" />}
+                    <div>
+                      <p>{pc.label}</p>
+                      {pc.detail && <p className="text-xs opacity-75 mt-0.5">{pc.detail}</p>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Error */}
+              {publishError && (
+                <div className="flex items-start gap-2 rounded-md p-2 bg-destructive/10 text-destructive text-xs my-2">
+                  <AlertTriangle className="size-4 flex-shrink-0 mt-0.5" />
+                  <p>{publishError}</p>
+                </div>
+              )}
+
+              <DialogFooter>
+                <Button variant="ghost" size="sm" className="text-xs" onClick={() => setPublishDialogOpen(false)}>
+                  Cancel
+                </Button>
+                {publishError && (
+                  <Button
+                    size="sm"
+                    className="text-xs bg-chart-4 hover:bg-chart-4 text-foreground"
+                    onClick={handlePublish}
+                  >
+                    Retry
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  className="text-xs bg-chart-5 hover:bg-chart-5 text-foreground"
+                  onClick={handlePublish}
+                  disabled={!allPassed || publishLoading}
+                >
+                  {publishLoading ? <><Loader2 className="size-3 animate-spin mr-1" /> Publishing...</> : 'Confirm Publish'}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    );
+  };
+
+  const renderTransitionDialog = () => {
+    if (!pendingTransition || !app) return null;
+
+    const preconditions = pendingTransition.targetStatus === 'PENDING_APPROVAL'
+      ? (failedPreconditions.length > 0 ? failedPreconditions : buildPreconditions(app, workflows))
+      : [];
+
+    return (
+      <Dialog open={transitionDialogOpen} onOpenChange={setTransitionDialogOpen}>
+        <DialogContent className="bg-card border-border/50">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">
+              {pendingTransition.label} App
+            </DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              {pendingTransition.targetStatus === 'PENDING_APPROVAL' && 'Submit this app for approval. All preconditions must pass.'}
+              {pendingTransition.targetStatus === 'DEPRECATED' && app.status === 'REJECTED' && 'Archive this rejected app. Rejected records cannot be resubmitted; create a new record if you want to try again.'}
+              {pendingTransition.targetStatus === 'DEPRECATED' && app.status !== 'REJECTED' && 'Archive this app. The scoped IAM role will be deleted and all agent bindings reset to DESIGN.'}
+              {pendingTransition.targetStatus === 'DRAFT' && 'Deprecated records cannot be reactivated. This action is unavailable.'}
+            </DialogDescription>
+          </DialogHeader>
+
+          {/* Preconditions for submit-for-approval */}
+          {preconditions.length > 0 && (
+            <div className="flex flex-col gap-2 my-2">
+              <p className="text-xs font-medium text-muted-foreground">Preconditions:</p>
+              {preconditions.map((pc, idx) => (
+                <div
+                  key={idx}
+                  className={cn(
+                    'flex items-start gap-2 rounded-md p-2 text-xs',
+                    pc.warning
+                      ? 'bg-chart-4/10 text-chart-4'
+                      : pc.passed ? 'bg-chart-2/10 text-chart-2' : 'bg-destructive/10 text-destructive',
+                  )}
+                >
+                  {pc.warning
+                    ? <AlertTriangle className="size-4 flex-shrink-0 mt-0.5" />
+                    : pc.passed ? <CheckCircle2 className="size-4 flex-shrink-0 mt-0.5" /> : <XCircle className="size-4 flex-shrink-0 mt-0.5" />}
+                  <div>
+                    <p>{pc.label}</p>
+                    {pc.detail && <p className="text-xs opacity-75 mt-0.5">{pc.detail}</p>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Transition error */}
+          {transitionError && (
+            <div className="flex items-start gap-2 rounded-md p-2 bg-destructive/10 text-destructive text-xs">
+              <AlertTriangle className="size-4 flex-shrink-0 mt-0.5" />
+              <p>{transitionError}</p>
+            </div>
+          )}
+
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-xs"
+              onClick={() => setTransitionDialogOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              className={cn('text-xs', pendingTransition.className)}
+              onClick={executeTransition}
+              disabled={transitionLoading || (pendingTransition.targetStatus === 'PENDING_APPROVAL' && failedPreconditions.some((p) => !p.passed))}
+            >
+              {transitionLoading ? <Loader2 className="size-3 animate-spin mr-1" /> : null}
+              {pendingTransition.label}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    );
+  };
+
+  // ---- Main Render ----
+
+  if (loading) {
+    return (
+      <PageContainer>
+          <div className="flex flex-col gap-6">
+            <div className="flex flex-col animate-pulse gap-4">
+              <div className="h-6 bg-accent rounded w-1/3" />
+              <div className="h-4 bg-accent rounded w-2/3" />
+              <div className="h-4 bg-accent rounded w-1/2" />
+              <div className="h-10 bg-accent rounded w-full mt-6" />
+              <div className="h-40 bg-accent rounded w-full" />
+            </div>
+          </div>
+      </PageContainer>
+    );
+  }
+
+  if (error || !app) {
+    return (
+      <PageContainer>
+          <div className="flex flex-col gap-6">
+            <Button variant="ghost" size="sm" onClick={onBack} className="gap-1 text-xs text-muted-foreground hover:text-foreground">
+              <ArrowLeft className="size-4" /> Back to Apps
+            </Button>
+            <div className="bg-destructive/10 border border-destructive/50 rounded-lg p-4">
+              <p className="text-destructive mb-2">{error || 'App not found'}</p>
+              <Button variant="outline" size="sm" onClick={loadApp} className="gap-2 text-xs">
+                Retry
+              </Button>
+            </div>
+          </div>
+      </PageContainer>
+    );
+  }
+
+  const statusColors = STATUS_COLORS[app.status] || STATUS_COLORS.DRAFT;
+  const transition = getStatusTransition(app.status);
+
+  return (
+    <PageContainer>
+        <div className="flex flex-col gap-6">
+          {/* Back button */}
+          <Button variant="ghost" size="sm" onClick={onBack} className="gap-1 text-xs text-muted-foreground hover:text-foreground">
+            <ArrowLeft className="size-4" /> Back to Apps
+          </Button>
+
+          {/* Header */}
+          <div className="flex items-start justify-between">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-3 mb-1">
+                <h1 className="text-2xl font-semibold text-foreground truncate">{app.name}</h1>
+                <Badge className={cn(statusColors.bg, statusColors.text, 'text-xs border-0')}>
+                  {app.status}
+                </Badge>
+              </div>
+              {app.description && (
+                <p className="text-sm text-muted-foreground mb-2">{app.description}</p>
+              )}
+              <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                <span>Created by {app.createdByName || app.createdBy || 'unknown'}</span>
+                <span>Created {formatDate(app.createdAt)}</span>
+                <span>Updated {formatDate(app.updatedAt)}</span>
+              </div>
+            </div>
+            {transition && (
+              <Button
+                size="sm"
+                className={cn('gap-1 text-xs flex-shrink-0 ml-4', transition.className)}
+                onClick={() => !transition.disabled && openTransitionDialog(transition)}
+                disabled={transition.disabled}
+                title={transition.disabled ? transition.disabledReason : undefined}
+              >
+                <transition.icon className="size-4" />
+                {transition.label}
+              </Button>
+            )}
+            {app.status === 'APPROVED' && (
+              <Button
+                size="sm"
+                className="gap-1 text-xs flex-shrink-0 ml-2 bg-chart-5 hover:bg-chart-5 text-foreground"
+                onClick={() => {
+                  setPublishError(null);
+                  setPublishResult(null);
+                  setPublishDialogOpen(true);
+                }}
+              >
+                <Globe className="size-4" />
+                Publish
+              </Button>
+            )}
+            {app.status === 'PUBLISHED' && (
+              <>
+                <Button
+                  size="sm"
+                  className="gap-1 text-xs flex-shrink-0 ml-2 bg-primary hover:bg-primary text-foreground"
+                  onClick={() => onNavigate?.(`app-api-dashboard:${app.appId}`)}
+                >
+                  <BarChart3 className="size-4" />
+                  API Dashboard
+                </Button>
+                <Button
+                  size="sm"
+                  className="gap-1 text-xs flex-shrink-0 ml-2 bg-destructive hover:bg-destructive text-foreground"
+                  onClick={() => {
+                    setUnpublishWarnings([]);
+                    setUnpublishDialogOpen(true);
+                  }}
+                >
+                  <Archive className="size-4" />
+                  Unpublish
+                </Button>
+              </>
+            )}
+          </div>
+
+          {/* Tabs */}
+          <Tabs value={activeTab} onValueChange={setActiveTab}>
+            <TabsList className="bg-card border border-border/50">
+              <TabsTrigger value="agents" className="text-xs gap-1 data-[state=active]:bg-accent data-[state=active]:text-foreground text-muted-foreground">
+                <Bot className="w-3.5 h-3.5" /> Agents
+              </TabsTrigger>
+              <TabsTrigger value="workflows" className="text-xs gap-1 data-[state=active]:bg-accent data-[state=active]:text-foreground text-muted-foreground">
+                <GitBranch className="w-3.5 h-3.5" /> Workflows
+              </TabsTrigger>
+              <TabsTrigger value="permissions" className="text-xs gap-1 data-[state=active]:bg-accent data-[state=active]:text-foreground text-muted-foreground">
+                <Shield className="w-3.5 h-3.5" /> Permissions
+              </TabsTrigger>
+              <TabsTrigger value="configuration" className="text-xs gap-1 data-[state=active]:bg-accent data-[state=active]:text-foreground text-muted-foreground">
+                <Settings className="w-3.5 h-3.5" /> Configuration
+              </TabsTrigger>
+              <TabsTrigger value="executions" className="text-xs gap-1 data-[state=active]:bg-accent data-[state=active]:text-foreground text-muted-foreground">
+                <Play className="w-3.5 h-3.5" /> Executions
+              </TabsTrigger>
+              {app.status === 'PUBLISHED' && (
+                <TabsTrigger value="api" className="text-xs gap-1 data-[state=active]:bg-accent data-[state=active]:text-foreground text-muted-foreground">
+                  <Activity className="w-3.5 h-3.5" /> API
+                </TabsTrigger>
+              )}
+            </TabsList>
+
+            <TabsContent value="agents" className="mt-4">{renderAgentsTab()}</TabsContent>
+            <TabsContent value="workflows" className="mt-4">{renderWorkflowsTab()}</TabsContent>
+            <TabsContent value="permissions" className="mt-4">{renderPermissionsTab()}</TabsContent>
+            <TabsContent value="configuration" className="mt-4">{renderConfigurationTab()}</TabsContent>
+            <TabsContent value="executions" className="mt-4">{renderExecutionsTab()}</TabsContent>
+            {app.status === 'PUBLISHED' && (
+              <TabsContent value="api" className="mt-4">{renderApiTab()}</TabsContent>
+            )}
+          </Tabs>
+        </div>
+
+      {/* Transition dialog */}
+      {renderTransitionDialog()}
+
+      {/* Publish dialog */}
+      {renderPublishDialog()}
+
+      {/* Execution detail sheet */}
+      <ExecutionDetailSheet
+        execution={selectedExecution}
+        open={detailSheetOpen}
+        onClose={() => setDetailSheetOpen(false)}
+        onViewTrace={(executionId) => onNavigate?.(`observability-trace:execution:${executionId}`)}
+        onDownloadReplay={handleDownloadReplayPackage}
+        onPause={canApproveExecutions && !orgLoading ? handlePauseExecution : undefined}
+        onApprove={canApproveExecutions && !orgLoading ? handleApproveExecution : undefined}
+        onDeny={canApproveExecutions && !orgLoading ? handleDenyExecution : undefined}
+        canApproveExecutions={canApproveExecutions && !orgLoading}
+      />
+
+      {/* Unpublish dialog */}
+      <Dialog open={unpublishDialogOpen} onOpenChange={(open) => {
+        setUnpublishDialogOpen(open);
+        if (!open) setUnpublishWarnings([]);
+      }}>
+        <DialogContent className="bg-card border-border/50 max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">Unpublish App</DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              This will tear down the published resources for "{app?.name}".
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex flex-col gap-3 my-2">
+            <div className="rounded-md p-3 bg-destructive/10 border border-destructive/30 text-xs text-destructive">
+              <p className="font-medium mb-1">Warning: The following actions will be performed:</p>
+              <ul className="flex flex-col list-disc list-inside gap-1">
+                <li>API Gateway endpoint will be deleted</li>
+                <li>All active API keys will be revoked</li>
+                <li>Scoped IAM role will be removed</li>
+                <li>App status will return to DRAFT</li>
+              </ul>
+            </div>
+
+            {unpublishWarnings.length > 0 && (
+              <div className="flex flex-col gap-2">
+                <p className="text-xs font-medium text-chart-4">Partial teardown warnings:</p>
+                {unpublishWarnings.map((w, i) => (
+                  <div key={i} className="flex items-start gap-2 rounded-md p-2 bg-chart-4/10 text-chart-4 text-xs">
+                    <AlertTriangle className="size-4 flex-shrink-0 mt-0.5" />
+                    <p>{w}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="ghost" size="sm" className="text-xs" onClick={() => setUnpublishDialogOpen(false)}>
+              Cancel
+            </Button>
+            {unpublishWarnings.length > 0 ? (
+              <Button size="sm" className="text-xs" onClick={() => setUnpublishDialogOpen(false)}>
+                Done
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                className="text-xs bg-destructive hover:bg-destructive text-foreground"
+                onClick={handleUnpublish}
+                disabled={unpublishLoading}
+              >
+                {unpublishLoading ? <><Loader2 className="size-3 animate-spin mr-1" /> Unpublishing...</> : 'Confirm Unpublish'}
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Create API Key dialog */}
+      <Dialog open={createKeyDialogOpen} onOpenChange={setCreateKeyDialogOpen}>
+        <DialogContent className="bg-card border-border/50 max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">Create New API Key</DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              Enter a name for the new API key.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="my-2">
+            <label className="text-xs text-muted-foreground mb-1 block">Key Name</label>
+            <Input
+              placeholder="e.g. Production, Staging"
+              value={newKeyName}
+              onChange={(e) => setNewKeyName(e.target.value)}
+              className="bg-transparent border border-input text-foreground text-xs"
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" size="sm" className="text-xs" onClick={() => setCreateKeyDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              className="text-xs bg-primary hover:bg-primary text-foreground"
+              onClick={handleCreateApiKey}
+              disabled={creatingKey || !newKeyName.trim()}
+            >
+              {creatingKey ? <Loader2 className="size-3 animate-spin mr-1" /> : null}
+              Create
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add Agent dialog */}
+      <Dialog open={addAgentDialogOpen} onOpenChange={setAddAgentDialogOpen}>
+        <DialogContent className="bg-card border-border/50 max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">Add Agent to App</DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              Select an active agent to bind to this app.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col max-h-80 overflow-y-auto gap-2 my-2">
+            {loadingAgents ? (
+              <div className="flex items-center gap-2 text-muted-foreground py-8 justify-center">
+                <Loader2 className="size-4 animate-spin" /> Loading agents...
+              </div>
+            ) : availableAgents.length === 0 ? (
+              <p className="text-muted-foreground py-8 text-center text-sm">No available agents to add.</p>
+            ) : (
+              availableAgents.map((agent) => (
+                <Card
+                  key={agent.agentId}
+                  className="flex-row items-center justify-between rounded-lg border-border/50 bg-background p-3 hover:border-border transition-colors"
+                >
+                  <div className="flex-1 min-w-0 mr-3">
+                    <p className="text-sm font-medium text-foreground truncate">{agent.name}</p>
+                    <p className="text-xs text-muted-foreground truncate">{agent.description || 'No description'}</p>
+                  </div>
+                  <Button
+                    size="sm"
+                    className="text-xs bg-primary hover:bg-primary text-foreground h-7 px-3 flex-shrink-0"
+                    onClick={() => handleAddAgent(agent.agentId)}
+                    disabled={addingAgent === agent.agentId}
+                  >
+                    {addingAgent === agent.agentId ? (
+                      <Loader2 className="size-3 animate-spin" />
+                    ) : (
+                      <>
+                        <Plus className="size-3 mr-1" /> Add
+                      </>
+                    )}
+                  </Button>
+                </Card>
+              ))
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" size="sm" className="text-xs" onClick={() => setAddAgentDialogOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit Binding dialog */}
+      <Dialog open={!!editingBinding} onOpenChange={(open: boolean) => { if (!open) setEditingBinding(null); }}>
+        <DialogContent className="bg-card border-border/50 max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">Edit Binding — {editingBinding?.agentId}</DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              Update the override settings for this agent binding.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-4 my-2">
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">System Prompt Addition</label>
+              <Textarea
+                value={editBindingForm.systemPromptAddition}
+                onChange={(e) => setEditBindingForm((f) => ({ ...f, systemPromptAddition: e.target.value }))}
+                className="bg-transparent border border-input text-foreground text-xs"
+                rows={3}
+                maxLength={MAX_SYSTEM_PROMPT_ADDITION_CHARS}
+              />
+              <p className="text-xs text-muted-foreground mt-1 text-right">
+                {editBindingForm.systemPromptAddition.length}/{MAX_SYSTEM_PROMPT_ADDITION_CHARS}
+              </p>
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">Tool Restrictions (comma-separated)</label>
+              <Input
+                value={editBindingForm.toolRestrictions}
+                onChange={(e) => setEditBindingForm((f) => ({ ...f, toolRestrictions: e.target.value }))}
+                className="bg-transparent border border-input text-foreground text-xs"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">Model Override</label>
+              <ModelOverrideSelect
+                id="model-override"
+                aria-label="Model override"
+                value={editBindingForm.modelOverride}
+                onChange={(v) => setEditBindingForm((f) => ({ ...f, modelOverride: v }))}
+              />
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">Status</label>
+              <Select
+                value={editBindingForm.status}
+                onValueChange={(val) => setEditBindingForm((f) => ({ ...f, status: val }))}
+              >
+                <SelectTrigger className="text-xs">
+                  <SelectValue placeholder="Select status" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="DESIGN">DESIGN</SelectItem>
+                  <SelectItem value="READY">READY</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" size="sm" className="text-xs" onClick={() => setEditingBinding(null)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              className="text-xs bg-primary hover:bg-primary text-foreground"
+              onClick={handleUpdateBinding}
+              disabled={editBindingSaving}
+            >
+              {editBindingSaving ? <Loader2 className="size-3 animate-spin mr-1" /> : null}
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Bind Workflow dialog */}
+      <Dialog open={bindWorkflowDialogOpen} onOpenChange={setBindWorkflowDialogOpen}>
+        <DialogContent className="bg-card border-border/50 max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">Bind Workflow to App</DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              Select a workflow to bind to this app.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col max-h-80 overflow-y-auto gap-2 my-2">
+            {loadingUnboundWorkflows ? (
+              <div className="flex items-center gap-2 text-muted-foreground py-8 justify-center">
+                <Loader2 className="size-4 animate-spin" /> Loading workflows...
+              </div>
+            ) : unboundWorkflows.length === 0 ? (
+              <p className="text-muted-foreground py-8 text-center text-sm">No available workflows to bind.</p>
+            ) : (
+              unboundWorkflows.map((wf) => (
+                <Card
+                  key={wf.workflowId}
+                  className="flex-row items-center justify-between rounded-lg border-border/50 bg-background p-3 hover:border-border transition-colors"
+                >
+                  <div className="flex-1 min-w-0 mr-3">
+                    <p className="text-sm font-medium text-foreground truncate">{wf.name}</p>
+                    <p className="text-xs text-muted-foreground">{wf.status}</p>
+                  </div>
+                  <Button
+                    size="sm"
+                    className="text-xs bg-primary hover:bg-primary text-foreground h-7 px-3 flex-shrink-0"
+                    onClick={() => handleBindWorkflow(wf.workflowId)}
+                    disabled={bindingWorkflow === wf.workflowId}
+                  >
+                    {bindingWorkflow === wf.workflowId ? (
+                      <Loader2 className="size-3 animate-spin" />
+                    ) : (
+                      <>
+                        <Plus className="size-3 mr-1" /> Bind
+                      </>
+                    )}
+                  </Button>
+                </Card>
+              ))
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" size="sm" className="text-xs" onClick={() => setBindWorkflowDialogOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add Permission dialog */}
+      <Dialog open={addPermDialogOpen} onOpenChange={setAddPermDialogOpen}>
+        <DialogContent className="bg-card border-border/50 max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">Add Permission</DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              Declare IAM actions and resource ARNs for this app's scoped role.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-4 my-2">
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">Description</label>
+              <Input
+                placeholder="e.g. S3 read access for reports bucket"
+                value={permForm.description}
+                onChange={(e) => setPermForm((f) => ({ ...f, description: e.target.value }))}
+                className="bg-transparent border border-input text-foreground text-xs"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">Actions (comma-separated)</label>
+              <Input
+                placeholder="e.g. s3:GetObject, s3:PutObject, dynamodb:Query"
+                value={permForm.actions}
+                onChange={(e) => setPermForm((f) => ({ ...f, actions: e.target.value }))}
+                className="bg-transparent border border-input text-foreground text-xs"
+              />
+              <p className="text-xs text-muted-foreground mt-1">Format: service:Action (e.g. s3:GetObject). Bare * is not allowed.</p>
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">Resources (comma-separated ARN patterns)</label>
+              <Input
+                placeholder="e.g. arn:aws:s3:::my-bucket/*, arn:aws:dynamodb:*:*:table/my-table"
+                value={permForm.resources}
+                onChange={(e) => setPermForm((f) => ({ ...f, resources: e.target.value }))}
+                className="bg-transparent border border-input text-foreground text-xs"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" size="sm" className="text-xs" onClick={() => setAddPermDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              className="text-xs bg-primary hover:bg-primary text-foreground"
+              onClick={handleAddPermission}
+              disabled={addingPerm}
+            >
+              {addingPerm ? <Loader2 className="size-3 animate-spin mr-1" /> : null}
+              Add Permission
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Execution decision dialog (pause / deny) */}
+      {decisionDialog && (
+        <ExecutionDecisionDialog
+          kind={decisionDialog.kind}
+          executionId={decisionDialog.executionId}
+          onConfirm={handleDecisionConfirm}
+          onCancel={() => setDecisionDialog(null)}
+          scope={decisionDialog.scope}
+          count={decisionDialog.count}
+        />
+      )}
+    </PageContainer>
+  );
+}

@@ -1,0 +1,191 @@
+import {
+  CognitoIdentityProviderClient,
+  GetUserCommand,
+} from "@aws-sdk/client-cognito-identity-provider";
+import { AuthContext } from "../types";
+import { deriveRoles, readGroups } from "./auth-event";
+
+const cognitoClient = new CognitoIdentityProviderClient({});
+
+/**
+ * Builds an AuthContext from a raw access token via Cognito GetUser.
+ *
+ * ROLES ARE ALWAYS EMPTY ON THIS PATH — fail closed (CIT-213). GetUser
+ * returns user ATTRIBUTES only; it carries no group membership, and
+ * `cognito:groups` is the sole authorization signal for every role
+ * (finding 7aa877f8 for admin, CIT-213 for project_manager / architect /
+ * developer). The only role-shaped attribute available here is
+ * `custom:role`, which is client-writable (absent an explicit Cognito
+ * client WriteAttributes allow-list, any authenticated user can set it via
+ * UpdateUserAttributes) and therefore must never populate `roles`.
+ * Callers that need roles must use a verified JWT (`createAuthContext` on
+ * an AppSync identity, or the HTTP-API authorizer claims) where the groups
+ * claim is present.
+ */
+export async function validateCognitoToken(
+  accessToken: string,
+): Promise<AuthContext | null> {
+  try {
+    const command = new GetUserCommand({
+      AccessToken: accessToken,
+    });
+
+    const response = await cognitoClient.send(command);
+
+    const userId = response.Username!;
+
+    return {
+      userId,
+      username: userId,
+      groups: [],
+      roles: [],
+    };
+  } catch (error) {
+    console.error("Token validation failed:", error);
+    return null;
+  }
+}
+
+export function hasPermission(
+  authContext: AuthContext,
+  permission: string,
+): boolean {
+  // Admin role has all permissions
+  if (authContext.roles?.includes("admin")) {
+    return true;
+  }
+
+  // Define role-based permissions
+  const rolePermissions: Record<string, string[]> = {
+    project_manager: [
+      "project:create",
+      "project:read",
+      "project:update",
+      "agent:monitor",
+      "conversation:read",
+      // (QT1-5): project_manager may reopen a LOCKED ADR. The
+      // reopen path runs audit-before-auth (QT2A-7 + QT3-3) so denied
+      // attempts by other roles still produce a durable audit row.
+      "adr:reopen",
+      // (QT1-5/QT2B-7): project_manager shares ownership of the
+      // design phase and may submit the AgentDesignAssessment.
+      "assessment:submit",
+      // CIT-101: project_manager may read eval suites/cases (mirrors
+      // project:read's role-set), but does not author or approve.
+      "eval:read",
+    ],
+    architect: [
+      "project:read",
+      "project:update",
+      "agent:interact",
+      "conversation:read",
+      "conversation:write",
+      "document:upload",
+      "adr:create",
+      // (QT1-5): architect may reopen a LOCKED ADR.
+      "adr:reopen",
+      "spec:approve",
+      // (QT1-5/QT2B-7): architect owns the design phase and may
+      // submit the AgentDesignAssessment.
+      "assessment:submit",
+      // Decision #7: registry permissions.
+      "registry:create",
+      "registry:update",
+      "registry:submit",
+      // CIT-101: architect authors eval suites/cases (create/update/delete/
+      // addCase/updateCase/import/clone) AND approves (freezes) them —
+      // author-can-freeze-their-own-suite keeps the immutability property
+      // test self-contained with one role; admin retains eval:approve via
+      // the bypass above regardless.
+      "eval:author",
+      "eval:approve",
+      "eval:read",
+      // CIT-102: architect may start/read eval runs (execute a frozen
+      // suite against an agent target).
+      "eval:run",
+      // Slice 2 (agent release bundles): cutting a release is a
+      // governance-grade freeze action (it pins APPROVED spec + registry
+      // state and permanently marks eval evidence referenced) — same
+      // grantee set as spec:approve/eval:approve, not project_manager or
+      // developer.
+      "release:cut",
+      // Environment release pointer: moving the mutable per-environment
+      // cursor is the same governance-grade trust tier as release:cut —
+      // it determines which immutable release an environment dispatches
+      // against, so it stays with architect rather than project_manager
+      // or developer.
+      "release:promote",
+      // Canary releases (decision D6): release:canary authorizes
+      // start/reweight/abort of a canary episode. promoteCanary (→100%)
+      // ALSO requires release:promote — a canary-only grant can never
+      // reach a full cutover on its own. Granted to the same architect
+      // tier as release:promote (admin has all via the bypass above).
+      "release:canary",
+      // Approval-required tool gating (finding c947aa77): tool:approve
+      // authorizes PRE-GRANTING a single-use approval for a gated tool on
+      // a (org, workflowDefinition, node, tool). Same governance-grade trust
+      // tier as release:promote — a gated side-effecting tool never runs
+      // without a deliberate, attributable human pre-authorization. Admin
+      // has it via the bypass above; NEVER folded into a broad role beyond
+      // architect/admin (least privilege).
+      "tool:approve",
+      // Tool sandbox execution (finding 615aa5bb): tool:execute authorizes
+      // running a tool config's code with its resolved, scoped credentials
+      // via testTool/executeTool. Same trust tier as tool:approve — running
+      // a tool's real credentials is at least as sensitive as pre-approving
+      // a gated run, so it stays with architect/admin, never a broader role.
+      "tool:execute",
+    ],
+    developer: [
+      "project:read",
+      "agent:read",
+      "conversation:read",
+      "implementation:download",
+      // Decision #7: registry read for developer role.
+      "registry:read",
+      // CIT-101: developer may read eval suites/cases but not author/approve.
+      "eval:read",
+      // CIT-102: developer may also start/read eval runs (design §9 KEY
+      // REVERSIBLE DECISIONS #6).
+      "eval:run",
+    ],
+  };
+
+  // Check if any of the user's roles have the required permission
+  for (const role of authContext.roles || []) {
+    const permissions = rolePermissions[role] || [];
+    if (permissions.includes(permission) || permissions.includes("*")) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+type IdentityBag = Record<string, unknown> & {
+  sub?: string;
+  username?: string;
+};
+type EventWithIdentity = { identity?: IdentityBag | null };
+
+export function extractUserIdFromEvent(event: unknown): string {
+  const e = event as EventWithIdentity;
+  return e.identity?.sub || e.identity?.username || "anonymous";
+}
+
+export function createAuthContext(event: unknown): AuthContext {
+  const identity: IdentityBag = (event as EventWithIdentity).identity || {};
+
+  // finding 7aa877f8 made admin group-authoritative; CIT-213 made EVERY
+  // role group-authoritative. `roles` is exactly the deduplicated
+  // `cognito:groups` claim (deriveRoles → readGroups, tolerant of the
+  // array / comma-separated-string shapes and of both identity[...] and
+  // identity.claims[...] locations). The client-writable `custom:role`
+  // claim is never read.
+  return {
+    userId: identity.sub || identity.username || "anonymous",
+    username: identity.username,
+    groups: readGroups(event),
+    roles: deriveRoles(event),
+  };
+}

@@ -1,0 +1,739 @@
+"""
+Constitutional hierarchy loader (US-ARB-003).
+
+Loads the four governance config tables (authority units, composition
+contracts, case law, constitutional layers) from DynamoDB and caches the
+result in-process for ``CACHE_TTL_SECONDS``. Applies the D2 app-scoped
+filter on authority units in Python after the scan (filter expressions are
+intentionally not used — the in-memory filter is clearer and Scan-with-filter
+is no cheaper on read capacity).
+
+Ported from the Agentic Fabric reference with Citadel-specific adaptations:
+
+* boto3 resource is constructed lazily (QB-013-1) rather than at import time,
+  so tests can patch ``boto3.resource`` before the first call.
+* Cache is keyed by ``registry_id`` (or ``'__ALL__'`` when no filter is supplied)
+  because different callers may legitimately request different scopes of the
+  authority graph.
+* Missing table env vars produce a logged warning and an empty list for that
+  domain — the loader must remain callable in partially-provisioned
+  environments (AC 4).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+import boto3
+
+from .models import (
+    ArbitrationDecision,
+    AuthorityScope,
+    AuthorityUnit,
+    CaseLawEntry,
+    CompositionContract,
+    ConflictResolution,
+    ConstitutionalLayer,
+)
+
+logger = logging.getLogger(__name__)
+
+
+CACHE_TTL_SECONDS = 300
+_GLOBAL_REGISTRY_ID = "*GLOBAL*"
+_CACHE_KEY_ALL = "__ALL__"
+
+# Enforcement-mode cache is independent of the four-table state cache above
+# (different TTL, different backing store — SSM vs DynamoDB) but is exposed
+# through the same ``GovernanceState`` snapshot for a single call site.
+_MODE_CACHE_TTL_SECONDS = 300
+_VALID_ENFORCEMENT_MODES = ("permissive", "shadow", "strict")
+_DEFAULT_ENFORCEMENT_MODE = "shadow"
+
+# Maps env name to (mode, loaded_at).
+_mode_cache: dict[str, tuple[str, float]] = {}
+
+# Once-per-cold-start guard so the "ENVIRONMENT not set" warning fires only once.
+_env_unset_warned: bool = False
+
+# effective_at cache — same TTL/cache shape as the enforcement-mode cache
+# above (independent SSM parameter, same env-scoped cache key). Mirrors the
+# second parameter ``backend/src/utils/governance-flag.ts`` reads
+# (``getGovernanceEffectiveAt``). ``None`` means "no cutoff set" (pre-flip),
+# which is the value the grandfathering rule
+# (``arbiter/governance/grandfathering.py``) treats as "grandfather
+# everyone" — same semantics as the TS reader's ``effectiveAt: string |
+# null``.
+_EFFECTIVE_AT_CACHE_TTL_SECONDS = 300
+
+# Maps env name to (effective_at, loaded_at).
+_effective_at_cache: dict[str, tuple[str | None, float]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Public dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GovernanceState:
+    """Snapshot of the four governance config tables at ``loaded_at``.
+
+    ``registry_id`` records the filter that produced this snapshot:
+
+    * ``None`` — no filter was applied; all authority units are present.
+    * any string — only ``authority_units`` with ``registryId`` equal to this
+      value or to ``'*GLOBAL*'`` are present. The other three collections are
+      always unfiltered.
+
+    ``enforcement_mode`` is the persisted governance enforcement mode
+    (``'permissive'`` | ``'shadow'`` | ``'strict'``) resolved from the same
+    SSM-backed control surface the platform's other governance-aware
+    components read (``/citadel/governance/enforce/{env}``). Defaults to
+    ``'shadow'`` when unset or unresolvable — see ``_resolve_enforcement_mode``.
+    """
+
+    authority_units: list[AuthorityUnit] = field(default_factory=list)
+    composition_contracts: list[CompositionContract] = field(default_factory=list)
+    case_law: list[CaseLawEntry] = field(default_factory=list)
+    constitutional_layers: list[ConstitutionalLayer] = field(default_factory=list)
+    loaded_at: float = 0.0
+    registry_id: str | None = None
+    enforcement_mode: str = _DEFAULT_ENFORCEMENT_MODE
+    # The persisted grandfathering cutoff (``/citadel/governance/
+    # effective_at/{env}``), resolved from the same SSM-backed control
+    # surface as ``enforcement_mode`` — see ``_resolve_effective_at``.
+    # ``None`` means no cutoff has been written yet (pre-shadow-flip);
+    # every grandfathering check for that state treats every subject as
+    # grandfathered, matching ``is_grandfathered_pure``'s ``None``/``''``
+    # branch and the TS reader's ``effectiveAt: string | null`` contract.
+    effective_at: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Module-level cache
+# ---------------------------------------------------------------------------
+
+
+# Maps cache key (registry_id or _CACHE_KEY_ALL) to (state, loaded_at).
+_cache: dict[str, tuple[GovernanceState, float]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Lazy DDB resource accessor (QB-013-1: do NOT construct at import time)
+# ---------------------------------------------------------------------------
+
+
+def _get_dynamodb_resource() -> Any:
+    """Return a boto3 DynamoDB resource, constructed on demand.
+
+    Constructing the resource lazily lets tests patch ``boto3.resource``
+    before this function is first called, and avoids triggering AWS
+    credential discovery at import time.
+    """
+    return boto3.resource("dynamodb")
+
+
+# ---------------------------------------------------------------------------
+# Scan helpers
+# ---------------------------------------------------------------------------
+
+
+_SCAN_ALL_MAX_PAGES = 10000
+
+
+def _scan_all(table: Any) -> list[dict]:
+    """Scan a DDB table and collect every page into a single list.
+
+    Defensive termination (finding: PR213 CI hang): a real DynamoDB
+    response's ``LastEvaluatedKey`` is either absent or a non-empty dict —
+    but in unit tests that stub ``table`` with a bare ``MagicMock``,
+    ``response.get("LastEvaluatedKey")`` returns a fresh (truthy)
+    ``MagicMock`` forever, so the original ``if not last_key: break`` never
+    fires and this loops indefinitely. Real tables are unaffected by either
+    guard below: a well-formed paginated scan always yields a non-empty dict
+    key until the final page, and legitimate scans stay far below
+    ``_SCAN_ALL_MAX_PAGES``.
+    """
+    items: list[dict] = []
+    kwargs: dict[str, Any] = {}
+    pages = 0
+    while True:
+        response = table.scan(**kwargs)
+        items.extend(response.get("Items", []))
+        last_key = response.get("LastEvaluatedKey")
+        if not isinstance(last_key, dict) or not last_key:
+            break
+        pages += 1
+        if pages >= _SCAN_ALL_MAX_PAGES:
+            logger.warning(
+                "Governance loader: _scan_all hit the %d-page cap; "
+                "aborting pagination with a possibly-incomplete result.",
+                _SCAN_ALL_MAX_PAGES,
+            )
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+    return items
+
+
+def _maybe_json(value: Any, default: Any) -> Any:
+    """Accept a value that may be a JSON string or already-decoded object.
+
+    DDB items deserialised by boto3 are normally dicts/lists, but some
+    writers store nested structures as JSON strings. Accept either shape
+    so the loader stays forward-compatible.
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return default
+    return value
+
+
+def _scan_table_by_env(env_var: str) -> list[dict] | None:
+    """Resolve ``env_var`` to a table name and scan it.
+
+    Returns ``None`` when the env var is unset (caller emits a warning and
+    returns an empty domain list). Returns a (possibly empty) list of raw
+    items otherwise.
+    """
+    table_name = os.environ.get(env_var)
+    if not table_name:
+        logger.warning(
+            "Governance loader: %s is not set; loading empty list for this domain.",
+            env_var,
+        )
+        return None
+    table = _get_dynamodb_resource().Table(table_name)
+    return _scan_all(table)
+
+
+# ---------------------------------------------------------------------------
+# Row deserialisers — each tolerates missing / extra fields for forward compat
+# ---------------------------------------------------------------------------
+
+
+def _scope_from_item(item: dict) -> AuthorityScope:
+    scope_data = _maybe_json(item.get("scope"), {}) or {}
+    return AuthorityScope(
+        decision_type=scope_data.get("decision_type", "*"),
+        domain=scope_data.get("domain", "*"),
+        conditions=scope_data.get("conditions", {}) or {},
+        limits=scope_data.get("limits", {}) or {},
+    )
+
+
+def _authority_unit_from_item(item: dict) -> AuthorityUnit | None:
+    try:
+        unit_id = item["unitId"]
+        agent_id = item["agentId"]
+    except KeyError as exc:
+        logger.warning(
+            "Skipping malformed authority unit row (missing %s): keys=%s",
+            exc,
+            list(item.keys()),
+        )
+        return None
+    expiry = item.get("expiryTimestamp")
+    try:
+        expiry_value = float(expiry) if expiry is not None else None
+    except (TypeError, ValueError):
+        expiry_value = None
+    return AuthorityUnit(
+        unit_id=unit_id,
+        agent_id=agent_id,
+        scope=_scope_from_item(item),
+        delegation_source=item.get("delegationSource"),
+        can_redelegate=bool(item.get("canRedelegate", False)),
+        expiry_timestamp=expiry_value,
+        revoked=bool(item.get("revoked", False)),
+        risk_rating=item.get("riskRating", "low"),
+        registry_id=item.get("registryId"),
+    )
+
+
+def _composition_contract_from_item(item: dict) -> CompositionContract | None:
+    try:
+        contract_id = item["contractId"]
+        party_a = item["partyA"]
+        party_b = item["partyB"]
+    except KeyError as exc:
+        logger.warning(
+            "Skipping malformed composition contract row (missing %s): keys=%s",
+            exc,
+            list(item.keys()),
+        )
+        return None
+    invariants = _maybe_json(item.get("invariants"), []) or []
+    stop_rights = _maybe_json(item.get("stopRights"), []) or []
+    try:
+        conflict_resolution = ConflictResolution(
+            item.get("conflictResolution", ConflictResolution.DEFAULT_DENY.value)
+        )
+    except ValueError:
+        conflict_resolution = ConflictResolution.DEFAULT_DENY
+    return CompositionContract(
+        contract_id=contract_id,
+        party_a=party_a,
+        party_b=party_b,
+        authority_precedence=item.get("authorityPrecedence", "none"),
+        invariants=list(invariants),
+        conflict_resolution=conflict_resolution,
+        stop_rights=list(stop_rights),
+        scope=_scope_from_item(item),
+        escalation_path=item.get("escalationPath"),
+    )
+
+
+def _case_law_from_item(item: dict) -> CaseLawEntry | None:
+    # US-ARB-013: skip revoked rows at load time so they never reach the
+    # engine. Schema is reconciled with the CDK ``CaseLawTable``:
+    #   entryId    (PK, string) -> CaseLawEntry.case_id
+    #   pattern    (map)        -> CaseLawEntry.pattern
+    #   resolution (string)     -> CaseLawEntry.resolution
+    #   createdAt  (ISO-8601)   -> CaseLawEntry.encoded_at (kept as string)
+    #   createdBy  (string)     -> CaseLawEntry.encoded_by
+    #   scopeOfApplicability    -> CaseLawEntry.scope_of_applicability
+    #   precedence (number)     -> CaseLawEntry.precedence
+    #   revoked    (bool)       -> filtered here; not re-surfaced
+    if item.get("revoked", False):
+        return None
+    try:
+        case_id = item["entryId"]
+        resolution_raw = item["resolution"]
+    except KeyError as exc:
+        logger.warning(
+            "Skipping malformed case-law row (missing %s): keys=%s",
+            exc,
+            list(item.keys()),
+        )
+        return None
+    try:
+        resolution = ArbitrationDecision(resolution_raw)
+    except ValueError:
+        logger.warning(
+            "Skipping case-law row with unknown resolution %r (entryId=%s)",
+            resolution_raw,
+            case_id,
+        )
+        return None
+    pattern = _maybe_json(item.get("pattern"), {}) or {}
+    scope_of_applicability = _maybe_json(item.get("scopeOfApplicability"), {}) or {}
+    # createdAt is an ISO-8601 string in the CDK schema; coerce to str defensively.
+    encoded_at = str(item.get("createdAt", ""))
+    try:
+        precedence = int(item.get("precedence", 0))
+    except (TypeError, ValueError):
+        precedence = 0
+    return CaseLawEntry(
+        case_id=case_id,
+        pattern=pattern,
+        resolution=resolution,
+        encoded_at=encoded_at,
+        encoded_by=item.get("createdBy", "unknown"),
+        scope_of_applicability=scope_of_applicability,
+        precedence=precedence,
+        revoked=False,  # filtered above
+    )
+
+
+def _constitutional_layer_from_item(item: dict) -> ConstitutionalLayer | None:
+    try:
+        layer_id = item["layerId"]
+    except KeyError:
+        logger.warning(
+            "Skipping malformed constitutional-layer row (missing layerId): keys=%s",
+            list(item.keys()),
+        )
+        return None
+    applies_to = _maybe_json(item.get("appliesTo"), []) or []
+    rules = _maybe_json(item.get("rules"), []) or []
+    return ConstitutionalLayer(
+        layer_id=layer_id,
+        layer_type=item.get("layerType", "global"),
+        applies_to=list(applies_to),
+        rules=list(rules),
+        parent_layer_id=item.get("parentLayerId"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-domain loaders
+# ---------------------------------------------------------------------------
+
+
+def _load_authority_units() -> list[AuthorityUnit]:
+    items = _scan_table_by_env("AUTHORITY_UNITS_TABLE")
+    if items is None:
+        return []
+    result: list[AuthorityUnit] = []
+    for item in items:
+        unit = _authority_unit_from_item(item)
+        if unit is not None:
+            result.append(unit)
+    return result
+
+
+def _load_composition_contracts() -> list[CompositionContract]:
+    items = _scan_table_by_env("COMPOSITION_CONTRACTS_TABLE")
+    if items is None:
+        return []
+    result: list[CompositionContract] = []
+    for item in items:
+        contract = _composition_contract_from_item(item)
+        if contract is not None:
+            result.append(contract)
+    return result
+
+
+def _load_case_law() -> list[CaseLawEntry]:
+    items = _scan_table_by_env("CASE_LAW_TABLE")
+    if items is None:
+        return []
+    result: list[CaseLawEntry] = []
+    for item in items:
+        entry = _case_law_from_item(item)
+        if entry is not None:
+            result.append(entry)
+    # Highest precedence first — stable ordering across reloads.
+    result.sort(key=lambda e: -e.precedence)
+    return result
+
+
+def _load_constitutional_layers() -> list[ConstitutionalLayer]:
+    items = _scan_table_by_env("CONSTITUTIONAL_LAYERS_TABLE")
+    if items is None:
+        return []
+    result: list[ConstitutionalLayer] = []
+    for item in items:
+        layer = _constitutional_layer_from_item(item)
+        if layer is not None:
+            result.append(layer)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# D2 filter
+# ---------------------------------------------------------------------------
+
+
+def _apply_registry_filter(
+    units: list[AuthorityUnit], registry_id: str | None
+) -> list[AuthorityUnit]:
+    """Apply the D2 app-scoped filter on authority units.
+
+    When ``registry_id`` is ``None`` the input is returned unchanged. Otherwise
+    only units whose ``registryId`` equals ``registry_id`` or the global sentinel
+    ``'*GLOBAL*'`` are retained. Units with no ``registryId`` at all are dropped
+    because the D2 rule requires an explicit scope.
+    """
+    if registry_id is None:
+        return units
+    allowed = {registry_id, _GLOBAL_REGISTRY_ID}
+    return [u for u in units if u.registry_id in allowed]
+
+
+# ---------------------------------------------------------------------------
+# Enforcement-mode resolution (SSM-backed, mirrors backend/src/utils/governance-flag.ts)
+# ---------------------------------------------------------------------------
+
+
+def _get_ssm_client() -> Any:
+    """Return a boto3 SSM client, constructed on demand (see QB-013-1)."""
+    return boto3.client("ssm")
+
+
+def _resolve_enforcement_mode(force_reload: bool = False) -> str:
+    """Resolve the persisted governance enforcement mode.
+
+    Reads the SSM parameter ``/citadel/governance/enforce/{ENVIRONMENT}`` —
+    the same control-surface parameter the TypeScript governance-flag reader
+    (``backend/src/utils/governance-flag.ts``) consults — so Python and
+    TypeScript components observe a single source of truth for rollout
+    state. ``ENVIRONMENT`` is read from the Lambda environment; if it is
+    unset the parameter path collapses to a plainly-invalid name, which is
+    handled the same as any other resolution failure below.
+
+    Falls back to ``_DEFAULT_ENFORCEMENT_MODE`` ('shadow') whenever the
+    parameter is missing, the value is outside the allowed literal set, or
+    the SSM call raises for any reason (permissions, throttling, network).
+    Shadow is the safe middle ground for the GATE VERDICT: findings are
+    still evaluated and recorded, but nothing is blocked on the verdict
+    itself, so an unresolvable mode never silently degrades into either
+    an accidental hard-block or an accidental bypass of the ARBITRATION
+    decision.
+
+    CORRECTED (finding 23971f32, cross-referenced from the TypeScript
+    module doc's identical correction): "nothing is blocked" above refers
+    only to the verdict/arbitration outcome, NOT to promotion as a whole.
+    Per the USER DECISION that ledger-finding recording is fail-closed in
+    BOTH shadow and strict mode, shadow's recording write is an
+    unguarded write whose failure propagates — an infrastructure fault
+    while writing the finding (e.g. a missing IAM grant on the ledger
+    table) blocks the promotion even though shadow's arbitration verdict
+    never asked for a block. Shadow is also the fallback mode this
+    resolver returns to on any SSM failure, so this is not a purely
+    theoretical interaction.
+
+    WHY THIS MUST MATCH THE TS READER, DELIBERATELY (not incidentally):
+    ``backend/src/utils/governance-flag.ts``'s ``getGovernanceEnforce``
+    defaults to this SAME literal, 'shadow', on the identical failure
+    class (SSM throw or an out-of-allowlist value). This is a deliberate
+    non-divergence, not a coincidence: 'permissive' would silently drop
+    the only durable record of a degraded read (permissive never writes a
+    governance-ledger finding), and 'strict' would newly BLOCK promotions
+    and activations that were previously passing during what is likely a
+    transient SSM outage — a surprising, self-inflicted escalation nobody
+    configured. 'shadow' is the one literal that is simultaneously
+    non-blocking (matches the historical, safe non-enforcing behavior)
+    and observable (a ledger finding + a `governance_flag_defaulted` log
+    field are written, unlike permissive's silence). See the
+    cross-runtime contract test
+    ``test_default_enforcement_mode_is_shadow_matching_ts_reader`` and its
+    TS-side twin in ``governance-flag.test.ts`` — if a future change ever
+    needs the two runtimes to differ, that decision must be re-justified
+    here and in the TS module doc, not made by one side drifting alone.
+
+    When ``ENVIRONMENT`` is unset (local dev, unit tests, or any process
+    not running as a deployed Lambda) the SSM lookup is skipped entirely —
+    there is no well-formed parameter path to query — and the default is
+    returned immediately without an AWS call.
+
+    Cached in-process for ``_MODE_CACHE_TTL_SECONDS`` per environment name.
+    """
+    env_name = os.environ.get("ENVIRONMENT")
+    if not env_name:
+        global _env_unset_warned  # noqa: PLW0603
+        if not _env_unset_warned:
+            _env_unset_warned = True
+            logger.warning(
+                "governance enforcement mode defaulted to shadow: ENVIRONMENT not set",
+            )
+            try:
+                boto3.client("cloudwatch").put_metric_data(
+                    Namespace="Citadel/Workflows",
+                    MetricData=[
+                        {
+                            "MetricName": "GovernanceModeDefaulted",
+                            "Value": 1,
+                            "Unit": "Count",
+                        }
+                    ],
+                )
+            except Exception:
+                pass  # best-effort; do not let metric emission block fallback
+        return _DEFAULT_ENFORCEMENT_MODE
+
+    now = time.time()
+
+    if not force_reload:
+        cached = _mode_cache.get(env_name)
+        if cached is not None:
+            mode, loaded_at = cached
+            if now - loaded_at < _MODE_CACHE_TTL_SECONDS:
+                return mode
+
+    resolved = _DEFAULT_ENFORCEMENT_MODE
+    try:
+        response = _get_ssm_client().get_parameter(
+            Name=f"/citadel/governance/enforce/{env_name}"
+        )
+        raw_value = response.get("Parameter", {}).get("Value")
+        if raw_value in _VALID_ENFORCEMENT_MODES:
+            resolved = raw_value
+        else:
+            logger.warning(
+                "Governance enforcement mode parameter has unresolvable "
+                "value %r for env=%s; defaulting to %r.",
+                raw_value, env_name, _DEFAULT_ENFORCEMENT_MODE,
+                extra={
+                    # VISIBILITY: a distinct, filterable field so a
+                    # defaulted mode is never indistinguishable from a
+                    # configured one in log queries — mirrors the
+                    # "GovernanceFlagDefaulted" EMF metric emitted by the
+                    # TS reader (backend/src/utils/governance-flag.ts)
+                    # on the identical branch.
+                    "governance_flag_defaulted": True,
+                    "governance_flag_defaulted_reason": "invalid_value",
+                },
+            )
+    except Exception as e:
+        # Any SSM failure (missing param, permissions, throttling, network)
+        # is a resolution failure, not a fatal error — default to shadow
+        # and log so operators can see the degraded state.
+        logger.warning(
+            "Failed to resolve governance enforcement mode from SSM for "
+            "env=%s; defaulting to %r. Error: %s",
+            env_name, _DEFAULT_ENFORCEMENT_MODE, e,
+            extra={
+                # VISIBILITY: see the matching `extra` on the
+                # invalid-value branch above — same distinguishing
+                # fields, different reason.
+                "governance_flag_defaulted": True,
+                "governance_flag_defaulted_reason": "ssm_error",
+            },
+        )
+
+    _mode_cache[env_name] = (resolved, now)
+    return resolved
+
+
+def __reset_mode_cache_for_test() -> None:
+    """Clear the process-local enforcement-mode cache. Test-only helper."""
+    global _env_unset_warned  # noqa: PLW0603
+    _mode_cache.clear()
+    _env_unset_warned = False
+
+
+def _resolve_effective_at(force_reload: bool = False) -> str | None:
+    """Resolve the persisted grandfathering cutoff.
+
+    Reads the SSM parameter ``/citadel/governance/effective_at/{ENVIRONMENT}``
+    — the second parameter the TypeScript governance-flag reader
+    (``getGovernanceEffectiveAt`` in ``backend/src/utils/
+    governance-flag.ts``) consults, alongside ``enforce`` (see
+    ``_resolve_enforcement_mode`` above, which this function mirrors
+    structurally: same cache shape, same env-unset short-circuit, same
+    fail-soft posture on any SSM error).
+
+    Returns ``None`` when: ``ENVIRONMENT`` is unset, the parameter does not
+    exist, the value is empty, or the SSM call raises for any reason
+    (permissions, throttling, network). ``None`` is itself a meaningful,
+    valid value here (not a degraded fallback like
+    ``_DEFAULT_ENFORCEMENT_MODE``) — it means "no cutoff has been written
+    yet", which the grandfathering rule (``grandfathering.py``) already
+    treats as "grandfather everyone". There is deliberately no
+    default-to-a-literal-string fallback the way enforcement mode falls
+    back to ``'shadow'``: an unresolvable cutoff must never manufacture a
+    real-looking date that could accidentally un-grandfather a subject.
+
+    Cached in-process for ``_EFFECTIVE_AT_CACHE_TTL_SECONDS`` per
+    environment name, independently of the enforcement-mode cache.
+    """
+    env_name = os.environ.get("ENVIRONMENT")
+    if not env_name:
+        return None
+
+    now = time.time()
+
+    if not force_reload:
+        cached = _effective_at_cache.get(env_name)
+        if cached is not None:
+            effective_at, loaded_at = cached
+            if now - loaded_at < _EFFECTIVE_AT_CACHE_TTL_SECONDS:
+                return effective_at
+
+    resolved: str | None = None
+    try:
+        response = _get_ssm_client().get_parameter(
+            Name=f"/citadel/governance/effective_at/{env_name}"
+        )
+        raw_value = response.get("Parameter", {}).get("Value")
+        if raw_value:
+            resolved = raw_value
+    except Exception as e:
+        # Any SSM failure (missing param, permissions, throttling, network)
+        # resolves to None (no cutoff), same fail-soft posture as
+        # _resolve_enforcement_mode's SSM-failure branch, logged the same
+        # way for operator visibility.
+        logger.warning(
+            "Failed to resolve governance effective_at from SSM for "
+            "env=%s; defaulting to no cutoff (None). Error: %s",
+            env_name, e,
+        )
+
+    _effective_at_cache[env_name] = (resolved, now)
+    return resolved
+
+
+def __reset_effective_at_cache_for_test() -> None:
+    """Clear the process-local effective_at cache. Test-only helper."""
+    _effective_at_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
+
+
+def load_governance_state(
+    registry_id: str | None = None,
+    force_reload: bool = False,
+) -> GovernanceState:
+    """Load the full governance state from DDB, applying the D2 app filter.
+
+    Args:
+        registry_id: When provided, authority units are filtered to those whose
+            ``registryId`` matches ``registry_id`` or the ``'*GLOBAL*'`` sentinel.
+            The other three collections are always unfiltered.
+        force_reload: When ``True``, bypasses the cache entry for this
+            ``registry_id`` key and re-scans every table. Also forces a fresh
+            resolution of ``enforcement_mode``.
+
+    Returns:
+        A ``GovernanceState`` snapshot, including the resolved
+        ``enforcement_mode`` (see ``_resolve_enforcement_mode``).
+    """
+    cache_key = registry_id if registry_id is not None else _CACHE_KEY_ALL
+    now = time.time()
+
+    if not force_reload:
+        cached = _cache.get(cache_key)
+        if cached is not None:
+            state, loaded_at = cached
+            if now - loaded_at < CACHE_TTL_SECONDS:
+                return state
+
+    # Cache miss (or forced): drop the single entry and re-scan.
+    _cache.pop(cache_key, None)
+
+    authority_units = _apply_registry_filter(_load_authority_units(), registry_id)
+    composition_contracts = _load_composition_contracts()
+    case_law = _load_case_law()
+    constitutional_layers = _load_constitutional_layers()
+    enforcement_mode = _resolve_enforcement_mode(force_reload=force_reload)
+    effective_at = _resolve_effective_at(force_reload=force_reload)
+
+    loaded_at = time.time()
+    state = GovernanceState(
+        authority_units=authority_units,
+        composition_contracts=composition_contracts,
+        case_law=case_law,
+        constitutional_layers=constitutional_layers,
+        loaded_at=loaded_at,
+        registry_id=registry_id,
+        enforcement_mode=enforcement_mode,
+        effective_at=effective_at,
+    )
+    _cache[cache_key] = (state, loaded_at)
+
+    logger.info(
+        "Governance state loaded (registry_id=%s, enforcement_mode=%s): "
+        "%d units, %d contracts, %d case-law entries, %d layers.",
+        registry_id,
+        enforcement_mode,
+        len(authority_units),
+        len(composition_contracts),
+        len(case_law),
+        len(constitutional_layers),
+    )
+    return state
+
+
+def __reset_hierarchy_cache_for_test() -> None:
+    """Clear the process-local cache.
+
+    Test-only helper. Safe to call from production code — the next request
+    will simply re-scan the tables.
+    """
+    _cache.clear()
+    _mode_cache.clear()
+    _effective_at_cache.clear()

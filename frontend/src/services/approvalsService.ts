@@ -1,0 +1,109 @@
+/**
+ * Approvals Service
+ * Handles listing pending approvals and approve/reject decisions via GraphQL.
+ */
+
+import serverService from './server';
+import { appApiService } from './appApiService';
+import { toolConfigService } from './toolConfigService';
+import { invalidate } from './queryCache';
+
+// --- Types ---
+
+export interface PendingApprovalItem {
+  recordId: string;
+  recordType: string;
+  name: string;
+  displayName: string;
+  orgId: string;
+  submittedAt: string;
+  createdBy: string;
+  status: string;
+  version?: number;
+}
+
+export interface PendingApprovalConnection {
+  items: PendingApprovalItem[];
+  nextToken?: string | null;
+}
+
+export type ApprovalDecision = 'APPROVED' | 'REJECTED';
+
+export class NotSupportedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NotSupportedError';
+  }
+}
+
+// --- GraphQL Documents ---
+
+const LIST_PENDING_APPROVALS = `
+  query ListPendingApprovals($limit: Int, $nextToken: String) {
+    listPendingApprovals(limit: $limit, nextToken: $nextToken) {
+      items {
+        recordId
+        recordType
+        name
+        displayName
+        orgId
+        submittedAt
+        createdBy
+        status
+        version
+      }
+      nextToken
+    }
+  }
+`;
+
+// --- Service ---
+
+export const approvalsService = {
+  /**
+   * Fetch a page of pending approvals.
+   */
+  async listPendingApprovals(
+    opts: { limit?: number; nextToken?: string } = {},
+  ): Promise<PendingApprovalConnection> {
+    const response = await serverService.query<{
+      listPendingApprovals: PendingApprovalConnection;
+    }>(LIST_PENDING_APPROVALS, {
+      limit: opts.limit,
+      nextToken: opts.nextToken,
+    });
+    return response.listPendingApprovals;
+  },
+
+  /**
+   * Approve or reject a pending record.
+   *
+   * For agent records: delegates to appApiService.updateApp.
+   * For tool records: delegates to toolConfigService.updateToolConfig.
+   */
+  async decideApproval(input: {
+    recordId: string;
+    recordType: string;
+    decision: ApprovalDecision;
+    version?: number;
+    statusReason?: string;
+  }): Promise<void> {
+    if (input.recordType === 'tool') {
+      await toolConfigService.updateToolConfig({
+        toolId: input.recordId,
+        status: input.decision,
+        statusReason: input.statusReason,
+      });
+      invalidate('toolConfigs:');
+      return;
+    }
+
+    await appApiService.updateApp({
+      appId: input.recordId,
+      ...(input.version !== undefined ? { version: input.version } : {}),
+      status: input.decision,
+      statusReason: input.statusReason,
+    } as Parameters<typeof appApiService.updateApp>[0]);
+    invalidate('agentConfigs:');
+  },
+};

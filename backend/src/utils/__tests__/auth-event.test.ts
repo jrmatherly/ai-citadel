@@ -1,0 +1,718 @@
+/**
+ * Unit tests for the shared auth-event helper.
+ *
+ * Covers `extractOrgFromEvent` (CLAIM ONLY — decision 00d40a31, option A:
+ * the `custom:organization` claim is minted server-side by the pre-token
+ * trigger from the membership table, and there is NO Cognito
+ * AdminGetUser fallback to the client-writable attribute) and the
+ * group-only role derivation (`readGroups`, `isAdminFromEvent`,
+ * `hasRoleFromEvent`, `deriveRoles`). The former AdminGetUser
+ * attribute-lookup helper has been DELETED from this module (board task
+ * 5190de51): project-owner org resolution now reads the UserOrgMembership
+ * table via utils/org-membership.ts. The Cognito mock is retained so the
+ * escalation tests can keep asserting ZERO AdminGetUser calls.
+ *
+ * finding 7aa877f8 made ADMIN group-only; CIT-213 extended that to every
+ * role: the `custom:role` claim is never read as an authorization signal.
+ */
+import { mockClient } from "aws-sdk-client-mock";
+import {
+  CognitoIdentityProviderClient,
+  AdminGetUserCommand,
+} from "@aws-sdk/client-cognito-identity-provider";
+import {
+  extractOrgFromEvent,
+  isAdminFromEvent,
+  hasRoleFromEvent,
+  readGroups,
+  assertRowOrg,
+  CrossOrgAccessError,
+  deriveRoles,
+  resolveScopedOrgFromEvent,
+  canCallerSeeRow,
+} from "../auth-event";
+
+const cognitoMock = mockClient(CognitoIdentityProviderClient);
+
+describe("auth-event", () => {
+  beforeAll(() => {
+    process.env.USER_POOL_ID = "us-east-1_test";
+  });
+
+  beforeEach(() => {
+    cognitoMock.reset();
+  });
+
+  afterAll(() => {
+    delete process.env.USER_POOL_ID;
+  });
+
+  describe("extractOrgFromEvent", () => {
+    test('returns orgId from identity["custom:organization"] without calling Cognito', async () => {
+      const event = {
+        identity: {
+          sub: "user-123",
+          "custom:organization": "org-claim-a",
+        },
+      };
+
+      const result = await extractOrgFromEvent(event);
+
+      expect(result).toBe("org-claim-a");
+      expect(cognitoMock.commandCalls(AdminGetUserCommand).length).toBe(0);
+    });
+
+    test('returns orgId from identity.claims["custom:organization"] without calling Cognito', async () => {
+      const event = {
+        identity: {
+          sub: "user-123",
+          claims: {
+            "custom:organization": "org-claim-b",
+          },
+        },
+      };
+
+      const result = await extractOrgFromEvent(event);
+
+      expect(result).toBe("org-claim-b");
+      expect(cognitoMock.commandCalls(AdminGetUserCommand).length).toBe(0);
+    });
+
+    test("KEY ESCALATION TEST (00d40a31): with NO claim, does NOT fall back to Cognito AdminGetUser — returns null even when the stored attribute holds an org", async () => {
+      cognitoMock.on(AdminGetUserCommand).resolves({
+        Username: "user-123",
+        UserAttributes: [
+          { Name: "sub", Value: "user-123" },
+          { Name: "custom:organization", Value: "org-cognito-c" },
+        ],
+      });
+
+      const event = { identity: { sub: "user-123" } };
+
+      const result = await extractOrgFromEvent(event);
+
+      expect(result).toBeNull();
+      expect(cognitoMock.commandCalls(AdminGetUserCommand).length).toBe(0);
+    });
+
+    test("with NO claim and identity.username only, still returns null and never calls Cognito", async () => {
+      cognitoMock.on(AdminGetUserCommand).resolves({
+        Username: "name-only-user",
+        UserAttributes: [
+          { Name: "custom:organization", Value: "org-from-username" },
+        ],
+      });
+
+      const event = { identity: { username: "name-only-user" } };
+
+      const result = await extractOrgFromEvent(event);
+
+      expect(result).toBeNull();
+      expect(cognitoMock.commandCalls(AdminGetUserCommand).length).toBe(0);
+    });
+
+    test("returns null when event has no identity", async () => {
+      const result = await extractOrgFromEvent({});
+      expect(result).toBeNull();
+      expect(cognitoMock.commandCalls(AdminGetUserCommand).length).toBe(0);
+    });
+
+    test("an empty-string claim is treated as absent (null), with no Cognito call", async () => {
+      const event = {
+        identity: { sub: "user-123", "custom:organization": "" },
+      };
+      const result = await extractOrgFromEvent(event);
+      expect(result).toBeNull();
+      expect(cognitoMock.commandCalls(AdminGetUserCommand).length).toBe(0);
+    });
+  });
+
+  describe("isAdminFromEvent", () => {
+    // finding 7aa877f8: custom:role is a client-writable attribute (absent
+    // an explicit Cognito WriteAttributes allow-list, ANY authenticated
+    // user can set it via UpdateUserAttributes). Treating it as a valid
+    // admin signal on its own is the escalation. Group membership
+    // (cognito:groups) is the only authoritative signal because group
+    // membership can only be changed server-side (Admin* API).
+    test('KEY ESCALATION TEST: returns false when custom:role is "admin" but cognito:groups does NOT include admin', () => {
+      const event = {
+        identity: {
+          "custom:role": "admin",
+          "cognito:groups": ["project_manager"],
+        },
+      };
+      expect(isAdminFromEvent(event)).toBe(false);
+    });
+
+    test('KEY ESCALATION TEST: returns false when custom:role is "admin" and cognito:groups is empty/absent', () => {
+      const event = { identity: { "custom:role": "admin" } };
+      expect(isAdminFromEvent(event)).toBe(false);
+    });
+
+    test("returns true for a genuine group admin (cognito:groups array contains admin), regardless of custom:role", () => {
+      const event = {
+        identity: {
+          "custom:role": "project_manager",
+          "cognito:groups": ["admin"],
+        },
+      };
+      expect(isAdminFromEvent(event)).toBe(true);
+    });
+
+    test('returns false when identity["custom:role"] is "admin" alone (no groups claim at all)', () => {
+      const event = { identity: { "custom:role": "admin" } };
+      expect(isAdminFromEvent(event)).toBe(false);
+    });
+
+    test('returns false when identity.claims["custom:role"] is "admin" alone (no groups claim at all)', () => {
+      const event = { identity: { claims: { "custom:role": "admin" } } };
+      expect(isAdminFromEvent(event)).toBe(false);
+    });
+
+    test('returns false when role is "project_manager"', () => {
+      const event = { identity: { "custom:role": "project_manager" } };
+      expect(isAdminFromEvent(event)).toBe(false);
+    });
+
+    test("returns false when role claim is absent", () => {
+      const event = { identity: { sub: "user-123" } };
+      expect(isAdminFromEvent(event)).toBe(false);
+    });
+
+    test("returns false when event has no identity", () => {
+      expect(isAdminFromEvent({})).toBe(false);
+    });
+
+    test('returns true when cognito:groups is an array containing "admin"', () => {
+      const event = {
+        identity: { "cognito:groups": ["admin", "user"] },
+      };
+      expect(isAdminFromEvent(event)).toBe(true);
+    });
+
+    test("returns false when cognito:groups array contains only non-admin groups", () => {
+      const event = {
+        identity: { "cognito:groups": ["user", "project_manager"] },
+      };
+      expect(isAdminFromEvent(event)).toBe(false);
+    });
+
+    test('returns true when cognito:groups is the comma-separated string "admin,user"', () => {
+      const event = {
+        identity: { "cognito:groups": "admin,user" },
+      };
+      expect(isAdminFromEvent(event)).toBe(true);
+    });
+
+    test('returns false when cognito:groups is the string "user,project_manager"', () => {
+      const event = {
+        identity: { "cognito:groups": "user,project_manager" },
+      };
+      expect(isAdminFromEvent(event)).toBe(false);
+    });
+
+    test("returns false when both cognito:groups and custom:role are missing", () => {
+      const event = { identity: { sub: "user-123" } };
+      expect(isAdminFromEvent(event)).toBe(false);
+    });
+
+    test('honours cognito:groups at identity["cognito:groups"] (Cognito user pool auth mode)', () => {
+      const event = {
+        identity: { "cognito:groups": ["admin"] },
+      };
+      expect(isAdminFromEvent(event)).toBe(true);
+    });
+
+    test('honours cognito:groups at identity.claims["cognito:groups"] (proxy/IAM mode)', () => {
+      const event = {
+        identity: { claims: { "cognito:groups": ["admin"] } },
+      };
+      expect(isAdminFromEvent(event)).toBe(true);
+    });
+
+    test('custom:role "admin" does NOT win when cognito:groups is empty/absent (post 7aa877f8)', () => {
+      const event = {
+        identity: { "custom:role": "admin", "cognito:groups": [] },
+      };
+      expect(isAdminFromEvent(event)).toBe(false);
+    });
+  });
+
+  describe("deriveRoles (shared AuthContext.roles derivation, finding 7aa877f8)", () => {
+    // deriveRoles is the single shared point every authContextFromEvent
+    // copy (14 resolver files) plus auth.ts's createAuthContext /
+    // validateCognitoToken now delegate to, so admin group-membership
+    // becomes authoritative everywhere `roles.includes("admin")` is
+    // checked (hasPermission, every local requireAdmin), without each
+    // caller having to re-implement the fold.
+
+    test("KEY ESCALATION TEST: custom:role='admin' alone (no admin group) does NOT produce roles containing admin", () => {
+      const event = { identity: { "custom:role": "admin" } };
+      expect(deriveRoles(event)).not.toContain("admin");
+    });
+
+    test("group membership 'admin' is present in roles even without a custom:role claim", () => {
+      const event = { identity: { "cognito:groups": ["admin"] } };
+      expect(deriveRoles(event)).toContain("admin");
+    });
+
+    test("a genuine group admin whose custom:role is a different value still gets admin in roles", () => {
+      const event = {
+        identity: { "custom:role": "developer", "cognito:groups": ["admin"] },
+      };
+      const roles = deriveRoles(event);
+      expect(roles).toContain("admin");
+    });
+
+    // CIT-213: non-admin roles are group-authoritative too. A custom:role
+    // claim — even a non-admin value — is never read as a role signal.
+    test("KEY ESCALATION TEST (CIT-213): custom:role='architect' alone (no architect group) does NOT produce roles containing architect", () => {
+      const event = { identity: { "custom:role": "architect" } };
+      expect(deriveRoles(event)).toEqual([]);
+    });
+
+    test("KEY ESCALATION TEST (CIT-213): custom:role='architect' with only the developer group yields exactly ['developer']", () => {
+      const event = {
+        identity: {
+          "custom:role": "architect",
+          "cognito:groups": ["developer"],
+        },
+      };
+      expect(deriveRoles(event)).toEqual(["developer"]);
+    });
+
+    test("non-admin group membership (e.g. architect) is returned as a role", () => {
+      const event = { identity: { "cognito:groups": ["architect"] } };
+      expect(deriveRoles(event)).toEqual(["architect"]);
+    });
+
+    test("multiple group memberships are all returned as roles", () => {
+      const event = {
+        identity: { "cognito:groups": ["developer", "architect", "admin"] },
+      };
+      expect(deriveRoles(event).sort()).toEqual([
+        "admin",
+        "architect",
+        "developer",
+      ]);
+    });
+
+    test("comma-separated string groups claim is split and trimmed into roles", () => {
+      const event = { identity: { "cognito:groups": "architect, developer" } };
+      expect(deriveRoles(event)).toEqual(["architect", "developer"]);
+    });
+
+    test('honours groups at identity.claims["cognito:groups"] (proxy/IAM mode)', () => {
+      const event = {
+        identity: { claims: { "cognito:groups": ["project_manager"] } },
+      };
+      expect(deriveRoles(event)).toEqual(["project_manager"]);
+    });
+
+    test("no roles when neither claim is present", () => {
+      const event = { identity: { sub: "u1" } };
+      expect(deriveRoles(event)).toEqual([]);
+    });
+
+    test("does not duplicate 'admin' when both custom:role and group say admin", () => {
+      const event = {
+        identity: { "custom:role": "admin", "cognito:groups": ["admin"] },
+      };
+      const roles = deriveRoles(event);
+      expect(roles.filter((r) => r === "admin").length).toBe(1);
+    });
+
+    test("dedupes a group that appears twice in the claim", () => {
+      const event = {
+        identity: { "cognito:groups": ["architect", "architect"] },
+      };
+      expect(deriveRoles(event)).toEqual(["architect"]);
+    });
+  });
+
+  describe("readGroups (CIT-213 shared groups-claim reader)", () => {
+    test("returns the array shape verbatim (strings only)", () => {
+      const event = { identity: { "cognito:groups": ["admin", "developer"] } };
+      expect(readGroups(event)).toEqual(["admin", "developer"]);
+    });
+
+    test("drops non-string entries from an array claim", () => {
+      const event = {
+        identity: { "cognito:groups": ["admin", 42, null, "developer"] },
+      };
+      expect(readGroups(event)).toEqual(["admin", "developer"]);
+    });
+
+    test("splits and trims a comma-separated string, dropping empty segments", () => {
+      const event = { identity: { "cognito:groups": " admin , developer,, " } };
+      expect(readGroups(event)).toEqual(["admin", "developer"]);
+    });
+
+    test('reads identity.claims["cognito:groups"] when the direct shape is absent', () => {
+      const event = { identity: { claims: { "cognito:groups": "architect" } } };
+      expect(readGroups(event)).toEqual(["architect"]);
+    });
+
+    test("returns [] when the claim is absent, when identity is absent, and for a non-string/non-array value", () => {
+      expect(readGroups({ identity: { sub: "u1" } })).toEqual([]);
+      expect(readGroups({})).toEqual([]);
+      expect(readGroups(undefined)).toEqual([]);
+      expect(readGroups({ identity: { "cognito:groups": 7 } })).toEqual([]);
+    });
+  });
+
+  describe("hasRoleFromEvent", () => {
+    // CIT-213: the claim-compare path was deleted. A custom:role claim is
+    // never a role signal, whichever identity shape carries it.
+    test('KEY ESCALATION TEST (CIT-213): identity["custom:role"] equal to the requested role does NOT grant it', () => {
+      const event = { identity: { "custom:role": "architect" } };
+      expect(hasRoleFromEvent(event, "architect")).toBe(false);
+    });
+
+    test('KEY ESCALATION TEST (CIT-213): identity.claims["custom:role"] equal to the requested role does NOT grant it', () => {
+      const event = { identity: { claims: { "custom:role": "architect" } } };
+      expect(hasRoleFromEvent(event, "architect")).toBe(false);
+    });
+
+    test("KEY ESCALATION TEST (CIT-213): custom:role=architect with only the developer group does NOT grant architect", () => {
+      const event = {
+        identity: {
+          "custom:role": "architect",
+          "cognito:groups": ["developer"],
+        },
+      };
+      expect(hasRoleFromEvent(event, "architect")).toBe(false);
+      expect(hasRoleFromEvent(event, "developer")).toBe(true);
+    });
+
+    test("returns false when custom:role is a different role", () => {
+      const event = { identity: { "custom:role": "developer" } };
+      expect(hasRoleFromEvent(event, "architect")).toBe(false);
+    });
+
+    test("returns true when cognito:groups array contains the requested role", () => {
+      const event = { identity: { "cognito:groups": ["architect", "user"] } };
+      expect(hasRoleFromEvent(event, "architect")).toBe(true);
+    });
+
+    test("returns true when cognito:groups is a comma-separated string containing the role", () => {
+      const event = { identity: { "cognito:groups": "user,architect" } };
+      expect(hasRoleFromEvent(event, "architect")).toBe(true);
+    });
+
+    test('honours cognito:groups at identity.claims["cognito:groups"] (proxy/IAM mode)', () => {
+      const event = {
+        identity: { claims: { "cognito:groups": ["architect"] } },
+      };
+      expect(hasRoleFromEvent(event, "architect")).toBe(true);
+    });
+
+    test("returns false when neither custom:role nor cognito:groups include the role", () => {
+      const event = { identity: { "cognito:groups": ["user", "developer"] } };
+      expect(hasRoleFromEvent(event, "architect")).toBe(false);
+    });
+
+    test("returns false when event has no identity", () => {
+      expect(hasRoleFromEvent({}, "architect")).toBe(false);
+    });
+
+    test("does not treat an admin caller as holding other roles", () => {
+      const event = { identity: { "cognito:groups": ["admin"] } };
+      expect(hasRoleFromEvent(event, "architect")).toBe(false);
+    });
+  });
+
+  describe("assertRowOrg", () => {
+    test("resolves when the row orgId matches the caller server-derived org", async () => {
+      const event = { identity: { sub: "u1", "custom:organization": "org-a" } };
+      await expect(
+        assertRowOrg({ orgId: "org-a" }, event),
+      ).resolves.toBeUndefined();
+    });
+
+    test("throws CrossOrgAccessError when the row orgId differs from the caller org", async () => {
+      const event = { identity: { sub: "u1", "custom:organization": "org-a" } };
+      await expect(
+        assertRowOrg({ orgId: "org-b" }, event),
+      ).rejects.toBeInstanceOf(CrossOrgAccessError);
+    });
+
+    test("throws when the row has no orgId (fail closed, never silently allow)", async () => {
+      const event = { identity: { sub: "u1", "custom:organization": "org-a" } };
+      await expect(assertRowOrg({}, event)).rejects.toBeInstanceOf(
+        CrossOrgAccessError,
+      );
+    });
+
+    test("throws when the row is null/undefined (fail closed)", async () => {
+      const event = { identity: { sub: "u1", "custom:organization": "org-a" } };
+      await expect(assertRowOrg(undefined, event)).rejects.toBeInstanceOf(
+        CrossOrgAccessError,
+      );
+      await expect(assertRowOrg(null, event)).rejects.toBeInstanceOf(
+        CrossOrgAccessError,
+      );
+    });
+
+    test("throws when the caller org is unresolvable, even if the row has an orgId (fail closed)", async () => {
+      const event = { identity: { sub: "u1" } }; // no org claim → unresolvable (no Cognito fallback)
+      // A residual Cognito fallback would resolve an org here and break the
+      // fail-closed expectation below (decision 00d40a31: claim only).
+      cognitoMock.on(AdminGetUserCommand).resolves({
+        UserAttributes: [{ Name: "custom:organization", Value: "org-a" }],
+      });
+      await expect(
+        assertRowOrg({ orgId: "org-a" }, event),
+      ).rejects.toBeInstanceOf(CrossOrgAccessError);
+    });
+
+    test("admin bypasses the org check entirely, even for a cross-org row (group-derived admin)", async () => {
+      const event = {
+        identity: { sub: "admin-1", "cognito:groups": ["admin"] },
+      };
+      await expect(
+        assertRowOrg({ orgId: "org-completely-different" }, event),
+      ).resolves.toBeUndefined();
+    });
+
+    test("KEY ESCALATION TEST: a custom:role=admin claim WITHOUT group membership does NOT bypass the org check", async () => {
+      const event = {
+        identity: {
+          sub: "u1",
+          "custom:role": "admin",
+          "custom:organization": "org-a",
+        },
+      };
+      await expect(
+        assertRowOrg({ orgId: "org-completely-different" }, event),
+      ).rejects.toBeInstanceOf(CrossOrgAccessError);
+    });
+
+    test('CrossOrgAccessError carries the "Access denied" message used by resolvers', async () => {
+      const event = { identity: { sub: "u1", "custom:organization": "org-a" } };
+      await expect(assertRowOrg({ orgId: "org-b" }, event)).rejects.toThrow(
+        "Access denied",
+      );
+    });
+  });
+
+  // Regression coverage for finding c7beb960 (high): the frontend switched
+  // from sending the access token to the ID token on AppSync requests,
+  // because the pre-token-generation trigger's claimsOverrideDetails only
+  // decorates the ID token with custom:organization. These tests pin the
+  // claims shape AppSync produces from an ID token (as opposed to the
+  // access-token shape that was silently reaching this code before the
+  // fix) so a future regression back to access-token claims is caught here
+  // rather than only in production CloudWatch logs.
+  describe("finding c7beb960: ID-token-shaped claims", () => {
+    test("extractOrgFromEvent resolves custom:organization from an ID-token-shaped identity (token_use='id')", async () => {
+      const idTokenEvent = {
+        identity: {
+          sub: "user-123",
+          username: "user-123",
+          token_use: "id",
+          "custom:organization": "Acme Corp",
+          "cognito:groups": ["admin"],
+        },
+      };
+
+      const result = await extractOrgFromEvent(idTokenEvent);
+
+      expect(result).toBe("Acme Corp");
+      expect(cognitoMock.commandCalls(AdminGetUserCommand).length).toBe(0);
+    });
+
+    test("extractOrgFromEvent returns null for an access-token-shaped identity lacking custom:organization (documents the bug this fix prevents)", async () => {
+      // An access token never carries custom:organization — this is the
+      // exact shape that reached extractOrgFromEvent for every caller
+      // before the frontend was switched to send the ID token. There is no
+      // Cognito fallback (decision 00d40a31), so this must resolve to null
+      // (fail closed), not silently succeed.
+      const accessTokenEvent = {
+        identity: {
+          sub: "user-123",
+          username: "user-123",
+          token_use: "access",
+          scope: "aws.cognito.signin.user.admin",
+          client_id: "abc123clientid",
+          "cognito:groups": ["admin"],
+        },
+      };
+      // A residual Cognito fallback would resolve an org here and break the
+      // fail-closed expectation below (decision 00d40a31: claim only).
+      cognitoMock.on(AdminGetUserCommand).resolves({
+        UserAttributes: [{ Name: "custom:organization", Value: "org-a" }],
+      });
+
+      const result = await extractOrgFromEvent(accessTokenEvent);
+
+      expect(result).toBeNull();
+    });
+
+    test("isAdminFromEvent resolves identically for ID-token-shaped and access-token-shaped identities (cognito:groups is present on both)", () => {
+      const idTokenEvent = {
+        identity: { token_use: "id", "cognito:groups": ["admin"] },
+      };
+      const accessTokenEvent = {
+        identity: { token_use: "access", "cognito:groups": ["admin"] },
+      };
+
+      expect(isAdminFromEvent(idTokenEvent)).toBe(true);
+      expect(isAdminFromEvent(accessTokenEvent)).toBe(true);
+    });
+
+    test("deriveRoles resolves identically for ID-token-shaped and access-token-shaped admin identities", () => {
+      const idTokenEvent = {
+        identity: { token_use: "id", "cognito:groups": ["admin"] },
+      };
+      const accessTokenEvent = {
+        identity: { token_use: "access", "cognito:groups": ["admin"] },
+      };
+
+      expect(deriveRoles(idTokenEvent)).toEqual(["admin"]);
+      expect(deriveRoles(accessTokenEvent)).toEqual(["admin"]);
+    });
+  });
+
+  describe("resolveScopedOrgFromEvent (Wave-3A, board task a6ff10ff)", () => {
+    test("admin with an explicit requestedOrgId gets that org honoured", async () => {
+      const event = {
+        identity: {
+          sub: "admin-1",
+          "cognito:groups": ["admin"],
+          "custom:organization": "org-admin-home",
+        },
+      };
+      const result = await resolveScopedOrgFromEvent(event, "org-other");
+      expect(result).toEqual({ orgId: "org-other" });
+    });
+
+    test("admin with no requestedOrgId falls back to their own resolvable org", async () => {
+      const event = {
+        identity: {
+          sub: "admin-1",
+          "cognito:groups": ["admin"],
+          "custom:organization": "org-admin-home",
+        },
+      };
+      const result = await resolveScopedOrgFromEvent(event, undefined);
+      expect(result).toEqual({ orgId: "org-admin-home" });
+    });
+
+    test("admin with no requestedOrgId and no resolvable own org returns null", async () => {
+      const event = {
+        identity: { sub: "admin-1", "cognito:groups": ["admin"] },
+      };
+      // A residual Cognito fallback would resolve an org here and break the
+      // fail-closed expectation below (decision 00d40a31: claim only).
+      cognitoMock.on(AdminGetUserCommand).resolves({
+        UserAttributes: [{ Name: "custom:organization", Value: "org-a" }],
+      });
+      const result = await resolveScopedOrgFromEvent(event, undefined);
+      expect(result).toBeNull();
+    });
+
+    test("non-admin caller ignoring a client-supplied requestedOrgId gets their own caller org", async () => {
+      const event = {
+        identity: { sub: "u1", "custom:organization": "org-real" },
+      };
+      const result = await resolveScopedOrgFromEvent(event, "org-victim");
+      expect(result).toEqual({ orgId: "org-real" });
+    });
+
+    test("non-admin caller with no requestedOrgId gets their own caller org", async () => {
+      const event = {
+        identity: { sub: "u1", "custom:organization": "org-real" },
+      };
+      const result = await resolveScopedOrgFromEvent(event, undefined);
+      expect(result).toEqual({ orgId: "org-real" });
+    });
+
+    test("non-admin caller with an unresolvable org returns null (never forwards the client value)", async () => {
+      const event = { identity: { sub: "u1" } };
+      // A residual Cognito fallback would resolve an org here and break the
+      // fail-closed expectation below (decision 00d40a31: claim only).
+      cognitoMock.on(AdminGetUserCommand).resolves({
+        UserAttributes: [{ Name: "custom:organization", Value: "org-a" }],
+      });
+      const result = await resolveScopedOrgFromEvent(event, "org-victim");
+      expect(result).toBeNull();
+    });
+
+    test("KEY ESCALATION TEST: custom:role=admin without group membership is treated as non-admin (own org, client value ignored)", async () => {
+      const event = {
+        identity: {
+          sub: "u1",
+          "custom:role": "admin",
+          "custom:organization": "org-real",
+        },
+      };
+      const result = await resolveScopedOrgFromEvent(event, "org-victim");
+      expect(result).toEqual({ orgId: "org-real" });
+    });
+  });
+
+  describe("canCallerSeeRow (Wave-3A, mirrors governance-ui callerCanSeeRow)", () => {
+    test("admin sees any row, even cross-org and un-stamped, and never throws", async () => {
+      const event = {
+        identity: { sub: "admin-1", "cognito:groups": ["admin"] },
+      };
+      await expect(
+        canCallerSeeRow({ orgId: "org-other" }, event),
+      ).resolves.toBe(true);
+      await expect(canCallerSeeRow({}, event)).resolves.toBe(true);
+    });
+
+    test("non-admin sees a row whose orgId matches their caller org", async () => {
+      const event = {
+        identity: { sub: "u1", "custom:organization": "org-a" },
+      };
+      await expect(canCallerSeeRow({ orgId: "org-a" }, event)).resolves.toBe(
+        true,
+      );
+    });
+
+    test("non-admin does not see a cross-org row", async () => {
+      const event = {
+        identity: { sub: "u1", "custom:organization": "org-a" },
+      };
+      await expect(canCallerSeeRow({ orgId: "org-b" }, event)).resolves.toBe(
+        false,
+      );
+    });
+
+    test("returns false (never throws) for an un-stamped row with no orgId", async () => {
+      const event = {
+        identity: { sub: "u1", "custom:organization": "org-a" },
+      };
+      await expect(canCallerSeeRow({}, event)).resolves.toBe(false);
+      await expect(canCallerSeeRow(null, event)).resolves.toBe(false);
+      await expect(canCallerSeeRow(undefined, event)).resolves.toBe(false);
+    });
+
+    test("returns false when the caller org is unresolvable, even though the row has an orgId (fail closed)", async () => {
+      const event = { identity: { sub: "u1" } };
+      // A residual Cognito fallback would resolve an org here and break the
+      // fail-closed expectation below (decision 00d40a31: claim only).
+      cognitoMock.on(AdminGetUserCommand).resolves({
+        UserAttributes: [{ Name: "custom:organization", Value: "org-a" }],
+      });
+      await expect(canCallerSeeRow({ orgId: "org-a" }, event)).resolves.toBe(
+        false,
+      );
+    });
+
+    test("KEY ESCALATION TEST: custom:role=admin without group membership does not bypass the org check", async () => {
+      const event = {
+        identity: {
+          sub: "u1",
+          "custom:role": "admin",
+          "custom:organization": "org-a",
+        },
+      };
+      await expect(
+        canCallerSeeRow({ orgId: "org-completely-different" }, event),
+      ).resolves.toBe(false);
+    });
+  });
+});

@@ -1,0 +1,295 @@
+import { runIamEquivalence } from "../../scripts/split-gates/rails/rail6-iam-equivalence";
+import {
+  StackBaseline,
+  NormalizedPolicyStatement,
+} from "../../scripts/split-gates/types";
+
+function stmt(
+  actions: string[],
+  resources: string[],
+  effect = "Allow",
+): NormalizedPolicyStatement {
+  return {
+    effect,
+    actions: [...actions].sort(),
+    resources: [...resources].sort(),
+    conditionKeys: [],
+  };
+}
+
+function makeBaseline(
+  lambdaRolePolicies: Record<string, NormalizedPolicyStatement[]>,
+): StackBaseline {
+  return {
+    stackName: "citadel-backend-dev",
+    capturedAt: new Date().toISOString(),
+    resources: {},
+    resolvers: {},
+    dataSources: {},
+    lambdaRolePolicies,
+    exports: {},
+  };
+}
+
+describe("rail 6 — IAM privilege-equivalence (positive)", () => {
+  it("passes trivially with an empty move manifest", () => {
+    const baseline = makeBaseline({});
+    const result = runIamEquivalence(baseline, {}, []);
+    expect(result.passed).toBe(true);
+    expect(result.violations).toHaveLength(0);
+  });
+
+  it("passes when the satellite role's statements are an exact subset of baseline", () => {
+    const baseline = makeBaseline({
+      RegistryAgentRecordResolverFn: [
+        stmt(
+          ["dynamodb:GetItem", "dynamodb:PutItem"],
+          ["arn:aws:dynamodb:*:*:table/citadel-apps-dev"],
+        ),
+      ],
+    });
+    const result = runIamEquivalence(
+      baseline,
+      {
+        RegistryAgentRecordResolverFnSat: [
+          stmt(
+            ["dynamodb:GetItem"],
+            ["arn:aws:dynamodb:*:*:table/citadel-apps-dev"],
+          ),
+        ],
+      },
+      [
+        {
+          baselineLogicalId: "RegistryAgentRecordResolverFn",
+          satelliteLogicalId: "RegistryAgentRecordResolverFnSat",
+          satelliteStackName: "citadel-registry-dev",
+        },
+      ],
+    );
+    expect(result.passed).toBe(true);
+  });
+
+  it("CIT-125 slice A: passes when the added statement matches an allowed-added-statement entry for that satellite logical ID", () => {
+    const baseline = makeBaseline({
+      DesignProgressNotifier61A5E671: [
+        stmt(["appsync:GraphQL"], ["arn:aws:appsync:*:*:apis/x/types/*"]),
+      ],
+    });
+    const result = runIamEquivalence(
+      baseline,
+      {
+        DesignProgressNotifier61A5E671: [
+          stmt(["appsync:GraphQL"], ["arn:aws:appsync:*:*:apis/x/types/*"]),
+          stmt(["sqs:SendMessage"], ["citadel-projects-async-dlq"]),
+        ],
+      },
+      [
+        {
+          baselineLogicalId: "DesignProgressNotifier61A5E671",
+          satelliteLogicalId: "DesignProgressNotifier61A5E671",
+          satelliteStackName: "citadel-projects-dev",
+        },
+      ],
+      {
+        DesignProgressNotifier61A5E671: [
+          stmt(["sqs:SendMessage"], ["citadel-projects-async-dlq"]),
+        ],
+      },
+    );
+    expect(result.passed).toBe(true);
+    expect(result.violations).toHaveLength(0);
+  });
+
+  it("CIT-125 slice A: any OTHER broadening on an allowlisted satellite still violates", () => {
+    const baseline = makeBaseline({
+      DesignProgressNotifier61A5E671: [
+        stmt(["appsync:GraphQL"], ["arn:aws:appsync:*:*:apis/x/types/*"]),
+      ],
+    });
+    const result = runIamEquivalence(
+      baseline,
+      {
+        DesignProgressNotifier61A5E671: [
+          stmt(["appsync:GraphQL"], ["arn:aws:appsync:*:*:apis/x/types/*"]),
+          stmt(["sqs:SendMessage"], ["citadel-projects-async-dlq"]),
+          // Not allowlisted — an unrelated broadening slipped in.
+          stmt(["dynamodb:DeleteItem"], ["arn:aws:dynamodb:*:*:table/x"]),
+        ],
+      },
+      [
+        {
+          baselineLogicalId: "DesignProgressNotifier61A5E671",
+          satelliteLogicalId: "DesignProgressNotifier61A5E671",
+          satelliteStackName: "citadel-projects-dev",
+        },
+      ],
+      {
+        DesignProgressNotifier61A5E671: [
+          stmt(["sqs:SendMessage"], ["citadel-projects-async-dlq"]),
+        ],
+      },
+    );
+    expect(result.passed).toBe(false);
+    expect(
+      result.violations.some((v) => v.message.includes("dynamodb:DeleteItem")),
+    ).toBe(true);
+  });
+});
+
+describe("rail 6 — IAM privilege-equivalence (negative: doctored broadened statement must FAIL correctly)", () => {
+  it("FAILS when the satellite role adds an action not present in baseline", () => {
+    const baseline = makeBaseline({
+      AgentImportResolverFn: [
+        stmt(
+          ["secretsmanager:GetSecretValue"],
+          ["arn:aws:secretsmanager:*:*:secret:citadel/agent-import/*"],
+        ),
+      ],
+    });
+    const result = runIamEquivalence(
+      baseline,
+      {
+        AgentImportResolverFnSat: [
+          stmt(
+            ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"],
+            ["arn:aws:secretsmanager:*:*:secret:citadel/agent-import/*"],
+          ),
+        ],
+      },
+      [
+        {
+          baselineLogicalId: "AgentImportResolverFn",
+          satelliteLogicalId: "AgentImportResolverFnSat",
+          satelliteStackName: "citadel-registry-dev",
+        },
+      ],
+    );
+    expect(result.passed).toBe(false);
+    expect(
+      result.violations.some(
+        (v) =>
+          v.logicalId === "AgentImportResolverFnSat" &&
+          /not covered by the baseline/.test(v.message),
+      ),
+    ).toBe(true);
+  });
+
+  it("FAILS when the satellite role widens Resource from a scoped ARN to a wildcard", () => {
+    const baseline = makeBaseline({
+      AgentImportResolverFn: [
+        stmt(
+          ["sts:AssumeRole"],
+          ["arn:aws:iam::123456789012:role/citadel-import-scoped"],
+        ),
+      ],
+    });
+    const result = runIamEquivalence(
+      baseline,
+      {
+        AgentImportResolverFnSat: [stmt(["sts:AssumeRole"], ["*"])],
+      },
+      [
+        {
+          baselineLogicalId: "AgentImportResolverFn",
+          satelliteLogicalId: "AgentImportResolverFnSat",
+          satelliteStackName: "citadel-registry-dev",
+        },
+      ],
+    );
+    expect(result.passed).toBe(false);
+    expect(
+      result.violations.some((v) => v.logicalId === "AgentImportResolverFnSat"),
+    ).toBe(true);
+  });
+
+  it("FAILS when no baseline policy exists for the mapped Lambda", () => {
+    const baseline = makeBaseline({});
+    const result = runIamEquivalence(
+      baseline,
+      { SomeSatFn: [stmt(["dynamodb:Query"], ["*"])] },
+      [
+        {
+          baselineLogicalId: "MissingBaselineFn",
+          satelliteLogicalId: "SomeSatFn",
+          satelliteStackName: "citadel-registry-dev",
+        },
+      ],
+    );
+    expect(result.passed).toBe(false);
+    expect(
+      result.violations.some((v) => v.logicalId === "MissingBaselineFn"),
+    ).toBe(true);
+  });
+
+  // Regression test for finding ef02d366: a manifest entry whose
+  // satelliteLogicalId is absent from the satellite-derived
+  // lambdaRolePolicies map (e.g. because the satellite template was
+  // synthesized stale, or the moved Lambda's construct ID drifted) must
+  // FAIL LOUD naming the missing entry — it must NEVER be treated as "zero
+  // statements, therefore trivially covered" and pass. This simulates
+  // removing one manifest entry's logical ID from a fixture template: the
+  // satelliteLambdaPolicies map here plays the role of "what was actually
+  // found by parsing the satellite templates", and
+  // AgentImportResolverFnSat is simply never populated in it — as if its
+  // template were stale/missing the moved Lambda.
+  it("FAILS LOUD when a manifest entry's satellite logical ID is entirely absent from the satellite templates (finding ef02d366 regression)", () => {
+    const baseline = makeBaseline({
+      AgentImportResolverFn: [
+        stmt(
+          ["secretsmanager:GetSecretValue"],
+          ["arn:aws:secretsmanager:*:*:secret:citadel/agent-import/*"],
+        ),
+      ],
+      RegistryAgentRecordResolverFn: [
+        stmt(
+          ["dynamodb:GetItem"],
+          ["arn:aws:dynamodb:*:*:table/citadel-apps-dev"],
+        ),
+      ],
+    });
+    // Only RegistryAgentRecordResolverFnSat was found in the (fixture)
+    // satellite templates — AgentImportResolverFnSat is completely absent,
+    // simulating a manifest entry that got "lost" (e.g. stale dist/synth or
+    // a construct-ID drift), NOT a Lambda with zero IAM statements.
+    const satelliteLambdaPolicies: Record<string, NormalizedPolicyStatement[]> =
+      {
+        RegistryAgentRecordResolverFnSat: [
+          stmt(
+            ["dynamodb:GetItem"],
+            ["arn:aws:dynamodb:*:*:table/citadel-apps-dev"],
+          ),
+        ],
+      };
+    const result = runIamEquivalence(baseline, satelliteLambdaPolicies, [
+      {
+        baselineLogicalId: "AgentImportResolverFn",
+        satelliteLogicalId: "AgentImportResolverFnSat",
+        satelliteStackName: "citadel-registry-dev",
+      },
+      {
+        baselineLogicalId: "RegistryAgentRecordResolverFn",
+        satelliteLogicalId: "RegistryAgentRecordResolverFnSat",
+        satelliteStackName: "citadel-registry-dev",
+      },
+    ]);
+    expect(result.passed).toBe(false);
+    // Names the missing entry explicitly rather than silently contributing
+    // zero violations for it.
+    expect(
+      result.violations.some(
+        (v) =>
+          v.logicalId === "AgentImportResolverFnSat" &&
+          /NOT FOUND/.test(v.message) &&
+          /AgentImportResolverFn/.test(v.message),
+      ),
+    ).toBe(true);
+    // The found entry must still pass on its own merits — this proves the
+    // fix doesn't just fail everything, it correctly isolates the missing
+    // entry.
+    expect(
+      result.violations.some(
+        (v) => v.logicalId === "RegistryAgentRecordResolverFnSat",
+      ),
+    ).toBe(false);
+  });
+});

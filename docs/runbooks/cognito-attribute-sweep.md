@@ -1,0 +1,125 @@
+# Runbook: Cognito custom-attribute sweep
+
+Script: `backend/scripts/audit-cognito-custom-attributes.ts`
+(`npm run audit:cognito-custom-attributes`). Ticket CIT-210, finding 7aa877f8.
+
+## Purpose
+
+Until commit `1c025bc` the user pool client had no `WriteAttributes` allow-list,
+so any signed-in user could write `custom:role=admin` or an arbitrary
+`custom:organization` on their own record. Commit `39b2de8` made admin
+determination group-only and the pre-token trigger now drops an unearned
+`custom:role=admin` claim, so a poisoned attribute no longer grants anything.
+Stale values may still be stored in the pool. This sweep finds them and, on
+request, cleans them up.
+
+Findings:
+
+| Kind                | Meaning                                                                                                                                                                                                                                                        | `--apply` action                                                                                                                         |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `ROLE_MISMATCH`     | `custom:role` set but user is not in a group of that name (includes `admin` without the `admin` group)                                                                                                                                                         | one group: set `custom:role` to it; no groups: delete `custom:role`; several groups: manual                                              |
+| `ORG_UNKNOWN`       | `custom:organization` is not a live organisation name                                                                                                                                                                                                          | delete `custom:organization`                                                                                                             |
+| `ORG_MISSING`       | user is in a group but has no `custom:organization`                                                                                                                                                                                                            | manual (assign via `assignUserRole`)                                                                                                     |
+| `ORG_NO_MEMBERSHIP` | `custom:organization` is a live org name but the user has no row in the `UserOrgMembership` table, so their next token will carry no org claim (decision 00d40a31). Only evaluated when `USER_ORG_MEMBERSHIP_TABLE` is set; not raised for `ORG_UNKNOWN` users | manual: run `npm run backfill:user-org-membership -- --apply` (see `user-org-membership-backfill.md`), or re-assign via `assignUserRole` |
+
+Every modified user is signed out (`AdminUserGlobalSignOut`) so the next login
+re-mints claims. Groups are never added or removed. Only `username` and `sub`
+are printed or exported. `ListUsers` is called without `AttributesToGet`
+(Cognito rejects `custom:` names there), so each page carries the full
+attribute record; the script projects `sub`, `custom:role` and
+`custom:organization` immediately and discards the rest, so email is never
+retained, logged, or exported.
+
+Flags: none (dry-run, the default), `--dry-run` (explicit alias for the
+default; cannot be combined with `--apply`), `--apply`, `--out FILE` (write the
+JSON export to FILE, atomically and only after the run completes), `--json`
+(JSON only on stdout).
+
+Exit codes: `0` no findings (or all remediated), `3` findings remain, `1` a
+write failed or a fatal error.
+
+## Prerequisites
+
+- AWS credentials for the target account with `cognito-idp:ListUsers`,
+  `AdminListGroupsForUser`, `AdminUpdateUserAttributes`,
+  `AdminDeleteUserAttributes`, `AdminUserGlobalSignOut` on the pool and
+  `dynamodb:Scan` on the organisations table. Read-only credentials suffice
+  for dry-run.
+- Env: `USER_POOL_ID`, `ORGANISATION_TABLE`, optional `AWS_REGION`
+  (default `us-west-2`), optional `USER_ORG_MEMBERSHIP_TABLE` (enables the
+  `ORG_NO_MEMBERSHIP` check; needs `dynamodb:GetItem` on that table and costs
+  one read per user with an attribute). `USER_POOL_ID` is in
+  `cdk-outputs.json` under `citadel-backend-dev`; the table names are the
+  `ORGANISATION_TABLE` / `USER_ORG_MEMBERSHIP_TABLE` env of the
+  `user-management-resolver` Lambda (`aws lambda get-function-configuration`).
+- `cd backend && npm ci`.
+
+## Confirm the environment carries both fixes first
+
+Running `--apply` against a pool whose client still allows self-writes only
+cleans up until the next self-write. Check each environment:
+
+1. Read the deployed sha from the `GitSha` stack tag (set by `deploy.sh` on
+   every stack; see "Deployment provenance" in `docs/DEPLOYMENT.md`):
+   ```bash
+   deployed_sha=$(aws cloudformation describe-stacks --stack-name citadel-backend-<env> \
+     --query "Stacks[0].Tags[?Key=='GitSha'].Value" --output text)
+   ```
+   If the tag is missing or reads `unknown` (stack last deployed before the tag
+   existed, or outside `deploy.sh`), fall back to the provenance manifest
+   written by `deploy.sh` (`deployment-manifest.json` at the repo root of the
+   clone that deployed, field `git_full_sha`/`git_sha`; gitignored, so read it
+   on the deploy host). As a last resort use the CloudFormation deploy
+   timestamp as a weaker signal: `aws cloudformation describe-stacks
+   --stack-name citadel-backend-<env> --query 'Stacks[0].LastUpdatedTime'` must
+   be after the commit dates of `1c025bc` and `39b2de8`
+   (`git show -s --format=%ci <sha>`).
+2. Verify the deployed sha contains both commits:
+   ```bash
+   git merge-base --is-ancestor 1c025bc <deployed_sha> && echo "1c025bc: ok"
+   git merge-base --is-ancestor 39b2de8 <deployed_sha> && echo "39b2de8: ok"
+   ```
+3. Cross-check live: `aws cognito-idp describe-user-pool-client --user-pool-id
+$USER_POOL_ID --client-id <id> --query 'UserPoolClient.WriteAttributes'`
+   must list only `email`, `given_name`, `family_name`.
+
+## Procedure
+
+```bash
+cd backend
+export AWS_PROFILE=<profile> USER_POOL_ID=<pool> ORGANISATION_TABLE=<table>
+export USER_ORG_MEMBERSHIP_TABLE=<membership table>   # optional; enables ORG_NO_MEMBERSHIP
+
+# 1. Dry-run and keep an export (this is your rollback record).
+#    Use --out, not `--json > file`: --out writes the file only after the
+#    audit completed, so a failed run (exit 1) leaves no file at all. A shell
+#    redirect would leave a 0-byte file that looks like an export.
+npm run audit:cognito-custom-attributes -- --dry-run --out cognito-audit-$(date -u +%Y%m%dT%H%M%SZ).json
+npm run audit:cognito-custom-attributes            # human-readable table
+
+# 2. Review ROLE_MISMATCH rows with several groups and every ORG_MISSING row;
+#    these are not auto-fixed. Fix them through the admin UI / assignUserRole.
+#    ORG_NO_MEMBERSHIP rows are fixed by the membership backfill, not here:
+#    npm run backfill:user-org-membership -- --apply
+
+# 3. Apply.
+npm run audit:cognito-custom-attributes -- --apply
+
+# 4. Re-run dry-run; expect exit 0, or exit 3 listing only manual items.
+npm run audit:cognito-custom-attributes
+```
+
+If step 1 exits `1`, no export file exists; do not proceed to step 3 until the
+dry-run completes.
+
+Affected users are signed out and must log in again.
+
+## Rollback
+
+Deleted attribute values are not recoverable from Cognito. The `--out` export
+from step 1 holds the previous `custom:role` / `custom:organization` for every
+finding; restore an individual value with
+`aws cognito-idp admin-update-user-attributes --user-pool-id $USER_POOL_ID
+--username <username> --user-attributes Name=custom:organization,Value=<value>`
+only after confirming the value is a live organisation name. Do not skip the
+export.

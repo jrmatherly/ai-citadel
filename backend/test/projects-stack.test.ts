@@ -1,0 +1,434 @@
+/**
+ * ProjectsStack — backend-stack-split phase 1 (decision 30e6d067).
+ *
+ * Asserts:
+ * - the satellite's resolver count (23, matching the move manifest)
+ * - JWT-free: satellites don't own auth — ProjectsStack must not define any
+ *   Cognito UserPool/Client/authorizer resources (BackendStack owns auth;
+ *   this satellite only consumes the pool ARN for AdminGetUser).
+ * - role least-privilege spot checks (project resolver's Cognito grant is
+ *   scoped to the single userPoolArn, not Resource::*).
+ * - cdk-nag suppression parity: the policy shapes match the categories
+ *   bin/app.ts's shared appLambdaSuppressions block covers (no new
+ *   suppression categories introduced by this satellite).
+ */
+import * as cdk from "aws-cdk-lib";
+import { Template, Match } from "aws-cdk-lib/assertions";
+import * as appsync from "aws-cdk-lib/aws-appsync";
+import * as cognito from "aws-cdk-lib/aws-cognito";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+import * as events from "aws-cdk-lib/aws-events";
+import * as sns from "aws-cdk-lib/aws-sns";
+import { Bucket } from "aws-cdk-lib/aws-s3";
+import * as path from "path";
+import { scaffoldBackendAssetDirs } from "./helpers/scaffold-stub-assets";
+import { assertSharedAsyncDlqShape } from "./helpers/shared-dlq-shape";
+
+scaffoldBackendAssetDirs(["dist/lambda", "src/schema"]);
+
+import { ProjectsStack } from "../lib/projects-stack";
+
+// Minimal CloudFormation resource shapes for template assertions (avoids
+// explicit `any` — enforced by lint-staged's --max-warnings 0).
+type PolicyStmtLike = { Action?: string | string[]; Resource?: unknown };
+type CfnPolicyLike = {
+  Properties?: { PolicyDocument?: { Statement?: PolicyStmtLike[] } };
+};
+type CfnRoleLike = { Properties?: { ManagedPolicyArns?: unknown } };
+
+function createFixture(app: cdk.App) {
+  const backendStack = new cdk.Stack(app, "MockBackendStack", {
+    env: { account: "123456789012", region: "us-east-1" },
+  });
+
+  const agentEventBus = new events.EventBus(backendStack, "AgentEventBus", {
+    eventBusName: "citadel-agents-test",
+  });
+
+  const appSyncApi = new appsync.GraphqlApi(backendStack, "MockApi", {
+    name: "mock-api",
+    schema: appsync.SchemaFile.fromAsset(
+      path.resolve(__dirname, "../src/schema/schema.graphql"),
+    ),
+  });
+
+  const projectsTable = new dynamodb.Table(backendStack, "ProjectsTable", {
+    tableName: "citadel-projects-test",
+    partitionKey: { name: "projectId", type: dynamodb.AttributeType.STRING },
+    billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+  });
+
+  const conversationsTable = new dynamodb.Table(
+    backendStack,
+    "ConversationsTable",
+    {
+      tableName: "citadel-conversations-test",
+      partitionKey: {
+        name: "conversationId",
+        type: dynamodb.AttributeType.STRING,
+      },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  const agentStatusTable = new dynamodb.Table(
+    backendStack,
+    "AgentStatusTable",
+    {
+      tableName: "citadel-agent-status-test",
+      partitionKey: { name: "projectId", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "agentId", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  const idempotencyTable = new dynamodb.Table(
+    backendStack,
+    "IdempotencyTable",
+    {
+      tableName: "citadel-idempotency-test",
+      partitionKey: { name: "eventId", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  const adrsTable = new dynamodb.Table(backendStack, "AdrsTable", {
+    tableName: "citadel-adrs-test",
+    partitionKey: { name: "adrId", type: dynamodb.AttributeType.STRING },
+    billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+  });
+
+  const executionSpecificationsTable = new dynamodb.Table(
+    backendStack,
+    "ExecutionSpecificationsTable",
+    {
+      tableName: "citadel-execution-specifications-test",
+      partitionKey: { name: "specId", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  const agentDesignAssessmentsTable = new dynamodb.Table(
+    backendStack,
+    "AgentDesignAssessmentsTable",
+    {
+      tableName: "citadel-agent-design-assessments-test",
+      partitionKey: {
+        name: "assessmentId",
+        type: dynamodb.AttributeType.STRING,
+      },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    },
+  );
+
+  const documentBucket = new Bucket(backendStack, "DocumentBucket", {
+    bucketName: "citadel-documents-test",
+  });
+
+  const userPool = new cognito.UserPool(backendStack, "UserPool", {
+    userPoolName: "citadel-test-pool",
+  });
+
+  const alarmTopic = new sns.Topic(backendStack, "AlarmTopic", {
+    topicName: "citadel-alarms-test",
+  });
+
+  const userOrgMembershipTable = new dynamodb.Table(
+    backendStack,
+    "UserOrgMembershipTable",
+    {
+      tableName: "citadel-user-org-membership-test",
+      partitionKey: { name: "sub", type: dynamodb.AttributeType.STRING },
+    },
+  );
+
+  return {
+    appSyncApi,
+    agentEventBus,
+    projectsTable,
+    conversationsTable,
+    agentStatusTable,
+    documentBucket,
+    idempotencyTable,
+    adrsTable,
+    executionSpecificationsTable,
+    agentDesignAssessmentsTable,
+    userPool,
+    alarmTopic,
+    userOrgMembershipTable,
+  };
+}
+
+function createTestStack(): { stack: ProjectsStack; template: Template } {
+  const app = new cdk.App();
+  const fixture = createFixture(app);
+
+  const stack = new ProjectsStack(app, "TestProjectsStack", {
+    env: { account: "123456789012", region: "us-east-1" },
+    environment: "test",
+    ...fixture,
+  });
+
+  const template = Template.fromStack(stack);
+  return { stack, template };
+}
+
+describe("ProjectsStack — backend-stack-split phase 1", () => {
+  let template: Template;
+
+  beforeAll(() => {
+    ({ template } = createTestStack());
+  });
+
+  // --- Resolver count ---
+  test("defines exactly 27 AppSync resolvers (matching the move manifest + updateAgentStatus, finding 0018a6d7, + wave-2a OnChatterSubscriptionAuthorizerResolver, finding 87a171ad, + OnDesignProgressSubscriptionAuthorizerResolver, finding 195b2a58, + RecordIntakeConsentResolver)", () => {
+    const resolvers = template.findResources("AWS::AppSync::Resolver");
+    expect(Object.keys(resolvers)).toHaveLength(27);
+  });
+
+  test("defines exactly 13 AppSync Lambda data sources", () => {
+    const dataSources = template.findResources("AWS::AppSync::DataSource", {
+      Properties: Match.objectLike({ Type: "AWS_LAMBDA" }),
+    });
+    expect(Object.keys(dataSources)).toHaveLength(13);
+  });
+
+  const expectedFields: Array<[string, string]> = [
+    ["Query", "getProject"],
+    ["Query", "listProjects"],
+    ["Mutation", "createProject"],
+    ["Mutation", "updateProject"],
+    ["Mutation", "uploadDocument"],
+    ["Query", "getAgentStatus"],
+    ["Mutation", "updateAgentStatus"],
+    ["Query", "getConversationHistory"],
+    ["Mutation", "sendMessage"],
+    ["Mutation", "publishConversationMessage"],
+    ["Mutation", "sendMessageToAgent"],
+    ["Mutation", "generateDocumentUploadUrl"],
+    ["Query", "getDocumentIngestionStatus"],
+    ["Query", "listProjectDocuments"],
+    ["Mutation", "deleteDocument"],
+    ["Query", "getProjectDocument"],
+    ["Query", "listDocumentVersions"],
+    ["Query", "getDocumentVersion"],
+    ["Mutation", "generateDocumentPdf"],
+    ["Mutation", "publishChatter"],
+    ["Mutation", "publishAssessmentCompletion"],
+    ["Query", "getAssessmentProgress"],
+    ["Mutation", "recordIntakeConsent"],
+    ["Mutation", "publishDesignProgress"],
+    ["Subscription", "onDesignProgress"],
+    ["Query", "generateReportDownloadUrl"],
+  ];
+
+  test.each(expectedFields)(
+    "attaches a resolver for %s.%s",
+    (typeName, fieldName) => {
+      template.hasResourceProperties("AWS::AppSync::Resolver", {
+        TypeName: typeName,
+        FieldName: fieldName,
+      });
+    },
+  );
+
+  // --- Finding 0018a6d7: updateAgentStatus wired onto the SAME datasource
+  // as its sibling getAgentStatus (both on agent-resolver.ts) ---
+  test("Mutation.updateAgentStatus is attached to the same datasource as Query.getAgentStatus", () => {
+    const resolvers = template.findResources("AWS::AppSync::Resolver");
+    const getStatus = Object.values(resolvers).filter(
+      (r) =>
+        (r as { Properties: { FieldName: string } }).Properties.FieldName ===
+        "getAgentStatus",
+    );
+    const updateStatus = Object.values(resolvers).filter(
+      (r) =>
+        (r as { Properties: { FieldName: string } }).Properties.FieldName ===
+        "updateAgentStatus",
+    );
+    expect(getStatus).toHaveLength(1);
+    expect(updateStatus).toHaveLength(1);
+    expect(
+      (updateStatus[0] as { Properties: { DataSourceName: unknown } })
+        .Properties.DataSourceName,
+    ).toEqual(
+      (getStatus[0] as { Properties: { DataSourceName: unknown } }).Properties
+        .DataSourceName,
+    );
+  });
+
+  // --- JWT-free: satellites don't own auth ---
+  test("does not define any Cognito UserPool (auth stays in BackendStack)", () => {
+    const pools = template.findResources("AWS::Cognito::UserPool");
+    expect(Object.keys(pools)).toHaveLength(0);
+  });
+
+  test("does not define any Cognito UserPoolClient", () => {
+    const clients = template.findResources("AWS::Cognito::UserPoolClient");
+    expect(Object.keys(clients)).toHaveLength(0);
+  });
+
+  test("does not define any AppSync GraphQLApi (attaches to BackendStack's API, doesn't own one)", () => {
+    const apis = template.findResources("AWS::AppSync::GraphQLApi");
+    expect(Object.keys(apis)).toHaveLength(0);
+  });
+
+  // --- Role least-privilege spot checks ---
+  test("project resolver's Cognito grant is scoped to the userPoolArn, not Resource::*", () => {
+    const policies = template.findResources("AWS::IAM::Policy", {
+      Properties: Match.objectLike({
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: "cognito-idp:AdminGetUser",
+            }),
+          ]),
+        },
+      }),
+    });
+    const matches = Object.values(policies);
+    expect(matches.length).toBeGreaterThan(0);
+    for (const policy of matches) {
+      const statements =
+        (policy as CfnPolicyLike).Properties?.PolicyDocument?.Statement ?? [];
+      const cognitoStmt = statements.find(
+        (s) => s.Action === "cognito-idp:AdminGetUser",
+      );
+      expect(cognitoStmt?.Resource).not.toBe("*");
+    }
+  });
+
+  test("document-upload resolver's Bedrock KB actions are scoped to the knowledge base ARN (not '*')", () => {
+    const policies = template.findResources("AWS::IAM::Policy", {
+      Properties: Match.objectLike({
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: [
+                "bedrock:GetKnowledgeBaseDocuments",
+                "bedrock:DeleteKnowledgeBaseDocuments",
+              ],
+            }),
+          ]),
+        },
+      }),
+    });
+    const policyEntries = Object.values(policies);
+    expect(policyEntries.length).toBeGreaterThan(0);
+
+    for (const policy of policyEntries) {
+      const statements =
+        (policy as CfnPolicyLike).Properties?.PolicyDocument?.Statement ?? [];
+      const kbStmt = statements.find((s) => {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        return actions.includes("bedrock:GetKnowledgeBaseDocuments");
+      });
+      expect(kbStmt).toBeDefined();
+      // Resource must be the KB ARN built via Fn::Join with the SSM token —
+      // NOT a bare '*'.
+      const resource = kbStmt!.Resource;
+      expect(resource).not.toBe("*");
+      // The resource is a Fn::Join that assembles the KB ARN from the
+      // SSM-resolved token; verify the join prefix contains the KB ARN
+      // pattern.
+      const join = resource as { "Fn::Join"?: [string, string[]] };
+      expect(join["Fn::Join"]).toBeDefined();
+      const joinParts = join["Fn::Join"]![1];
+      const joinStr = joinParts.join("");
+      expect(joinStr).toContain("arn:aws:bedrock:");
+      expect(joinStr).toContain(":knowledge-base/");
+    }
+  });
+
+  test("no IAM policy statement grants a full-service wildcard action (iam:*, dynamodb:*, or s3:*)", () => {
+    const policies = template.findResources("AWS::IAM::Policy");
+    for (const policy of Object.values(policies)) {
+      const statements = (policy as CfnPolicyLike).Properties?.PolicyDocument
+        ?.Statement;
+      if (!Array.isArray(statements)) continue;
+      for (const stmt of statements) {
+        const actions = Array.isArray(stmt.Action)
+          ? stmt.Action
+          : [stmt.Action];
+        for (const action of actions) {
+          if (typeof action !== "string") continue;
+          expect(["iam:*", "dynamodb:*", "s3:*"]).not.toContain(action);
+        }
+      }
+    }
+  });
+
+  // --- moved constructs present ---
+  test("defines exactly 17 Lambda functions (the moved set + DesignProgressSubscriptionAuthorizerFunction, finding 195b2a58, + IntakeConsentResolverFunction)", () => {
+    const fns = template.findResources("AWS::Lambda::Function");
+    expect(Object.keys(fns)).toHaveLength(17);
+  });
+
+  test("defines exactly 2 CloudWatch alarms (ProjectResolver error + throttle)", () => {
+    const alarms = template.findResources("AWS::CloudWatch::Alarm");
+    expect(Object.keys(alarms)).toHaveLength(2);
+  });
+
+  test("defines exactly 4 EventBridge rules (Chatter, ProgressUpdate, AssessmentCompletion, DesignProgress)", () => {
+    const rules = template.findResources("AWS::Events::Rule");
+    expect(Object.keys(rules)).toHaveLength(4);
+  });
+
+  // --- cdk-nag suppression parity ---
+  test("every Lambda execution role assumes lambda.amazonaws.com with a ManagedPolicyArns array (matches the app-level IAM4 suppression category)", () => {
+    const roles = template.findResources("AWS::IAM::Role", {
+      Properties: Match.objectLike({
+        AssumeRolePolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Principal: { Service: "lambda.amazonaws.com" },
+            }),
+          ]),
+        }),
+      }),
+    });
+    const lambdaRoles = Object.values(roles);
+    expect(lambdaRoles.length).toBeGreaterThan(0);
+    for (const role of lambdaRoles) {
+      const managedArns = (role as CfnRoleLike).Properties?.ManagedPolicyArns;
+      expect(Array.isArray(managedArns)).toBe(true);
+    }
+  });
+
+  test("every AppSync data source service role assumes appsync.amazonaws.com only (no other principal)", () => {
+    const roles = template.findResources("AWS::IAM::Role", {
+      Properties: Match.objectLike({
+        AssumeRolePolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Principal: { Service: "appsync.amazonaws.com" },
+            }),
+          ]),
+        }),
+      }),
+    });
+    // 13 Lambda data sources -> 13 appsync-assumable roles.
+    expect(Object.keys(roles)).toHaveLength(13);
+  });
+});
+
+// CIT-125 slice A follow-up (design A.6 #6, deferred from the feature PR
+// per the slice-A verification advisory): shared async DLQ queue shape,
+// asserted against this file's existing Template.fromStack harness.
+describe("ProjectsStack — CIT-125 slice A shared async DLQ shape", () => {
+  let template: Template;
+  beforeAll(() => {
+    ({ template } = createTestStack());
+  });
+
+  test("shared async DLQ carries the design queue shape (14d retention, SQS-managed SSE, enforceSSL policy)", () => {
+    assertSharedAsyncDlqShape(template, "projects");
+  });
+});

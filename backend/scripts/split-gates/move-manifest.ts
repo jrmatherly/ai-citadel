@@ -1,0 +1,2407 @@
+/**
+ * The move manifest — the single source of truth for "what has moved out of
+ * the backend stack, to where, and why".
+ *
+ * Phase 1 (decision 30e6d067): the projects / conversations / documents /
+ * assessment / design-progress / planning / chatter domain moved from
+ * BackendStack to CitadelProjectsStack.
+ *
+ * Phase 2 (decision 30e6d067, this stage): the registry / agent-import /
+ * fabricator-request / fabricator-queue / fabrication-event / app-CRUD-
+ * and-api-key domain moved from BackendStack to CitadelRegistryStack.
+ * gateway-registration-handler and agent-config-resolver were NOT moved
+ * this phase (see registry-stack.ts's file-header EXCLUSIONS section for
+ * reasons); publishApp/unpublishApp resolvers (targeting a GatewayStack-
+ * owned function) also stay in BackendStack, documented the same way.
+ *
+ * Every entry below was derived directly from a diff between the committed
+ * pre-split baseline (`split-baseline/citadel-backend-dev.json`) and a
+ * fresh synth of citadel-backend-dev + citadel-projects-dev +
+ * citadel-registry-dev after each move — not hand-typed. Re-derive with the
+ * same diff if the moved Lambdas' construct IDs ever change.
+ */
+import { AllowlistEntry } from "./rails/rail1-removals-only";
+import { MovedLambdaMapping } from "./rails/rail6-iam-equivalence";
+import { MovedResolverMapping } from "./rails/rail7-resolver-equivalence";
+import { NormalizedPolicyStatement } from "./types";
+
+/** Logical IDs the removals-only diff (rail 1) is allowed to see disappear from backend, with justification. */
+export const REMOVAL_ALLOWLIST: AllowlistEntry[] = [
+  // --- Lambda functions (14) ---
+  {
+    logicalId: "ProjectResolverFunction1AB69E16",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "ProjectResolverFunctionLogsC65D0DC1",
+    justification: "LogGroup of ProjectResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "ProjectResolverFunctionServiceRoleD35F2FBB",
+    justification: "Execution role of ProjectResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "ProjectResolverFunctionServiceRoleDefaultPolicy75B6E5A1",
+    justification:
+      "DefaultPolicy of ProjectResolverFunction's role; moved with it.",
+  },
+  {
+    logicalId: "ConversationResolverFunctionA84FB482",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "ConversationResolverFunctionLogs1A830C4B",
+    justification: "LogGroup of ConversationResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "ConversationResolverFunctionServiceRoleF6A23AA5",
+    justification:
+      "Execution role of ConversationResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "ConversationResolverFunctionServiceRoleDefaultPolicy017815CF",
+    justification:
+      "DefaultPolicy of ConversationResolverFunction's role; moved with it.",
+  },
+  {
+    logicalId: "AgentResolverFunctionEF491ADF",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "AgentResolverFunctionLogs14A0600B",
+    justification: "LogGroup of AgentResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "AgentResolverFunctionServiceRole5824F55A",
+    justification: "Execution role of AgentResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "AgentResolverFunctionServiceRoleDefaultPolicy23EF618E",
+    justification:
+      "DefaultPolicy of AgentResolverFunction's role; moved with it.",
+  },
+  {
+    logicalId: "DocumentUploadResolverFunction905C268F",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "DocumentUploadResolverFunctionLogsC5B9C38B",
+    justification: "LogGroup of DocumentUploadResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "DocumentUploadResolverFunctionServiceRole31545179",
+    justification:
+      "Execution role of DocumentUploadResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "DocumentUploadResolverFunctionServiceRoleDefaultPolicy4277A959",
+    justification:
+      "DefaultPolicy of DocumentUploadResolverFunction's role; moved with it.",
+  },
+  {
+    logicalId: "DocumentResolverFunctionADF84905",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "DocumentResolverFunctionLogs55EED230",
+    justification: "LogGroup of DocumentResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "DocumentResolverFunctionServiceRole185574A3",
+    justification: "Execution role of DocumentResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "DocumentResolverFunctionServiceRoleDefaultPolicy4635269E",
+    justification:
+      "DefaultPolicy of DocumentResolverFunction's role; moved with it.",
+  },
+  {
+    logicalId: "ChatterPublisherFunction40B50CEA",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "ChatterPublisherFunctionLogs703E6915",
+    justification: "LogGroup of ChatterPublisherFunction; moved with it.",
+  },
+  {
+    logicalId: "ChatterPublisherFunctionServiceRoleBD9E5EE0",
+    justification: "Execution role of ChatterPublisherFunction; moved with it.",
+  },
+  {
+    logicalId: "ChatterPublisherFunctionServiceRoleDefaultPolicy3ACB2AD8",
+    justification:
+      "DefaultPolicy of ChatterPublisherFunction's role; moved with it.",
+  },
+  {
+    logicalId: "ChatterResolverFunction3B170D4D",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "ChatterResolverFunctionLogsAC2AD360",
+    justification: "LogGroup of ChatterResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "ChatterResolverFunctionServiceRole5E890AE9",
+    justification:
+      "Execution role of ChatterResolverFunction (no DefaultPolicy — no addToRolePolicy calls); moved with it.",
+  },
+  {
+    logicalId: "ProjectProgressUpdater66E18062",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "ProjectProgressUpdaterLogs9A56750A",
+    justification: "LogGroup of ProjectProgressUpdater; moved with it.",
+  },
+  {
+    logicalId: "ProjectProgressUpdaterServiceRoleC9BF95C7",
+    justification: "Execution role of ProjectProgressUpdater; moved with it.",
+  },
+  {
+    logicalId: "ProjectProgressUpdaterServiceRoleDefaultPolicyA81D2263",
+    justification:
+      "DefaultPolicy of ProjectProgressUpdater's role; moved with it.",
+  },
+  {
+    logicalId: "AssessmentCompletionNotifierF2243F8D",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "AssessmentCompletionNotifierLogsE93BC728",
+    justification: "LogGroup of AssessmentCompletionNotifier; moved with it.",
+  },
+  {
+    logicalId: "AssessmentCompletionNotifierServiceRole17069A96",
+    justification:
+      "Execution role of AssessmentCompletionNotifier; moved with it.",
+  },
+  {
+    logicalId: "AssessmentCompletionNotifierServiceRoleDefaultPolicy0D48BA2B",
+    justification:
+      "DefaultPolicy of AssessmentCompletionNotifier's role; moved with it.",
+  },
+  {
+    logicalId: "AssessmentCompletionResolverFunction01CCC17D",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "AssessmentCompletionResolverFunctionLogsADA7B248",
+    justification:
+      "LogGroup of AssessmentCompletionResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "AssessmentCompletionResolverFunctionServiceRole09A608DC",
+    justification:
+      "Execution role of AssessmentCompletionResolverFunction (no DefaultPolicy); moved with it.",
+  },
+  {
+    logicalId: "AssessmentProgressResolverFunctionC05492C6",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "AssessmentProgressResolverFunctionLogsC1A7E017",
+    justification:
+      "LogGroup of AssessmentProgressResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "AssessmentProgressResolverFunctionServiceRole799D9B79",
+    justification:
+      "Execution role of AssessmentProgressResolverFunction; moved with it.",
+  },
+  {
+    logicalId:
+      "AssessmentProgressResolverFunctionServiceRoleDefaultPolicy0F187242",
+    justification:
+      "DefaultPolicy of AssessmentProgressResolverFunction's role; moved with it.",
+  },
+  {
+    logicalId: "DesignProgressNotifier61A5E671",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "DesignProgressNotifierLogsD652E6CB",
+    justification: "LogGroup of DesignProgressNotifier; moved with it.",
+  },
+  {
+    logicalId: "DesignProgressNotifierServiceRole1321C778",
+    justification: "Execution role of DesignProgressNotifier; moved with it.",
+  },
+  {
+    logicalId: "DesignProgressNotifierServiceRoleDefaultPolicyC0A04D28",
+    justification:
+      "DefaultPolicy of DesignProgressNotifier's role; moved with it.",
+  },
+  {
+    logicalId: "DesignProgressResolverFunctionCDC01114",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "DesignProgressResolverFunctionLogs12C92D91",
+    justification: "LogGroup of DesignProgressResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "DesignProgressResolverFunctionServiceRoleD95F9C64",
+    justification:
+      "Execution role of DesignProgressResolverFunction (no DefaultPolicy); moved with it.",
+  },
+  {
+    logicalId: "GenerateReportUrlFunction63D5CCD0",
+    justification:
+      "Moved to CitadelProjectsStack (phase 1, decision 30e6d067).",
+  },
+  {
+    logicalId: "GenerateReportUrlFunctionLogs3A7D33F3",
+    justification: "LogGroup of GenerateReportUrlFunction; moved with it.",
+  },
+  {
+    logicalId: "GenerateReportUrlFunctionServiceRole5330DB34",
+    justification:
+      "Execution role of GenerateReportUrlFunction; moved with it.",
+  },
+  {
+    logicalId: "GenerateReportUrlFunctionServiceRoleDefaultPolicyA9D4C228",
+    justification:
+      "DefaultPolicy of GenerateReportUrlFunction's role; moved with it.",
+  },
+  // --- EventBridge rules + their auto-generated Lambda invoke permissions (4 rules) ---
+  {
+    logicalId: "ChatterRule264A0546",
+    justification: "Targets ChatterPublisherFunction only; moved with it.",
+  },
+  {
+    logicalId:
+      "ChatterRuleAllowEventRulecitadelbackenddevChatterPublisherFunction37FCEB3EBE70000E",
+    justification:
+      "Auto-generated Lambda::Permission for ChatterRule's target; moved with it.",
+  },
+  {
+    logicalId: "ProgressUpdateRule1132E7FE",
+    justification: "Targets ProjectProgressUpdater only; moved with it.",
+  },
+  {
+    logicalId:
+      "ProgressUpdateRuleAllowEventRulecitadelbackenddevProjectProgressUpdaterE26B1FC232D7AEB6",
+    justification:
+      "Auto-generated Lambda::Permission for ProgressUpdateRule's target; moved with it.",
+  },
+  {
+    logicalId: "AssessmentCompletionRule184CD45C",
+    justification: "Targets AssessmentCompletionNotifier only; moved with it.",
+  },
+  {
+    logicalId:
+      "AssessmentCompletionRuleAllowEventRulecitadelbackenddevAssessmentCompletionNotifier86C7D303E464C82A",
+    justification:
+      "Auto-generated Lambda::Permission for AssessmentCompletionRule's target; moved with it.",
+  },
+  {
+    logicalId: "DesignProgressRule4722B2BE",
+    justification: "Targets DesignProgressNotifier only; moved with it.",
+  },
+  {
+    logicalId:
+      "DesignProgressRuleAllowEventRulecitadelbackenddevDesignProgressNotifierC92BAAEF4E3FBB11",
+    justification:
+      "Auto-generated Lambda::Permission for DesignProgressRule's target; moved with it.",
+  },
+  // --- AppSync DataSources + their service roles (10 Lambda DS + 3 dead DynamoDB DS) ---
+  {
+    logicalId: "AgenticAIApiProjectLambdaDataSource3B8E595B",
+    justification:
+      "DataSource for moved project resolvers; recreated as ProjectLambdaDataSource in CitadelProjectsStack.",
+  },
+  {
+    logicalId: "AgenticAIApiProjectLambdaDataSourceServiceRoleFDD9E507",
+    justification: "Service role of ProjectLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiProjectLambdaDataSourceServiceRoleDefaultPolicyF015540F",
+    justification:
+      "DefaultPolicy of ProjectLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiConversationLambdaDataSource0F5CEA1A",
+    justification:
+      "DataSource for moved conversation resolvers; recreated in CitadelProjectsStack.",
+  },
+  {
+    logicalId: "AgenticAIApiConversationLambdaDataSourceServiceRole083029CC",
+    justification:
+      "Service role of ConversationLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiConversationLambdaDataSourceServiceRoleDefaultPolicy22411EBC",
+    justification:
+      "DefaultPolicy of ConversationLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiAgentLambdaDataSourceDA63EBDA",
+    justification:
+      "DataSource for moved getAgentStatus resolver; recreated in CitadelProjectsStack.",
+  },
+  {
+    logicalId: "AgenticAIApiAgentLambdaDataSourceServiceRoleBF5FEDBE",
+    justification: "Service role of AgentLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiAgentLambdaDataSourceServiceRoleDefaultPolicyF10F15C6",
+    justification:
+      "DefaultPolicy of AgentLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiDocumentUploadLambdaDataSource4BC80711",
+    justification:
+      "DataSource for moved document-upload resolvers; recreated in CitadelProjectsStack.",
+  },
+  {
+    logicalId: "AgenticAIApiDocumentUploadLambdaDataSourceServiceRole5B0EFE97",
+    justification:
+      "Service role of DocumentUploadLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiDocumentUploadLambdaDataSourceServiceRoleDefaultPolicy1A76D465",
+    justification:
+      "DefaultPolicy of DocumentUploadLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiDocumentLambdaDataSource49614661",
+    justification:
+      "DataSource for moved document resolvers; recreated in CitadelProjectsStack.",
+  },
+  {
+    logicalId: "AgenticAIApiDocumentLambdaDataSourceServiceRole6C3C0E9B",
+    justification: "Service role of DocumentLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiDocumentLambdaDataSourceServiceRoleDefaultPolicy24047825",
+    justification:
+      "DefaultPolicy of DocumentLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiChatterLambdaDataSource7A18574D",
+    justification:
+      "DataSource for moved publishChatter resolver; recreated in CitadelProjectsStack.",
+  },
+  {
+    logicalId: "AgenticAIApiChatterLambdaDataSourceServiceRole8B68A612",
+    justification: "Service role of ChatterLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiChatterLambdaDataSourceServiceRoleDefaultPolicy4BCA5365",
+    justification:
+      "DefaultPolicy of ChatterLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiAssessmentCompletionLambdaDataSourceD6ED942E",
+    justification:
+      "DataSource for moved publishAssessmentCompletion resolver; recreated in CitadelProjectsStack.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiAssessmentCompletionLambdaDataSourceServiceRole1C2C5431",
+    justification:
+      "Service role of AssessmentCompletionLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiAssessmentCompletionLambdaDataSourceServiceRoleDefaultPolicy41FDCE83",
+    justification:
+      "DefaultPolicy of AssessmentCompletionLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiAssessmentProgressLambdaDataSourceD3E4191F",
+    justification:
+      "DataSource for moved getAssessmentProgress resolver; recreated in CitadelProjectsStack.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiAssessmentProgressLambdaDataSourceServiceRole34F91CE6",
+    justification:
+      "Service role of AssessmentProgressLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiAssessmentProgressLambdaDataSourceServiceRoleDefaultPolicy9D219235",
+    justification:
+      "DefaultPolicy of AssessmentProgressLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiDesignProgressLambdaDataSource0B9C4AAA",
+    justification:
+      "DataSource for moved publishDesignProgress resolver; recreated in CitadelProjectsStack.",
+  },
+  {
+    logicalId: "AgenticAIApiDesignProgressLambdaDataSourceServiceRole7F0D9227",
+    justification:
+      "Service role of DesignProgressLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiDesignProgressLambdaDataSourceServiceRoleDefaultPolicy9255715C",
+    justification:
+      "DefaultPolicy of DesignProgressLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiGenerateReportUrlDataSource2BEEB1F4",
+    justification:
+      "DataSource for moved generateReportDownloadUrl resolver; recreated in CitadelProjectsStack.",
+  },
+  {
+    logicalId: "AgenticAIApiGenerateReportUrlDataSourceServiceRoleC36FF3A0",
+    justification:
+      "Service role of GenerateReportUrlDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiGenerateReportUrlDataSourceServiceRoleDefaultPolicyF85F1259",
+    justification:
+      "DefaultPolicy of GenerateReportUrlDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiProjectsDataSourceA5D879B8",
+    justification:
+      "Unused DynamoDB DataSource (never had a resolver attached in the pre-split baseline either); dropped rather than recreated, since it served no field.",
+  },
+  {
+    logicalId: "AgenticAIApiProjectsDataSourceServiceRoleB722A09A",
+    justification:
+      "Service role of the unused ProjectsDataSource; dropped with it.",
+  },
+  {
+    logicalId: "AgenticAIApiProjectsDataSourceServiceRoleDefaultPolicy97526FA2",
+    justification:
+      "DefaultPolicy of the unused ProjectsDataSource's role; dropped with it.",
+  },
+  {
+    logicalId: "AgenticAIApiConversationsDataSource50154233",
+    justification:
+      "Unused DynamoDB DataSource (never had a resolver attached in the pre-split baseline either); dropped rather than recreated, since it served no field.",
+  },
+  {
+    logicalId: "AgenticAIApiConversationsDataSourceServiceRoleDA8EEF07",
+    justification:
+      "Service role of the unused ConversationsDataSource; dropped with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiConversationsDataSourceServiceRoleDefaultPolicy29CD7256",
+    justification:
+      "DefaultPolicy of the unused ConversationsDataSource's role; dropped with it.",
+  },
+  {
+    logicalId: "AgenticAIApiAgentStatusDataSourceC16782E0",
+    justification:
+      "Unused DynamoDB DataSource (never had a resolver attached in the pre-split baseline either); dropped rather than recreated, since it served no field.",
+  },
+  {
+    logicalId: "AgenticAIApiAgentStatusDataSourceServiceRole955C06E5",
+    justification:
+      "Service role of the unused AgentStatusDataSource; dropped with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiAgentStatusDataSourceServiceRoleDefaultPolicy2E87E1F4",
+    justification:
+      "DefaultPolicy of the unused AgentStatusDataSource's role; dropped with it.",
+  },
+  // --- AppSync Resolvers (23) ---
+  {
+    logicalId: "AgenticAIApiGetProjectResolverEA8B2F67",
+    justification: "Moved to CitadelProjectsStack as GetProjectResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiListProjectsResolver3F1F1150",
+    justification: "Moved to CitadelProjectsStack as ListProjectsResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiCreateProjectResolver15C9890E",
+    justification: "Moved to CitadelProjectsStack as CreateProjectResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiUpdateProjectResolver8D527D4B",
+    justification: "Moved to CitadelProjectsStack as UpdateProjectResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiUploadDocumentResolverA75B2DE0",
+    justification: "Moved to CitadelProjectsStack as UploadDocumentResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetAgentStatusResolverE4790BA2",
+    justification: "Moved to CitadelProjectsStack as GetAgentStatusResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetConversationHistoryResolverA891E8EE",
+    justification:
+      "Moved to CitadelProjectsStack as GetConversationHistoryResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiSendMessageResolver7BECC9D3",
+    justification: "Moved to CitadelProjectsStack as SendMessageResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiPublishConversationMessageResolverB0BE2EEB",
+    justification:
+      "Moved to CitadelProjectsStack as PublishConversationMessageResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiSendMessageToAgentResolver2E8BB9BA",
+    justification:
+      "Moved to CitadelProjectsStack as SendMessageToAgentResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGenerateDocumentUploadUrlResolver1710E567",
+    justification:
+      "Moved to CitadelProjectsStack as GenerateDocumentUploadUrlResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetDocumentIngestionStatusResolver1273B9A6",
+    justification:
+      "Moved to CitadelProjectsStack as GetDocumentIngestionStatusResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiListProjectDocumentsResolver8233808C",
+    justification:
+      "Moved to CitadelProjectsStack as ListProjectDocumentsResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiDeleteDocumentResolver2EFF3AED",
+    justification: "Moved to CitadelProjectsStack as DeleteDocumentResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetProjectDocumentResolver980F0E28",
+    justification:
+      "Moved to CitadelProjectsStack as GetProjectDocumentResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiListDocumentVersionsResolver3F603C9D",
+    justification:
+      "Moved to CitadelProjectsStack as ListDocumentVersionsResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetDocumentVersionResolver9FF311AD",
+    justification:
+      "Moved to CitadelProjectsStack as GetDocumentVersionResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGenerateDocumentPdfResolver31C667B1",
+    justification:
+      "Moved to CitadelProjectsStack as GenerateDocumentPdfResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiPublishChatterResolverD144FAF4",
+    justification: "Moved to CitadelProjectsStack as PublishChatterResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiPublishAssessmentCompletionResolver7D8B1F67",
+    justification:
+      "Moved to CitadelProjectsStack as PublishAssessmentCompletionResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetAssessmentProgressResolver9ECD99A8",
+    justification:
+      "Moved to CitadelProjectsStack as GetAssessmentProgressResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiPublishDesignProgressResolver4D37FB3B",
+    justification:
+      "Moved to CitadelProjectsStack as PublishDesignProgressResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGenerateReportDownloadUrlResolver498E58D8",
+    justification:
+      "Moved to CitadelProjectsStack as GenerateReportDownloadUrlResolver.",
+  },
+  // --- CloudWatch Alarms (2, followed ProjectResolverFunction) ---
+  {
+    logicalId: "ProjectResolverErrorAlarm6D4A121B",
+    justification:
+      "Alarm on ProjectResolverFunction; recreated in CitadelProjectsStack as ProjectResolverErrorAlarm.",
+  },
+  {
+    logicalId: "ProjectResolverThrottleAlarmD3F0F4B5",
+    justification:
+      "Alarm on ProjectResolverFunction; recreated in CitadelProjectsStack as ProjectResolverThrottleAlarm.",
+  },
+
+  // --- AppSync 5xx alarm relocation (decision ab73ae1b) ---
+  {
+    logicalId: "AppSync5xxAlarm67B161CE",
+    justification:
+      "Decision ab73ae1b: moved to TelemetryStack (telemetry-stack.ts:2213, " +
+      "platform-health SLO suite) as a strict superset alarm (SNS action, " +
+      "tighter threshold) owning the physical name " +
+      "citadel-appsync-5xx-<env>. Both stacks declaring the identical " +
+      "alarmName broke deploys (AWS::EarlyValidation::ResourceExistenceCheck " +
+      "on second deploy); no monitoring loss, since TelemetryStack's " +
+      "definition is a superset. Guarded by " +
+      "backend/test/duplicate-alarm-name-guard.test.ts. Not a stateful " +
+      "type (CloudWatch::Alarm), so allowlisting fully satisfies rail 1. " +
+      "See backend-stack.ts:3151 for the removal comment.",
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Phase 2 (decision 30e6d067, this stage): the registry / agent-import /
+  // fabricator-request / fabricator-queue / fabrication-event / app-CRUD-
+  // and-api-key domain moved from BackendStack to CitadelRegistryStack.
+  // Derived the same way as phase 1 — diff between the committed baseline
+  // and a fresh synth of citadel-backend-dev + citadel-registry-dev.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // --- E19 phase-1 registry exports (decision 06077146): registry ARN/ID now resolved via SSM ---
+  {
+    logicalId: "AgentCoreRegistryArn",
+    justification:
+      "Retained only during E19 phase 1; consumers now read the registry id/arn from SSM (finding 8b7ee8af, decision 06077146).",
+  },
+  {
+    logicalId: "AgentCoreRegistryId",
+    justification:
+      "Retained only during E19 phase 1; consumers now read the registry id/arn from SSM (finding 8b7ee8af, decision 06077146).",
+  },
+  {
+    logicalId: "ExportsOutputFnGetAttAgentCoreRegistryRegistryArn635B1025",
+    justification:
+      "Retained only during E19 phase 1; consumers now read the registry id/arn from SSM (finding 8b7ee8af, decision 06077146).",
+  },
+  {
+    logicalId: "ExportsOutputFnGetAttAgentCoreRegistryRegistryId501C916F",
+    justification:
+      "Retained only during E19 phase 1; consumers now read the registry id/arn from SSM (finding 8b7ee8af, decision 06077146).",
+  },
+
+  // --- CIT-207: Cognito UserPoolClient id now resolved via SSM ---
+  {
+    logicalId: "UserPoolClientIdExport",
+    justification:
+      "CIT-207: duplicate explicit export of the Cognito UserPoolClient id " +
+      "(0 importers — RUNBOOK.md reads the plain UserPoolClientId output, " +
+      "not this export). Frontend/telemetry now resolve the client id via " +
+      "SSM (/citadel/<env>/cognito/client-id) instead of Fn::ImportValue.",
+  },
+
+  // --- CIT-207 phase 2: drop the auto-export keep-alive now that consumers read SSM ---
+  {
+    logicalId: "ExportsOutputRefUserPoolClient2F5918F753847A55",
+    justification:
+      "CIT-207 phase 2: auto-generated export of the Cognito " +
+      "UserPoolClient id, retained via exportValue during phase 1 while " +
+      "frontend/telemetry importers migrated to the SSM parameter " +
+      "(/citadel/<env>/cognito/client-id). Phase 1 is now live everywhere, " +
+      "so the exportValue keep-alive is removed (mirrors the registry " +
+      "exports allowlisted in phase 2, commit 0904aa2/eaa8e17).",
+  },
+
+  // --- Lambda functions (7 clusters, 4 CFN each: fn, log group, role, policy) ---
+  {
+    logicalId: "AgentImportResolverFunctionE5B20F94",
+    justification:
+      "Moved to CitadelRegistryStack (phase 2, decision 30e6d067).",
+  },
+  {
+    logicalId: "AgentImportResolverFunctionLogsDAFF048F",
+    justification: "LogGroup of AgentImportResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "AgentImportResolverFunctionServiceRole079601F5",
+    justification:
+      "Execution role of AgentImportResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "AgentImportResolverFunctionServiceRoleDefaultPolicy48899C8B",
+    justification:
+      "DefaultPolicy of AgentImportResolverFunction's role; moved with it.",
+  },
+  {
+    logicalId: "AgentImportManifestResultHandlerAC7A0B8E",
+    justification:
+      "Moved to CitadelRegistryStack (phase 2, decision 30e6d067).",
+  },
+  {
+    logicalId: "AgentImportManifestResultHandlerLogs33C7F708",
+    justification:
+      "LogGroup of AgentImportManifestResultHandler; moved with it.",
+  },
+  {
+    logicalId: "AgentImportManifestResultHandlerServiceRole3DEB3E3F",
+    justification:
+      "Execution role of AgentImportManifestResultHandler; moved with it.",
+  },
+  {
+    logicalId:
+      "AgentImportManifestResultHandlerServiceRoleDefaultPolicy8E6A2C14",
+    justification:
+      "DefaultPolicy of AgentImportManifestResultHandler's role; moved with it.",
+  },
+  {
+    logicalId: "AgentCodeResolverFunction720FFFB6",
+    justification:
+      "Moved to CitadelRegistryStack (phase 2, decision 30e6d067).",
+  },
+  {
+    logicalId: "AgentCodeResolverFunctionLogs4FD4D0A2",
+    justification: "LogGroup of AgentCodeResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "AgentCodeResolverFunctionServiceRoleD2F7BE23",
+    justification:
+      "Execution role of AgentCodeResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "AgentCodeResolverFunctionServiceRoleDefaultPolicyF9A56B5F",
+    justification:
+      "DefaultPolicy of AgentCodeResolverFunction's role; moved with it.",
+  },
+  {
+    logicalId: "FabricatorRequestResolverFunctionBCCF3ABD",
+    justification:
+      "Moved to CitadelRegistryStack (phase 2, decision 30e6d067).",
+  },
+  {
+    logicalId: "FabricatorRequestResolverFunctionLogsB7EB3A42",
+    justification:
+      "LogGroup of FabricatorRequestResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "FabricatorRequestResolverFunctionServiceRoleA672CCA1",
+    justification:
+      "Execution role of FabricatorRequestResolverFunction; moved with it.",
+  },
+  {
+    logicalId:
+      "FabricatorRequestResolverFunctionServiceRoleDefaultPolicy142FDFD7",
+    justification:
+      "DefaultPolicy of FabricatorRequestResolverFunction's role; moved with it.",
+  },
+  {
+    logicalId: "FabricatorQueueResolverFunctionE2D38CA8",
+    justification:
+      "Moved to CitadelRegistryStack (phase 2, decision 30e6d067).",
+  },
+  {
+    logicalId: "FabricatorQueueResolverFunctionLogs906F666F",
+    justification:
+      "LogGroup of FabricatorQueueResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "FabricatorQueueResolverFunctionServiceRole88E78362",
+    justification:
+      "Execution role of FabricatorQueueResolverFunction; moved with it.",
+  },
+  {
+    logicalId:
+      "FabricatorQueueResolverFunctionServiceRoleDefaultPolicy9DFE3201",
+    justification:
+      "DefaultPolicy of FabricatorQueueResolverFunction's role; moved with it.",
+  },
+  {
+    logicalId: "FabricationEventHandlerFunctionA425E3C0",
+    justification:
+      "Moved to CitadelRegistryStack (phase 2, decision 30e6d067).",
+  },
+  {
+    logicalId: "FabricationEventHandlerFunctionLogs8701156E",
+    justification:
+      "LogGroup of FabricationEventHandlerFunction; moved with it.",
+  },
+  {
+    logicalId: "FabricationEventHandlerFunctionServiceRole2C1FA004",
+    justification:
+      "Execution role of FabricationEventHandlerFunction; moved with it.",
+  },
+  {
+    logicalId:
+      "FabricationEventHandlerFunctionServiceRoleDefaultPolicyDE9EB2EF",
+    justification:
+      "DefaultPolicy of FabricationEventHandlerFunction's role; moved with it.",
+  },
+  {
+    logicalId: "RegistryAgentRecordResolverFunction5D7EA0BC",
+    justification:
+      "Moved to CitadelRegistryStack (phase 2, decision 30e6d067). Keeps its " +
+      "deterministic functionName (citadel-registry-agent-record-resolver-<env>) " +
+      "in the satellite — the only moved function in this phase that is not " +
+      "auto-named, since it was already deterministically named in the baseline.",
+  },
+  {
+    logicalId: "RegistryAgentRecordResolverFunctionLogs25CD0897",
+    justification:
+      "LogGroup of RegistryAgentRecordResolverFunction; moved with it.",
+  },
+  {
+    logicalId: "RegistryAgentRecordResolverFunctionServiceRoleB465E208",
+    justification:
+      "Execution role of RegistryAgentRecordResolverFunction; moved with it.",
+  },
+  {
+    logicalId:
+      "RegistryAgentRecordResolverFunctionServiceRoleDefaultPolicy27F40C93",
+    justification:
+      "DefaultPolicy of RegistryAgentRecordResolverFunction's role; moved with it.",
+  },
+  // --- Registry sync Lambda + its rule/DLQ (not a resolver-serving fn) ---
+  {
+    logicalId: "RegistrySyncLambdaC145524B",
+    justification:
+      "Moved to CitadelRegistryStack (phase 2, decision 30e6d067).",
+  },
+  {
+    logicalId: "RegistrySyncLambdaLogsB9C7EC7F",
+    justification: "LogGroup of RegistrySyncLambda; moved with it.",
+  },
+  {
+    logicalId: "RegistrySyncLambdaServiceRoleB56E9F10",
+    justification: "Execution role of RegistrySyncLambda; moved with it.",
+  },
+  {
+    logicalId: "RegistrySyncLambdaServiceRoleDefaultPolicy81D64F97",
+    justification: "DefaultPolicy of RegistrySyncLambda's role; moved with it.",
+  },
+  {
+    logicalId: "RegistrySyncRuleE4DF9965",
+    justification: "Targets RegistrySyncLambda only; moved with it.",
+  },
+  {
+    logicalId:
+      "RegistrySyncRuleAllowEventRulecitadelbackenddevRegistrySyncLambda2FD0F1C48FD5EDF2",
+    justification:
+      "Auto-generated Lambda::Permission for RegistrySyncRule's target; moved with it.",
+  },
+  {
+    logicalId: "RegistrySyncDLQFB920991",
+    justification:
+      "Dead-letter queue for RegistrySyncLambda's EventBridge target; moved with it.",
+  },
+  {
+    logicalId: "RegistrySyncDLQPolicyCBFB114B",
+    justification: "Queue policy of RegistrySyncDLQ; moved with it.",
+  },
+  // --- EventBridge rules + auto-generated Lambda invoke permissions (2 rules) ---
+  {
+    logicalId: "AgentImportManifestResultRule30ACE2BF",
+    justification:
+      "Targets AgentImportManifestResultHandler only; moved with it.",
+  },
+  {
+    logicalId:
+      "AgentImportManifestResultRuleAllowEventRulecitadelbackenddevAgentImportManifestResultHandler778E32F2467C753E",
+    justification:
+      "Auto-generated Lambda::Permission for AgentImportManifestResultRule's target; moved with it.",
+  },
+  {
+    logicalId: "FabricationEventRuleC8C213DE",
+    justification:
+      "Targets FabricationEventHandlerFunction only; moved with it. Left in " +
+      "BackendStack during phase 1 specifically because its target function " +
+      "moves here, in phase 2.",
+  },
+  {
+    logicalId:
+      "FabricationEventRuleAllowEventRulecitadelbackenddevFabricationEventHandlerFunctionB1717AEE49C3388A",
+    justification:
+      "Auto-generated Lambda::Permission for FabricationEventRule's target; moved with it.",
+  },
+  // --- AppSync DataSources + their service roles (6 Lambda DS) ---
+  {
+    logicalId: "AgenticAIApiAgentImportLambdaDataSource8A5EDBB8",
+    justification:
+      "DataSource for moved AgentImport resolvers; recreated as AgentImportLambdaDataSource in CitadelRegistryStack.",
+  },
+  {
+    logicalId: "AgenticAIApiAgentImportLambdaDataSourceServiceRole753E40F4",
+    justification:
+      "Service role of AgentImportLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiAgentImportLambdaDataSourceServiceRoleDefaultPolicy8DF04456",
+    justification:
+      "DefaultPolicy of AgentImportLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiAgentCodeLambdaDataSourceC71C6DFB",
+    justification:
+      "DataSource for moved AgentCode resolvers; recreated as AgentCodeLambdaDataSource in CitadelRegistryStack.",
+  },
+  {
+    logicalId: "AgenticAIApiAgentCodeLambdaDataSourceServiceRoleDC7BC345",
+    justification: "Service role of AgentCodeLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiAgentCodeLambdaDataSourceServiceRoleDefaultPolicy28AE0658",
+    justification:
+      "DefaultPolicy of AgentCodeLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiFabricatorRequestLambdaDataSource14885F51",
+    justification:
+      "DataSource for moved fabricator-request resolvers; recreated as FabricatorRequestLambdaDataSource in CitadelRegistryStack.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiFabricatorRequestLambdaDataSourceServiceRole77597578",
+    justification:
+      "Service role of FabricatorRequestLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiFabricatorRequestLambdaDataSourceServiceRoleDefaultPolicyA8DE0203",
+    justification:
+      "DefaultPolicy of FabricatorRequestLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiFabricatorQueueLambdaDataSource0B0CBA20",
+    justification:
+      "DataSource for moved getFabricatorQueue resolver; recreated as FabricatorQueueLambdaDataSource in CitadelRegistryStack.",
+  },
+  {
+    logicalId: "AgenticAIApiFabricatorQueueLambdaDataSourceServiceRole0ED2B05B",
+    justification:
+      "Service role of FabricatorQueueLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiFabricatorQueueLambdaDataSourceServiceRoleDefaultPolicyE7DDBD64",
+    justification:
+      "DefaultPolicy of FabricatorQueueLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiFabricationEventLambdaDataSourceCE69D09B",
+    justification:
+      "DataSource for moved publishFabricationEvent resolver; recreated as FabricationEventLambdaDataSource in CitadelRegistryStack.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiFabricationEventLambdaDataSourceServiceRole0EF3972F",
+    justification:
+      "Service role of FabricationEventLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiFabricationEventLambdaDataSourceServiceRoleDefaultPolicy157A43E8",
+    justification:
+      "DefaultPolicy of FabricationEventLambdaDataSource's role; moved with it.",
+  },
+  {
+    logicalId: "AgenticAIApiRegistryAgentRecordLambdaDataSourceF0EF0666",
+    justification:
+      "DataSource for the 28-field registry-agent-record resolver; recreated as RegistryAgentRecordLambdaDataSource in CitadelRegistryStack.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiRegistryAgentRecordLambdaDataSourceServiceRoleDB2B26E3",
+    justification:
+      "Service role of RegistryAgentRecordLambdaDataSource; moved with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiRegistryAgentRecordLambdaDataSourceServiceRoleDefaultPolicy976E3B9A",
+    justification:
+      "DefaultPolicy of RegistryAgentRecordLambdaDataSource's role; moved with it.",
+  },
+  // --- AppSync Resolvers (39) ---
+  {
+    logicalId: "AgenticAIApiImportAgentResolver18D4DC83",
+    justification: "Moved to CitadelRegistryStack as ImportAgentResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiAttestAgentImportResolverDF2A989D",
+    justification:
+      "Moved to CitadelRegistryStack as AttestAgentImportResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiDiscoverAgentsResolver979B354A",
+    justification: "Moved to CitadelRegistryStack as DiscoverAgentsResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiDescribeAgentCandidateResolverB33253A4",
+    justification:
+      "Moved to CitadelRegistryStack as DescribeAgentCandidateResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiTestImportedAgentResolver5D05A3FE",
+    justification:
+      "Moved to CitadelRegistryStack as TestImportedAgentResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiProbeAgentCandidateResolverEC03C31D",
+    justification:
+      "Moved to CitadelRegistryStack as ProbeAgentCandidateResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiProbeImportReachabilityResolverF1E2801F",
+    justification:
+      "Moved to CitadelRegistryStack as ProbeImportReachabilityResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiProposeAgentManifestTier3Resolver7FA15006",
+    justification:
+      "Moved to CitadelRegistryStack as ProposeAgentManifestTier3Resolver.",
+  },
+  {
+    logicalId: "AgenticAIApiAcceptProposedManifestTier3Resolver6B5376BB",
+    justification:
+      "Moved to CitadelRegistryStack as AcceptProposedManifestTier3Resolver.",
+  },
+  {
+    logicalId: "AgenticAIApiPublishImportToGatewayResolver36C8E28E",
+    justification:
+      "Moved to CitadelRegistryStack as PublishImportToGatewayResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiUnpublishImportFromGatewayResolverA95B0229",
+    justification:
+      "Moved to CitadelRegistryStack as UnpublishImportFromGatewayResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetAgentCodeResolverC63C1519",
+    justification: "Moved to CitadelRegistryStack as GetAgentCodeResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiUpdateAgentCodeResolver6EAE7F99",
+    justification: "Moved to CitadelRegistryStack as UpdateAgentCodeResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiRequestAgentCreationResolver45590254",
+    justification:
+      "Moved to CitadelRegistryStack as RequestAgentCreationResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiRequestToolCreationResolver8588C4BC",
+    justification:
+      "Moved to CitadelRegistryStack as RequestToolCreationResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetFabricatorQueueResolver99A2754B",
+    justification:
+      "Moved to CitadelRegistryStack as GetFabricatorQueueResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiPublishFabricationEventResolver8E74BC3F",
+    justification:
+      "Moved to CitadelRegistryStack as PublishFabricationEventResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetAppResolver5424C672",
+    justification: "Moved to CitadelRegistryStack as GetAppResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiListAppsResolverB92B8C88",
+    justification: "Moved to CitadelRegistryStack as ListAppsResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiCreateAppResolverE50F85FD",
+    justification: "Moved to CitadelRegistryStack as CreateAppResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiUpdateAppResolver538DD59F",
+    justification: "Moved to CitadelRegistryStack as UpdateAppResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiDeleteAppResolver9A463411",
+    justification: "Moved to CitadelRegistryStack as DeleteAppResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiBindWorkflowToAppResolverD0843AB8",
+    justification:
+      "Moved to CitadelRegistryStack as BindWorkflowToAppResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiUnbindWorkflowFromAppResolver3133738D",
+    justification:
+      "Moved to CitadelRegistryStack as UnbindWorkflowFromAppResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiUpdateAgentBindingResolverC80D5608",
+    justification:
+      "Moved to CitadelRegistryStack as UpdateAgentBindingResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiAddAppComponentResolverB8A446B4",
+    justification: "Moved to CitadelRegistryStack as AddAppComponentResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiRemoveAppComponentResolverF6B9A4CD",
+    justification:
+      "Moved to CitadelRegistryStack as RemoveAppComponentResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiSetAppConfigSchemaResolver56CF4186",
+    justification:
+      "Moved to CitadelRegistryStack as SetAppConfigSchemaResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiSetAppConfigValuesResolverDB2149F4",
+    justification:
+      "Moved to CitadelRegistryStack as SetAppConfigValuesResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiPublishAppStatusEventResolver5DE69E7B",
+    justification:
+      "Moved to CitadelRegistryStack as PublishAppStatusEventResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiCreateAppApiKeyResolverCAA23E27",
+    justification: "Moved to CitadelRegistryStack as CreateAppApiKeyResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiRevokeAppApiKeyResolverB88C6619",
+    justification: "Moved to CitadelRegistryStack as RevokeAppApiKeyResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiRotateAppApiKeyResolverD4039849",
+    justification: "Moved to CitadelRegistryStack as RotateAppApiKeyResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiListAppApiKeysResolverC3BC1C96",
+    justification: "Moved to CitadelRegistryStack as ListAppApiKeysResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiSetAppAuthConfigResolver8C6D30A5",
+    justification: "Moved to CitadelRegistryStack as SetAppAuthConfigResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGrantAppAccessResolver951B96B9",
+    justification: "Moved to CitadelRegistryStack as GrantAppAccessResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiRevokeAppAccessResolverCBB2ED0B",
+    justification: "Moved to CitadelRegistryStack as RevokeAppAccessResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiListAppAccessEntriesResolver5107E67D",
+    justification:
+      "Moved to CitadelRegistryStack as ListAppAccessEntriesResolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetAppMetricsResolverCD9FD173",
+    justification: "Moved to CitadelRegistryStack as GetAppMetricsResolver.",
+  },
+];
+
+/** Resolver fields moved to a satellite stack, for rail 3 parity + rail 7 equivalence. */
+export const MOVED_RESOLVERS: MovedResolverMapping[] = [
+  { fieldKey: "Query.getProject", satelliteStackName: "citadel-projects-dev" },
+  {
+    fieldKey: "Query.listProjects",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.createProject",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.updateProject",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.uploadDocument",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Query.getAgentStatus",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Query.getConversationHistory",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.sendMessage",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.publishConversationMessage",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.sendMessageToAgent",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.generateDocumentUploadUrl",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Query.getDocumentIngestionStatus",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Query.listProjectDocuments",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.deleteDocument",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Query.getProjectDocument",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Query.listDocumentVersions",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Query.getDocumentVersion",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.generateDocumentPdf",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.publishChatter",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.publishAssessmentCompletion",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Query.getAssessmentProgress",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Mutation.publishDesignProgress",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    fieldKey: "Query.generateReportDownloadUrl",
+    satelliteStackName: "citadel-projects-dev",
+  },
+
+  // Phase 2 (decision 30e6d067)
+  {
+    fieldKey: "Mutation.importAgent",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.attestAgentImport",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Query.discoverAgents",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Query.describeAgentCandidate",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.testImportedAgent",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.probeAgentCandidate",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.probeImportReachability",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.proposeAgentManifestTier3",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.acceptProposedManifestTier3",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.publishImportToGateway",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.unpublishImportFromGateway",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Query.getAgentCode",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.updateAgentCode",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.requestAgentCreation",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.requestToolCreation",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Query.getFabricatorQueue",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.publishFabricationEvent",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  { fieldKey: "Query.getApp", satelliteStackName: "citadel-registry-dev" },
+  { fieldKey: "Query.listApps", satelliteStackName: "citadel-registry-dev" },
+  {
+    fieldKey: "Mutation.createApp",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.updateApp",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.deleteApp",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.bindWorkflowToApp",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.unbindWorkflowFromApp",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.updateAgentBinding",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.addAppComponent",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.removeAppComponent",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.setAppConfigSchema",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.setAppConfigValues",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.publishAppStatusEvent",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.createAppApiKey",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.revokeAppApiKey",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.rotateAppApiKey",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Query.listAppApiKeys",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.setAppAuthConfig",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.grantAppAccess",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Mutation.revokeAppAccess",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Query.listAppAccessEntries",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    fieldKey: "Query.getAppMetrics",
+    satelliteStackName: "citadel-registry-dev",
+  },
+];
+
+/** Lambda logical-ID name-mapping (backend baseline -> satellite) for rail 6 IAM equivalence. */
+export const MOVED_LAMBDA_ROLES: MovedLambdaMapping[] = [
+  {
+    baselineLogicalId: "ProjectResolverFunction1AB69E16",
+    satelliteLogicalId: "ProjectResolverFunction1AB69E16",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "ConversationResolverFunctionA84FB482",
+    satelliteLogicalId: "ConversationResolverFunctionA84FB482",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "AgentResolverFunctionEF491ADF",
+    satelliteLogicalId: "AgentResolverFunctionEF491ADF",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "DocumentUploadResolverFunction905C268F",
+    satelliteLogicalId: "DocumentUploadResolverFunction905C268F",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "DocumentResolverFunctionADF84905",
+    satelliteLogicalId: "DocumentResolverFunctionADF84905",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "ChatterPublisherFunction40B50CEA",
+    satelliteLogicalId: "ChatterPublisherFunction40B50CEA",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "ChatterResolverFunction3B170D4D",
+    satelliteLogicalId: "ChatterResolverFunction3B170D4D",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "ProjectProgressUpdater66E18062",
+    satelliteLogicalId: "ProjectProgressUpdater66E18062",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "AssessmentCompletionNotifierF2243F8D",
+    satelliteLogicalId: "AssessmentCompletionNotifierF2243F8D",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "AssessmentCompletionResolverFunction01CCC17D",
+    satelliteLogicalId: "AssessmentCompletionResolverFunction01CCC17D",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "AssessmentProgressResolverFunctionC05492C6",
+    satelliteLogicalId: "AssessmentProgressResolverFunctionC05492C6",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "DesignProgressNotifier61A5E671",
+    satelliteLogicalId: "DesignProgressNotifier61A5E671",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "DesignProgressResolverFunctionCDC01114",
+    satelliteLogicalId: "DesignProgressResolverFunctionCDC01114",
+    satelliteStackName: "citadel-projects-dev",
+  },
+  {
+    baselineLogicalId: "GenerateReportUrlFunction63D5CCD0",
+    satelliteLogicalId: "GenerateReportUrlFunction63D5CCD0",
+    satelliteStackName: "citadel-projects-dev",
+  },
+
+  // Phase 2 (decision 30e6d067) — logical IDs are identical baseline<->
+  // satellite (same construct ID, different stack), except
+  // RegistryAgentRecordResolverFunction which keeps functionName pinning.
+  {
+    baselineLogicalId: "AgentImportResolverFunctionE5B20F94",
+    satelliteLogicalId: "AgentImportResolverFunctionE5B20F94",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    baselineLogicalId: "AgentImportManifestResultHandlerAC7A0B8E",
+    satelliteLogicalId: "AgentImportManifestResultHandlerAC7A0B8E",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    baselineLogicalId: "AgentCodeResolverFunction720FFFB6",
+    satelliteLogicalId: "AgentCodeResolverFunction720FFFB6",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    baselineLogicalId: "FabricatorRequestResolverFunctionBCCF3ABD",
+    satelliteLogicalId: "FabricatorRequestResolverFunctionBCCF3ABD",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    baselineLogicalId: "FabricatorQueueResolverFunctionE2D38CA8",
+    satelliteLogicalId: "FabricatorQueueResolverFunctionE2D38CA8",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    baselineLogicalId: "FabricationEventHandlerFunctionA425E3C0",
+    satelliteLogicalId: "FabricationEventHandlerFunctionA425E3C0",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    baselineLogicalId: "RegistryAgentRecordResolverFunction5D7EA0BC",
+    satelliteLogicalId: "RegistryAgentRecordResolverFunction5D7EA0BC",
+    satelliteStackName: "citadel-registry-dev",
+  },
+  {
+    baselineLogicalId: "RegistrySyncLambdaC145524B",
+    satelliteLogicalId: "RegistrySyncLambdaC145524B",
+    satelliteStackName: "citadel-registry-dev",
+  },
+];
+
+/** Satellite stack names participating in the split, for rail 3's merged-set computation. */
+export const SATELLITE_STACK_NAMES: string[] = [
+  "citadel-projects-dev",
+  "citadel-registry-dev",
+];
+
+/**
+ * Rail 3 has no addition-allowlist mechanism of its own (unlike rail 1's
+ * `ADDITION_ALLOWLIST`) — resolver-parity baseline drift for legitimate new
+ * fields must be expected explicitly here, mirroring rail 1's allowlist
+ * shape and justification-comment convention. Every field below corresponds
+ * 1:1 to an `ADDITION_ALLOWLIST` resolver entry above (decision 453d1acc:
+ * allowlist route, do not regenerate the baseline). Adding an entry here
+ * does NOT weaken rail 3's other checks — MISSING baseline fields and
+ * DOUBLE-ATTACH still violate; this only exempts the exact field keys
+ * listed from the "extra"/unexpected-new-field check.
+ */
+export const EXPECTED_NEW_FIELDS: AllowlistEntry[] = [
+  {
+    logicalId: "Mutation.resumeExecution",
+    justification:
+      "StepRunner resume resolver — see ADDITION_ALLOWLIST entry " +
+      "AgenticAIApiResumeExecutionResolver38379257.",
+  },
+  {
+    logicalId: "Mutation.setEvalSamplingConfig",
+    justification:
+      "Decision d36fbbf7: eval-sampling AppSync wiring — see " +
+      "ADDITION_ALLOWLIST entry AgenticAIApiSetEvalSamplingConfigResolver7000B62F.",
+  },
+  {
+    logicalId: "Query.getEvalSamplingConfig",
+    justification:
+      "Decision d36fbbf7: eval-sampling AppSync wiring — see " +
+      "ADDITION_ALLOWLIST entry AgenticAIApiGetEvalSamplingConfigResolver9D568E32.",
+  },
+  {
+    logicalId: "Query.listEvalProdSamples",
+    justification:
+      "Decision d36fbbf7: eval-sampling AppSync wiring — see " +
+      "ADDITION_ALLOWLIST entry AgenticAIApiListEvalProdSamplesResolverFF0E4413.",
+  },
+  {
+    logicalId: "Query.listAvailableDataSources",
+    justification:
+      "Finding 0018a6d7: see ADDITION_ALLOWLIST entry " +
+      "AgenticAIApiListAvailableDataSourcesResolverF6DE4B81.",
+  },
+  {
+    logicalId: "Query.listIntegrationOperations",
+    justification:
+      "Finding 0018a6d7: see ADDITION_ALLOWLIST entry " +
+      "AgenticAIApiListIntegrationOperationsResolver737538A7.",
+  },
+  {
+    logicalId: "Mutation.updateAgentStatus",
+    justification:
+      "Finding 0018a6d7: UpdateAgentStatusResolver added in " +
+      "citadel-projects-dev (projects-stack.ts) on the existing " +
+      "AgentLambdaDataSource, same handler (agent-resolver.ts) and same " +
+      "project-membership/org check as its already-wired sibling " +
+      "Query.getAgentStatus. Not a backend-template addition (rail 1 " +
+      "doesn't see it) but rail 3's merged-set check spans all stacks, so " +
+      "it needs the same expected-new-field exemption.",
+  },
+  {
+    logicalId: "Subscription.onChatter",
+    justification:
+      "Wave-2a tenancy fix (finding 87a171ad section A): onChatter gained " +
+      "an orgId: ID! argument and an explicit connect-time authorization " +
+      "resolver (OnChatterSubscriptionAuthorizerResolver, " +
+      "chatter-subscription-authorizer.ts) in citadel-projects-dev. " +
+      "Previously this field had NO CfnResolver at all — it relied solely " +
+      "on the implicit @aws_subscribe(mutations:[...]) wiring, which never " +
+      "appears in the resolvers baseline. Attaching an explicit resolver " +
+      "is a genuinely new Subscription.onChatter key in the merged " +
+      "resolver set; not a backend-template addition (rail 1 doesn't see " +
+      "it, satellite-only).",
+  },
+  {
+    logicalId: "Subscription.onFabricationEvent",
+    justification:
+      "Wave-2a tenancy fix (finding 87a171ad section A): same rationale " +
+      "as Subscription.onChatter above, mirrored for onFabricationEvent " +
+      "via OnFabricationEventSubscriptionAuthorizerResolver in " +
+      "citadel-registry-dev.",
+  },
+  {
+    logicalId: "Subscription.onDesignProgress",
+    justification:
+      "Finding 195b2a58 item b: onDesignProgress gained an explicit " +
+      "connect-time authorization resolver " +
+      "(OnDesignProgressSubscriptionAuthorizerResolver, " +
+      "design-progress-subscription-authorizer.ts) in citadel-projects-dev, " +
+      "reconciling the requested projectId against the caller via the " +
+      "shared assertProjectAccess gate. Previously this field had NO " +
+      "CfnResolver at all — it relied solely on the implicit " +
+      "@aws_subscribe(mutations:[...]) wiring, which never appears in the " +
+      "resolvers baseline. Same shape as the Subscription.onChatter " +
+      "exemption above (satellite-only addition; rail 1 doesn't see it).",
+  },
+  {
+    logicalId: "Query.listPendingApprovals",
+    justification: "Pending approvals queue for administrators.",
+  },
+  {
+    logicalId: "Query.getTagPolicy",
+    justification: "CIT-042: Organisation tag policy read (member or admin).",
+  },
+  {
+    logicalId: "Mutation.updateTagPolicy",
+    justification: "CIT-042: Administrator-only tag policy editor.",
+  },
+  {
+    logicalId: "Mutation.pauseExecution",
+    justification:
+      "Execution approval API: see ADDITION_ALLOWLIST entry " +
+      "AgenticAIApiPauseExecutionResolver4601AFED.",
+  },
+  {
+    logicalId: "Mutation.approveExecution",
+    justification:
+      "Execution approval API: see ADDITION_ALLOWLIST entry " +
+      "AgenticAIApiApproveExecutionResolverCDDF9ECC.",
+  },
+  {
+    logicalId: "Mutation.testTool",
+    justification:
+      "Wiring fix: ToolSandboxFunction (services-stack.ts) now attached " +
+      "to BackendStack's AppSync API via L1 CfnDataSource/CfnResolver. " +
+      "Admin/architect-only (tool:execute permission gate in " +
+      "tool-sandbox.ts), org-scoped (finding 615aa5bb). Satellite-only " +
+      "addition (citadel-services-dev); rail 1 doesn't see it.",
+  },
+  {
+    logicalId: "Mutation.denyExecution",
+    justification:
+      "Execution approval API: see ADDITION_ALLOWLIST entry " +
+      "AgenticAIApiDenyExecutionResolver0902D82B.",
+  },
+  {
+    logicalId: "Query.listAwaitingApprovals",
+    justification:
+      "Execution approval API: see ADDITION_ALLOWLIST entry " +
+      "AgenticAIApiListAwaitingApprovalsResolver03BFE76A.",
+  },
+  {
+    logicalId: "Mutation.recordIntakeConsent",
+    justification:
+      "Intake consent gate (sec/intake-consent-gate): Cognito-auth " +
+      "mutation for writing short-lived consent records before privileged " +
+      "post-fabrication actions. Wired in citadel-projects-dev " +
+      "(projects-stack.ts). Not a backend-template addition.",
+  },
+];
+
+/**
+ * CIT-125 slice A — the one deliberate, justified addition to the backend
+ * template this stage allows: the shared per-stack async DLQ
+ * (`BackendAsyncDlq`) and its auto-generated `QueuePolicy`. Every other new
+ * logical ID added to citadel-backend-<env> still fails rail 1
+ * (removals-only guarantee preserved). Logical IDs below are the CDK
+ * auto-generated construct IDs for `new sqs.Queue(this, "BackendAsyncDlq",
+ * ...)` in backend-stack.ts — re-derive from a fresh synth diff if the
+ * construct ID or its position in the construct tree ever changes.
+ */
+export const ADDITION_ALLOWLIST: AllowlistEntry[] = [
+  {
+    logicalId: "BackendAsyncDlqB9955E40",
+    justification:
+      "CIT-125 slice A: shared per-stack async DLQ (function-level " +
+      "DeadLetterConfig) for the 7 previously-unprotected backend " +
+      "EventBridge Lambda consumers. Additive-only — no existing " +
+      "resource changes. Logical ID confirmed via `cdk synth " +
+      "citadel-backend-dev` (backend-stack.ts's `new sqs.Queue(this, " +
+      '"BackendAsyncDlq", ...)`).',
+  },
+  {
+    logicalId: "BackendAsyncDlqPolicy30F9D1E2",
+    justification:
+      "Auto-generated SQS QueuePolicy for BackendAsyncDlq (enforceSSL); " +
+      "moves with the queue. Logical ID confirmed via the same synth.",
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CIT-101 — Eval/Release/Promotion platform. 23 legitimate additions
+  // landed on main between the Jul-25 baseline capture and this
+  // reconciliation stage (decision 453d1acc: allowlist route, do not
+  // regenerate the baseline). Construct block backend-stack.ts:3283–3812;
+  // source comments there tag these tables "release evidence, governed
+  // like ExecutionSpecifications: RETAIN + deletionProtection + PITR".
+  // Logical IDs confirmed via a live `cdk synth citadel-backend-dev` +
+  // `npm run split:gates` run, not hand-typed.
+  // ═══════════════════════════════════════════════════════════════════════
+  {
+    logicalId: "EvalSuitesTableCD7FA97A",
+    justification: "CIT-101: eval/release platform — EvalSuites table.",
+  },
+  {
+    logicalId: "EvalCasesTable5ACF1009",
+    justification: "CIT-101: eval/release platform — EvalCases table.",
+  },
+  {
+    logicalId: "EvalRunsTable1462273E",
+    justification: "CIT-101: eval/release platform — EvalRuns table.",
+  },
+  {
+    logicalId: "EvalRunCaseResultsTable961B302A",
+    justification: "CIT-101: eval/release platform — EvalRunCaseResults table.",
+  },
+  {
+    logicalId: "EvalBaselinesTable1E81E088",
+    justification: "CIT-101: eval/release platform — EvalBaselines table.",
+  },
+  {
+    logicalId: "EvalComparisonsTableBB147DA7",
+    justification: "CIT-101: eval/release platform — EvalComparisons table.",
+  },
+  {
+    logicalId: "EvalComparisonConfigTable5E04F05F",
+    justification:
+      "CIT-101: eval/release platform — EvalComparisonConfig table.",
+  },
+  {
+    logicalId: "EvalSamplingConfigTable853B8B52",
+    justification: "CIT-101: eval/release platform — EvalSamplingConfig table.",
+  },
+  {
+    logicalId: "EvalProdSamplesTable2B37B8C9",
+    justification: "CIT-101: eval/release platform — EvalProdSamples table.",
+  },
+  {
+    logicalId: "AgentReleasesTable4E094171",
+    justification: "CIT-101: eval/release platform — AgentReleases table.",
+  },
+  {
+    logicalId: "EnvironmentReleasePointersTableFC230B29",
+    justification:
+      "CIT-101: eval/release platform — EnvironmentReleasePointers table.",
+  },
+  {
+    logicalId: "PromotionPolicyConfigTable47D26109",
+    justification:
+      "CIT-101: eval/release platform — PromotionPolicyConfig table.",
+  },
+  {
+    logicalId: "AgentReleaseWriterRole02E9922B",
+    justification:
+      "CIT-101: eval/release platform — writer role for AgentReleasesTable.",
+  },
+  {
+    logicalId: "AgentReleaseWriterRoleDefaultPolicy750604C6",
+    justification: "DefaultPolicy of AgentReleaseWriterRole; added with it.",
+  },
+  {
+    logicalId: "EnvironmentReleasePointerWriterRoleBAD849A2",
+    justification:
+      "CIT-101: eval/release platform — writer role for " +
+      "EnvironmentReleasePointersTable.",
+  },
+  {
+    logicalId: "EnvironmentReleasePointerWriterRoleDefaultPolicy054A5C1E",
+    justification:
+      "DefaultPolicy of EnvironmentReleasePointerWriterRole; added with it.",
+  },
+  {
+    logicalId: "PromotionPolicyConfigWriterRole8A02956B",
+    justification:
+      "CIT-101: eval/release platform — writer role for " +
+      "PromotionPolicyConfigTable.",
+  },
+  {
+    logicalId: "PromotionPolicyConfigWriterRoleDefaultPolicy507FE4A7",
+    justification:
+      "DefaultPolicy of PromotionPolicyConfigWriterRole; added with it.",
+  },
+  {
+    logicalId: "SeedEvalSuitesFunctionEEE6C7BC",
+    justification:
+      "CIT-101: eval/release platform — custom-resource seed Lambda for " +
+      "EvalSuitesTable.",
+  },
+  {
+    logicalId: "SeedEvalSuitesFunctionLogs5595E734",
+    justification: "LogGroup of SeedEvalSuitesFunction; added with it.",
+  },
+  {
+    logicalId: "SeedEvalSuitesFunctionServiceRole8B365008",
+    justification: "Execution role of SeedEvalSuitesFunction; added with it.",
+  },
+  {
+    logicalId: "SeedEvalSuitesFunctionServiceRoleDefaultPolicy7F26E48E",
+    justification:
+      "DefaultPolicy of SeedEvalSuitesFunction's role; added with it.",
+  },
+  {
+    logicalId: "SeedEvalSuitesResource",
+    justification:
+      "CustomResource invoking SeedEvalSuitesFunction on deploy; added with it.",
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Eval-sampling AppSync wiring (decision d36fbbf7, "Phase 2 production
+  // sampling"). 6 additions from
+  // `BackendStack.addEvalSamplingConfigResolvers()` (backend-stack.ts:
+  // 3901–3936), called from bin/app.ts:406 with a deterministic ARN of the
+  // TelemetryStack-owned `citadel-eval-sampling-config-resolver-<env>`
+  // Lambda — a cross-stack pattern used to avoid a cyclic stack dependency.
+  // ═══════════════════════════════════════════════════════════════════════
+  {
+    logicalId: "AgenticAIApiEvalSamplingConfigLambdaDataSourceD4E6867C",
+    justification:
+      "Decision d36fbbf7: eval-sampling AppSync wiring — Lambda " +
+      "DataSource pointing at TelemetryStack's eval-sampling-config " +
+      "resolver Lambda.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiEvalSamplingConfigLambdaDataSourceServiceRoleFC35DA0E",
+    justification:
+      "Service role of EvalSamplingConfigLambdaDataSource; added with it.",
+  },
+  {
+    logicalId:
+      "AgenticAIApiEvalSamplingConfigLambdaDataSourceServiceRoleDefaultPolicyA14B3695",
+    justification:
+      "DefaultPolicy of EvalSamplingConfigLambdaDataSource's role; added with it.",
+  },
+  {
+    logicalId: "AgenticAIApiSetEvalSamplingConfigResolver7000B62F",
+    justification:
+      "Decision d36fbbf7: eval-sampling AppSync wiring — " +
+      "Mutation.setEvalSamplingConfig resolver.",
+  },
+  {
+    logicalId: "AgenticAIApiGetEvalSamplingConfigResolver9D568E32",
+    justification:
+      "Decision d36fbbf7: eval-sampling AppSync wiring — " +
+      "Query.getEvalSamplingConfig resolver.",
+  },
+  {
+    logicalId: "AgenticAIApiListEvalProdSamplesResolverFF0E4413",
+    justification:
+      "Decision d36fbbf7: eval-sampling AppSync wiring — " +
+      "Query.listEvalProdSamples resolver.",
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // StepRunner resume resolver (1 addition).
+  // ═══════════════════════════════════════════════════════════════════════
+  {
+    logicalId: "AgenticAIApiResumeExecutionResolver38379257",
+    justification:
+      "StepRunner resume resolver — Mutation.resumeExecution on the " +
+      "existing ExecutionLambdaDataSource (backend-stack.ts:3011); adds " +
+      "workflow-resume capability, no existing resource changes.",
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Finding 0018a6d7 — orphan-resolver wiring for 2 backend-stack-owned
+  // fields with pre-existing tested handlers but no resolver (see
+  // schema-resolver-parity-guard.test.ts's now-shrunk DELIBERATELY_UNWIRED
+  // map). Both attach to an EXISTING datasource shared with an
+  // already-wired sibling field on the same handler — no new datasource,
+  // no new Lambda, no new wiring pattern.
+  // ═══════════════════════════════════════════════════════════════════════
+  {
+    logicalId: "AgenticAIApiListAvailableDataSourcesResolverF6DE4B81",
+    justification:
+      "Finding 0018a6d7: Query.listAvailableDataSources on the existing " +
+      "DataStoreLambdaDataSource, same handler (datastore-resolver.ts) and " +
+      "same org-scoped OrgIndex query pattern as its already-wired sibling " +
+      "Query.listDataStores.",
+  },
+  {
+    logicalId: "AgenticAIApiListIntegrationOperationsResolver737538A7",
+    justification:
+      "Finding 0018a6d7: Query.listIntegrationOperations on the existing " +
+      "ToolConfigLambdaDataSource, same handler (tool-config-resolver.ts) " +
+      "as its already-wired sibling Query.getToolConfig. Reads only the " +
+      "static, non-tenant OPERATIONS_REGISTRY — no org scoping needed.",
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // E19 phase-1 registry IAM resources migration (finding 8b7ee8af, decision
+  // 06077146): agent-registry:* IAM statements now use SSM parameter
+  // references instead of Fn::ImportValue for registry ARN/ID resolution.
+  // Backend gained 2 SSM parameters (RegistryIdParam, RegistryArnParam) to
+  // enable cross-stack registry identification. These parameters are
+  // retained exports from CitadelRegistryStack to support potential future
+  // registry discovery or re-addressing — a deliberate design choice, not a
+  // temporary artifact. The allowlist route (decision 453d1acc) is used
+  // rather than regenerating the baseline, as per the established
+  // reconciliation pattern.
+  // ═══════════════════════════════════════════════════════════════════════
+  {
+    logicalId: "RegistryIdParam7D00EE41",
+    justification:
+      "E19 phase-1: SSM parameter for registry ID (finding 8b7ee8af, " +
+      "decision 06077146). Enables cross-stack registry identification; " +
+      "retained as export from CitadelRegistryStack.",
+  },
+  {
+    logicalId: "RegistryArnParam22606220",
+    justification:
+      "E19 phase-1: SSM parameter for registry ARN (finding 8b7ee8af, " +
+      "decision 06077146). Replaces Fn::ImportValue for IAM resource " +
+      "resolution; retained as export from CitadelRegistryStack.",
+  },
+
+  // --- CIT-207: new SSM parameter publishing the Cognito UserPoolClient id ---
+  {
+    logicalId: "UserPoolClientIdParam5DF0EADC",
+    justification:
+      "CIT-207: SSM parameter (/citadel/<env>/cognito/client-id) " +
+      "publishing the Cognito UserPoolClient id so frontend/telemetry can " +
+      "resolve it without a cross-stack Fn::ImportValue (mirrors the E19 " +
+      "registry id/arn SSM channel, decision 06077146).",
+  },
+
+  // --- CIT-214: server-derived custom:organization claim (PR #226) ---
+  {
+    logicalId: "UserOrgMembershipTable7D8BD3BE",
+    justification:
+      "CIT-214 (decision 00d40a31, option A): authoritative " +
+      "user->organisation membership DynamoDB table; the Cognito " +
+      "pre-token-generation trigger mints custom:organization from it " +
+      "server-side (fail closed). Escalation finding 7aa877f8.",
+  },
+  {
+    logicalId: "PreTokenGenerationFunctionServiceRoleDefaultPolicy63BFB755",
+    justification:
+      "CIT-214: grantReadData on UserOrgMembershipTable for the " +
+      "pre-token-generation Lambda — the first IAM grant that function has " +
+      "needed, so CDK now emits a DefaultPolicy for its service role.",
+  },
+  {
+    logicalId: "AgenticAIApiListPendingApprovalsResolver024F6303",
+    justification: "Pending approvals queue for administrators.",
+  },
+  {
+    logicalId: "AgenticAIApiGetTagPolicyResolverC8C12F23",
+    justification: "CIT-042: Organisation tag policy read (member or admin).",
+  },
+  {
+    logicalId: "AgenticAIApiUpdateTagPolicyResolverC38663E3",
+    justification: "CIT-042: Administrator-only tag policy editor.",
+  },
+  {
+    logicalId: "AgenticAIApiPauseExecutionResolver4601AFED",
+    justification:
+      "Execution approval API: Mutation.pauseExecution on the existing " +
+      "ExecutionLambdaDataSource (backend-stack.ts).",
+  },
+  {
+    logicalId: "AgenticAIApiApproveExecutionResolverCDDF9ECC",
+    justification:
+      "Execution approval API: Mutation.approveExecution on the existing " +
+      "ExecutionLambdaDataSource (backend-stack.ts).",
+  },
+  {
+    logicalId: "AgenticAIApiDenyExecutionResolver0902D82B",
+    justification:
+      "Execution approval API: Mutation.denyExecution on the existing " +
+      "ExecutionLambdaDataSource (backend-stack.ts).",
+  },
+  {
+    logicalId: "AgenticAIApiListAwaitingApprovalsResolver03BFE76A",
+    justification:
+      "Execution approval API: Query.listAwaitingApprovals on the existing " +
+      "ExecutionLambdaDataSource (backend-stack.ts).",
+  },
+];
+
+/**
+ * CIT-125 slice A — per-satellite-Lambda allowed ADDED policy statements
+ * for rail 6. Each of the 6 moved Lambdas below (4 in citadel-projects-dev,
+ * 2 in citadel-registry-dev) gained exactly one new statement this slice:
+ * `sqs:SendMessage` on its stack's own shared async DLQ (a resource that
+ * does not exist in the backend baseline at all, so it can never be
+ * "covered by baseline" — it must be allowlisted here instead). Any OTHER
+ * broadening on these Lambdas still fails rail 6. Keyed by the exact Lambda
+ * function logical ID (matching how `buildBaseline`'s
+ * `lambdaRolePolicies` map is keyed); the resource string is the exact
+ * `GETATT:<logicalId>:Arn` normalized form `template-utils.ts` produces for
+ * a same-stack `Fn::GetAtt` reference (NOT a physical queue name — rail 6
+ * compares normalized IAM statements, not ARNs). Both the satellite DLQ
+ * logical IDs and the exact normalized form were confirmed via `cdk synth
+ * citadel-projects-dev citadel-registry-dev` + a live `npm run split:gates`
+ * run, not hand-typed.
+ */
+export const ALLOWED_SATELLITE_ADDED_STATEMENTS: Record<
+  string,
+  NormalizedPolicyStatement[]
+> = {
+  ChatterPublisherFunction40B50CEA: [
+    {
+      effect: "Allow",
+      actions: ["sqs:SendMessage"],
+      resources: ["GETATT:ProjectsAsyncDlq002366D5:Arn"],
+      conditionKeys: [],
+    },
+  ],
+  ProjectProgressUpdater66E18062: [
+    {
+      effect: "Allow",
+      actions: ["sqs:SendMessage"],
+      resources: ["GETATT:ProjectsAsyncDlq002366D5:Arn"],
+      conditionKeys: [],
+    },
+  ],
+  AssessmentCompletionNotifierF2243F8D: [
+    {
+      effect: "Allow",
+      actions: ["sqs:SendMessage"],
+      resources: ["GETATT:ProjectsAsyncDlq002366D5:Arn"],
+      conditionKeys: [],
+    },
+  ],
+  DesignProgressNotifier61A5E671: [
+    {
+      effect: "Allow",
+      actions: ["sqs:SendMessage"],
+      resources: ["GETATT:ProjectsAsyncDlq002366D5:Arn"],
+      conditionKeys: [],
+    },
+  ],
+  AgentImportManifestResultHandlerAC7A0B8E: [
+    {
+      effect: "Allow",
+      actions: ["sqs:SendMessage"],
+      resources: ["GETATT:RegistryAsyncDlq778E7865:Arn"],
+      conditionKeys: [],
+    },
+    // E19 phase-1: agent-registry GA namespace migration + SSM resolution
+    // (finding c6544456, finding 8b7ee8af, decision 06077146). Registry
+    // ARN/ID now resolved via SSM parameters instead of Fn::ImportValue.
+    {
+      effect: "Allow",
+      actions: [
+        "agent-registry:GetRegistryRecord",
+        "agent-registry:UpdateRegistryRecord",
+      ],
+      resources: [
+        "GETATT:SsmParameterValuecitadeldevregistryarnC96584B6F00A464EAD1953AFF4B05118Parameter:Ref",
+        "JOIN::GETATT:SsmParameterValuecitadeldevregistryarnC96584B6F00A464EAD1953AFF4B05118Parameter:Ref/*",
+      ],
+      conditionKeys: [],
+    },
+  ],
+  FabricationEventHandlerFunctionA425E3C0: [
+    {
+      effect: "Allow",
+      actions: ["sqs:SendMessage"],
+      resources: ["GETATT:RegistryAsyncDlq778E7865:Arn"],
+      conditionKeys: [],
+    },
+  ],
+  // E19 phase-1: agent-code-resolver's org+role authz fix (a29f50b) + SSM
+  // resolution (finding 8b7ee8af, decision 06077146) wired a bedrock-
+  // agentcore:GetRegistryRecord-only grant on the Registry (02a95f3, later
+  // renamed to agent-registry:GetRegistryRecord per finding c6544456) to
+  // look up the agent's Registry record for the orgId reconciliation check.
+  // Read-only, scoped to the registry ARN — no Create/Update/Delete action
+  // is granted. The satellite's frozen baseline predates this branch's authz
+  // work, so it cannot cover the statement; allowlisted here per the PR 111
+  // reconciliation pattern rather than regenerating the baseline
+  // (a separate governance act). E19 phase-1 now resolves the registry
+  // reference via SSM parameters instead of Fn::ImportValue.
+  AgentCodeResolverFunction720FFFB6: [
+    {
+      effect: "Allow",
+      actions: ["agent-registry:GetRegistryRecord"],
+      resources: [
+        "GETATT:SsmParameterValuecitadeldevregistryarnC96584B6F00A464EAD1953AFF4B05118Parameter:Ref",
+        "JOIN::GETATT:SsmParameterValuecitadeldevregistryarnC96584B6F00A464EAD1953AFF4B05118Parameter:Ref/*",
+      ],
+      conditionKeys: [],
+    },
+  ],
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // agent-registry GA namespace migration + E19 phase-1 SSM resolution
+  // (finding c6544456, finding 8b7ee8af, decision 06077146, decision
+  // 453d1acc: allowlist route, do not regenerate the frozen pre-split
+  // baseline). Every bedrock-agentcore:*Registry*/*RegistryRecord* action
+  // across the moved-Lambda roles was renamed to the agent-registry:
+  // equivalent (same operation names, same resource scoping) as part of the
+  // agent-registry GA rollout — a deliberate, intended IAM change, not a
+  // broadening. Additionally, E19 phase-1 (finding 8b7ee8af, decision
+  // 06077146) changed registry ARN/ID resolution from Fn::ImportValue to SSM
+  // parameter references, enabling cross-stack registry identification. The
+  // frozen baseline (captured pre-migration) can never cover an
+  // agent-registry:* action NOR SSM-resolved resources, so each statement
+  // is allowlisted here per-Lambda. Actions/resources below match what
+  // registry-stack.ts grants post-rename and post-SSM-migration; confirmed
+  // via a live `cdk synth citadel-registry-dev citadel-backend-dev` + `npm
+  // run split:gates` run, not hand-typed.
+  // ═══════════════════════════════════════════════════════════════════════
+  AgentImportResolverFunctionE5B20F94: [
+    {
+      effect: "Allow",
+      actions: [
+        "agent-registry:CreateRegistryRecord",
+        "agent-registry:UpdateRegistryRecord",
+        "agent-registry:UpdateRegistryRecordStatus",
+        "agent-registry:SubmitRegistryRecordForApproval",
+        "agent-registry:DeleteRegistryRecord",
+        "agent-registry:GetRegistryRecord",
+        "agent-registry:ListRegistryRecords",
+      ],
+      resources: [
+        "GETATT:SsmParameterValuecitadeldevregistryarnC96584B6F00A464EAD1953AFF4B05118Parameter:Ref",
+        "JOIN::GETATT:SsmParameterValuecitadeldevregistryarnC96584B6F00A464EAD1953AFF4B05118Parameter:Ref/*",
+      ],
+      conditionKeys: [],
+    },
+    // Tag-policy enforcement (CIT-042): read the caller's organisation
+    // policy row (grantReadData on OrganisationTable, cross-stack
+    // Fn::ImportValue resolved by CDK).
+    {
+      effect: "Allow",
+      actions: [
+        "dynamodb:BatchGetItem",
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:DescribeTable",
+        "dynamodb:GetItem",
+        "dynamodb:GetRecords",
+        "dynamodb:GetShardIterator",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+      ],
+      resources: ["GETATT:OrganisationTableF468D173:Arn"],
+      conditionKeys: [],
+    },
+    // Tag-policy enforcement (CIT-042): governance enforcement mode. CDK
+    // merges ssm:GetParameter grants into one statement — the pre-existing
+    // gateway-id param is included alongside the two new governance params.
+    {
+      effect: "Allow",
+      actions: ["ssm:GetParameter"],
+      resources: [
+        "arn:aws:ssm:us-west-2:000000000000:parameter/citadel/gateway-id-dev",
+        "arn:aws:ssm:us-west-2:000000000000:parameter/citadel/governance/effective_at/dev",
+        "arn:aws:ssm:us-west-2:000000000000:parameter/citadel/governance/enforce/dev",
+      ],
+      conditionKeys: [],
+    },
+  ],
+  // AgentImportManifestResultHandlerAC7A0B8E is merged into its existing
+  // key above (sqs:SendMessage DLQ grant + the renamed agent-registry
+  // statement, same finding c6544456) rather than duplicated here — a
+  // second top-level key with the same name would silently shadow the
+  // first in the object literal.
+  RegistryAgentRecordResolverFunction5D7EA0BC: [
+    {
+      effect: "Allow",
+      actions: [
+        "agent-registry:CreateRegistryRecord",
+        "agent-registry:UpdateRegistryRecord",
+        "agent-registry:UpdateRegistryRecordStatus",
+        "agent-registry:SubmitRegistryRecordForApproval",
+        "agent-registry:DeleteRegistryRecord",
+        "agent-registry:GetRegistryRecord",
+        "agent-registry:ListRegistryRecords",
+      ],
+      resources: [
+        "GETATT:SsmParameterValuecitadeldevregistryarnC96584B6F00A464EAD1953AFF4B05118Parameter:Ref",
+        "JOIN::GETATT:SsmParameterValuecitadeldevregistryarnC96584B6F00A464EAD1953AFF4B05118Parameter:Ref/*",
+      ],
+      conditionKeys: [],
+    },
+    // Publish/attach approval gate reads the governance enforcement mode
+    // (getGovernanceEnforce) — scoped ssm:GetParameter on the two rollout
+    // parameters only, same shape as backend-stack.ts / services-stack.ts.
+    // CDK merges same-effect/same-action addToRolePolicy() calls into one
+    // statement, so this covers the pre-existing app-api-key-pepper
+    // ssm:GetParameter resource alongside the two new governance ones —
+    // confirmed via the actual rail 6 satellite-synth diff, not hand-typed.
+    // 000000000000 is rail 6's normalized sandbox account (see
+    // normalizeArnAccount in template-utils.ts); region us-west-2 matches
+    // every other account-scoped ARN in this file.
+    {
+      effect: "Allow",
+      actions: ["ssm:GetParameter"],
+      resources: [
+        "arn:aws:ssm:us-west-2:000000000000:parameter/citadel/dev/app-api-key-pepper",
+        "arn:aws:ssm:us-west-2:000000000000:parameter/citadel/governance/effective_at/dev",
+        "arn:aws:ssm:us-west-2:000000000000:parameter/citadel/governance/enforce/dev",
+      ],
+      conditionKeys: [],
+    },
+    // PR-349 approval-cache write fix: grantReadWriteData on agentConfigTable
+    // (was grantReadData) so the decideRecord belt-and-braces path can write
+    // approval-cache fields. CDK merges the three grantReadWriteData calls
+    // (apps + workflows + agentConfig) into one statement with the union of
+    // their ARNs; the baseline had agentConfig as read-only, so the merged
+    // R/W statement is not covered. Confirmed via `cdk synth + npm run
+    // split:gates`, not hand-typed.
+    {
+      effect: "Allow",
+      actions: [
+        "dynamodb:BatchGetItem",
+        "dynamodb:BatchWriteItem",
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:DescribeTable",
+        "dynamodb:GetItem",
+        "dynamodb:GetRecords",
+        "dynamodb:GetShardIterator",
+        "dynamodb:PutItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:UpdateItem",
+      ],
+      resources: [
+        "GETATT:AgentConfigTableE9BDF3BA:Arn",
+        "GETATT:AppsTable172E1E77:Arn",
+        "GETATT:WorkflowsTable4E215008:Arn",
+        "JOIN::GETATT:AppsTable172E1E77:Arn/index/*",
+        "JOIN::GETATT:WorkflowsTable4E215008:Arn/index/*",
+      ],
+      conditionKeys: [],
+    },
+    // PR-349 ApprovalCacheWriteFailed metric: cloudwatch:PutMetricData scoped
+    // to the Citadel/Registry namespace via condition key. CDK emits the
+    // condition as part of the statement but rail 6 normalizes conditions
+    // away (conditionKeys: []), so the wildcard resource + action is what
+    // needs covering here.
+    {
+      effect: "Allow",
+      actions: ["cloudwatch:PutMetricData"],
+      resources: ["*"],
+      conditionKeys: [],
+    },
+  ],
+  RegistrySyncLambdaC145524B: [
+    {
+      effect: "Allow",
+      actions: [
+        "agent-registry:CreateRegistryRecord",
+        "agent-registry:UpdateRegistryRecord",
+        "agent-registry:UpdateRegistryRecordStatus",
+        "agent-registry:DeleteRegistryRecord",
+        "agent-registry:GetRegistryRecord",
+        "agent-registry:ListRegistryRecords",
+      ],
+      resources: [
+        "GETATT:SsmParameterValuecitadeldevregistryarnC96584B6F00A464EAD1953AFF4B05118Parameter:Ref",
+        "JOIN::GETATT:SsmParameterValuecitadeldevregistryarnC96584B6F00A464EAD1953AFF4B05118Parameter:Ref/*",
+      ],
+      conditionKeys: [],
+    },
+    // Bug #199: registry-sync GA path added UpdateItem for both the agents
+    // and tools cache tables, but the tools table grant was originally
+    // Get/Put/Delete only, so every tool-record event dead-lettered with
+    // AccessDenied. This statement covers the widened tools-table grant
+    // (Delete/Get/Put/UpdateItem) added alongside the pre-existing
+    // agents-table grant (000000000000 is rail 6's normalized sandbox
+    // account placeholder, not a real account).
+    {
+      effect: "Allow",
+      actions: [
+        "dynamodb:DeleteItem",
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+      ],
+      resources: [
+        "arn:aws:dynamodb:us-west-2:000000000000:table/citadel-tools-dev",
+      ],
+      conditionKeys: [],
+    },
+  ],
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Tag-policy enforcement (CIT-042): agent-import and fabricator-request
+  // resolvers now read the caller's organisation policy row
+  // (dynamodb:GetItem on OrganisationTable) and the governance enforcement
+  // mode (ssm:GetParameter on the two governance rollout parameters).
+  // The frozen baseline predates this branch, so these statements are
+  // allowlisted here. CDK merges same-effect/same-action addToRolePolicy
+  // calls, so agent-import's ssm:GetParameter includes the pre-existing
+  // gateway-id parameter alongside the two new governance ones.
+  // Confirmed via a live `npm run split:gates` run, not hand-typed.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // NOTE: AgentImportResolverFunctionE5B20F94 already has entries above
+  // (from the agent-registry GA migration). These new entries are MERGED
+  // into the existing key. Since JS object literals shadow duplicate keys,
+  // we must append to the existing array instead. The entries are spliced
+  // into the existing AgentImportResolverFunctionE5B20F94 array above.
+
+  // Tag-policy enforcement (CIT-042): fabricator-request-resolver reads the
+  // caller's organisation policy row and the governance enforcement mode.
+  // Confirmed via a live `npm run split:gates` run, not hand-typed.
+  FabricatorRequestResolverFunctionBCCF3ABD: [
+    {
+      effect: "Allow",
+      actions: [
+        "dynamodb:BatchGetItem",
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:DescribeTable",
+        "dynamodb:GetItem",
+        "dynamodb:GetRecords",
+        "dynamodb:GetShardIterator",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+      ],
+      resources: ["GETATT:OrganisationTableF468D173:Arn"],
+      conditionKeys: [],
+    },
+    {
+      effect: "Allow",
+      actions: ["ssm:GetParameter"],
+      resources: [
+        "arn:aws:ssm:us-west-2:000000000000:parameter/citadel/governance/effective_at/dev",
+        "arn:aws:ssm:us-west-2:000000000000:parameter/citadel/governance/enforce/dev",
+      ],
+      conditionKeys: [],
+    },
+  ],
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Scope KB document actions to the deployment knowledge base (finding
+  // c2ecd5c9). The frozen baseline had resources: ["*"]; the satellite now
+  // resolves the KB id via SSM and scopes to the exact KB ARN — a strict
+  // privilege narrowing. Confirmed via a live `npm run split:gates` run,
+  // not hand-typed.
+  // ═══════════════════════════════════════════════════════════════════════
+  DocumentUploadResolverFunction905C268F: [
+    {
+      effect: "Allow",
+      actions: [
+        "bedrock:DeleteKnowledgeBaseDocuments",
+        "bedrock:GetKnowledgeBaseDocuments",
+      ],
+      resources: [
+        "JOIN::arn:aws:bedrock:us-west-2:000000000000:knowledge-base/GETATT:SsmParameterValuecitadelknowledgebaseiddevC96584B6F00A464EAD1953AFF4B05118Parameter:Ref",
+      ],
+      conditionKeys: [],
+    },
+  ],
+};

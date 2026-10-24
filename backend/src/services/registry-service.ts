@@ -1,0 +1,2381 @@
+/**
+ * Registry Service Layer
+ *
+ * Encapsulates all AgentCore Registry API interactions. Resolvers and the
+ * Fabricator use this module instead of calling Registry APIs directly.
+ */
+import {
+  AgentRegistryControlClient,
+  CreateRegistryRecordCommand,
+  GetRegistryRecordCommand,
+  UpdateRegistryRecordCommand,
+  UpdateRegistryRecordStatusCommand,
+  SubmitRegistryRecordForApprovalCommand,
+  DeleteRegistryRecordCommand,
+  ListRegistryRecordsCommand,
+  RegistryRecordStatus,
+  RegistryRecordFilterName,
+  RecordType,
+} from "@aws-sdk/client-agent-registry-control";
+import type {
+  GetRegistryRecordCommandOutput,
+  ListRegistryRecordsCommandOutput,
+  RegistryRecordSummary,
+} from "@aws-sdk/client-agent-registry-control";
+import { sanitizeRegistryName } from "../utils/registry-name";
+import { LifecycleManager, REGISTRY_TRANSITIONS } from "../adapters/lifecycle";
+import { ConnectorError } from "../adapters/errors";
+import type { Viewer } from "../utils/record-visibility";
+import { isRecordVisible } from "../utils/record-visibility";
+import { resolveKind, inferKindFromParsed } from "../utils/citadel-kind";
+import type { CitadelKind } from "../utils/citadel-kind";
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by getResource when the requested `type` (agent/tool) does not
+ * match the stored record's descriptor content. Agents always carry a
+ * `manifest` in customDescriptorContent; tools do not. Callers (e.g. the
+ * AgentApp resolver) can catch this and surface a clean not-found error
+ * rather than leaking a mis-typed record to the UI.
+ */
+export class TypeMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TypeMismatchError";
+  }
+}
+
+/**
+ * Structured error for the agent-record approval lifecycle gate: illegal
+ * status transitions and pending-immutability violations. Carries a `code`
+ * so callers/UIs can branch on failure kind rather than string-matching the
+ * human message.
+ */
+export class RegistryLifecycleError extends ConnectorError {
+  constructor(
+    message: string,
+    code: "INVALID_TRANSITION" | "RECORD_IMMUTABLE",
+  ) {
+    super(message, code, false);
+    this.name = "RegistryLifecycleError";
+  }
+}
+
+/**
+ * Thrown by {@link RegistryService.resolveRecordId} when a name-based
+ * lookup cannot be resolved via direct lookup and the bounded enumeration
+ * fallback exhausts its time budget or page limit (finding ce7daab8: the
+ * unbounded fallback previously ran GetRegistryRecord once per record in
+ * the WHOLE registry with no time budget, triggering a
+ * 'Request rate exceeded' retry storm that blew the Lambda's 30s timeout).
+ *
+ * `retryable: false` — an immediate retry repeats the same enumeration
+ * cost and reproduces the same timeout; that retry-without-backoff pattern
+ * is the mechanism that caused the incident, so it must not be encouraged
+ * here. Callers should surface this to the user (e.g. "try again with the
+ * agent's recordId/ARN") rather than looping.
+ */
+export class RecordResolutionTimeoutError extends ConnectorError {
+  constructor(type: ResourceType, id: string) {
+    super(
+      `Timed out resolving registry record for ${type}: ${id} — the registry ` +
+        `is too large to enumerate within budget. Provide the record's ` +
+        `recordId or ARN directly, or narrow the lookup.`,
+      "RECORD_RESOLUTION_TIMEOUT",
+      false,
+    );
+    this.name = "RecordResolutionTimeoutError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Types & Interfaces
+// ---------------------------------------------------------------------------
+
+export interface RegistryServiceConfig {
+  registryId: string;
+  region: string;
+}
+
+export type BindingDirection = "INPUT" | "OUTPUT" | "BIDIRECTIONAL";
+
+/**
+ * Structural view of an AWS SDK error for transient/not-found checks.
+ * Used to inspect caught `unknown` errors without asserting a full class.
+ */
+interface AwsErrorLike {
+  name?: string;
+  $metadata?: { httpStatusCode?: number };
+}
+
+export interface IntegrationBinding {
+  integrationId: string;
+  integrationType: string;
+  operations?: string[];
+  direction?: BindingDirection;
+}
+
+export interface DataStoreBinding {
+  dataStoreId: string;
+  dataStoreType: string;
+  operations?: string[];
+  direction?: BindingDirection;
+}
+
+// ---------------------------------------------------------------------------
+// Agent import: invocation + origin descriptor blocks (US-IMP-001)
+//
+// These extend the agent descriptor stored in customDescriptorContent so an
+// imported (externally-owned) agent records HOW it is invoked and WHERE it
+// came from. Both blocks are optional — records that predate the import
+// feature carry neither and are treated as protocol=AGENTCORE_RUNTIME with
+// zero behaviour change (back-compat invariant 6).
+// ---------------------------------------------------------------------------
+
+/**
+ * Transport/protocol used to invoke an agent. The legacy AgentCore-only path
+ * is represented by AGENTCORE_RUNTIME, which is also the back-compat default
+ * for records with no invocation block.
+ */
+export type AgentInvocationProtocol =
+  | "AGENTCORE_RUNTIME"
+  | "BEDROCK_AGENT"
+  | "LAMBDA_INVOKE"
+  | "HTTP_ENDPOINT"
+  | "MCP"
+  | "A2A"
+  | "STEP_FUNCTIONS"
+  | "SAGEMAKER_ENDPOINT"
+  | "SQS_ASYNC";
+
+/** Authentication mode used when reaching an invocation target. */
+export type AgentInvocationAuthMode =
+  "SIGV4" | "API_KEY" | "OAUTH2" | "COGNITO" | "NONE" | "BEARER";
+
+/** Synchronous request/response vs. asynchronous callback delivery. */
+export type AgentInvocationMode = "sync" | "async_callback";
+
+/**
+ * How to reach and invoke an agent. `target` is protocol-specific (an ARN, an
+ * HTTPS URL, an MCP endpoint, ...). Secrets are never inlined here — only a
+ * `secretRef` pointing at Secrets Manager (RD1, least-privilege invariant 2).
+ */
+export interface AgentInvocationBlock {
+  protocol: AgentInvocationProtocol;
+  target: string;
+  auth: {
+    mode: AgentInvocationAuthMode;
+    secretRef?: string;
+    /**
+     * Custom request-header name for the resolved API_KEY secret (e.g.
+     * 'x-api-key'). Optional and only meaningful for mode API_KEY; absent ⇒ the
+     * secret is sent as `Authorization: <value>` (back-compat default). Ignored
+     * by the bearer-token modes (BEARER/OAUTH2/COGNITO) and by SIGV4/NONE.
+     */
+    header?: string;
+  };
+  mode: AgentInvocationMode;
+  region?: string;
+  account?: string;
+  roleArn?: string;
+  externalId?: string;
+  /**
+   * Operator-supplied READ-ONLY analysis role in the TARGET account of a
+   * cross-account `roleArn` (US-IMP Phase-2). When present, the activation
+   * trust-path path assumes this role (externalId-gated) to run read-only
+   * `iam:GetRole`/`GetRolePolicy` against `roleArn` in its home account, then
+   * attests like the same-account path. Absent ⇒ a cross-account `roleArn`
+   * falls back to the manual-attestation finding. Never carries a secret — the
+   * role must trust Citadel and is gated by {@link externalId}.
+   */
+  analysisRoleArn?: string;
+}
+
+/**
+ * Provenance for an imported agent. `ownership` is fixed at 'external' —
+ * Citadel orchestrates imported agents but never owns, redeploys, or scales
+ * the customer's infrastructure (invariant 1).
+ */
+export interface AgentOrigin {
+  sourceArn?: string;
+  account?: string;
+  region?: string;
+  substrate: string;
+  discoveredAt: string;
+  ownership: "external";
+}
+
+/**
+ * Confidence level for a proposed/inferred descriptor field, mirroring the
+ * agent-source `Confidence` union. Redeclared locally (rather than imported
+ * from ../adapters/agent-source/types) because that module imports its
+ * invocation/origin types FROM this file — keeping the alias here avoids a
+ * circular module dependency. LLM-proposed manifests are always 'low'.
+ */
+export type ProposedManifestConfidence = "high" | "medium" | "low";
+
+/**
+ * UNTRUSTED, LLM-proposed agent manifest stored on a DRAFT import record
+ * (Tier-3 agent import). It is ingested asynchronously from the Fabricator,
+ * recursively sanitized, and parked here PENDING HUMAN REVIEW — it is NEVER
+ * promoted into the trusted {@link AgentCustomMetadata.manifest}, never alters
+ * {@link AgentCustomMetadata.invocation} / `state` /
+ * {@link AgentCustomMetadata.governanceAttestation}, and never activates the
+ * agent. A separate, human-gated accept step (a later increment) is the ONLY
+ * path from here into the trusted manifest.
+ *
+ * Required fields are always stamped by the result handler; the optional
+ * fields are present on the 'pending_review' (proposed) path and mostly absent
+ * on the minimal 'failed' marker.
+ */
+export interface ProposedManifestMetadata {
+  /** The sanitized LLM-proposed manifest. Untrusted-derived; never auto-trusted. */
+  manifest?: Record<string, unknown>;
+  /** Always 'low' for an LLM proposal (invariant: LLM-inferred ⇒ low). */
+  confidence?: ProposedManifestConfidence;
+  /**
+   * Review gate. 'pending_review' on a proposal; 'failed' on the failure
+   * marker; 'accepted' once the human-gated Tier-3 accept step has promoted the
+   * proposed manifest into the trusted manifest. Acceptance NEVER activates the
+   * agent — the record still STAYS DRAFT.
+   */
+  reviewState: "pending_review" | "failed" | "accepted";
+  /** Provenance — fixed for the Tier-3 LLM path. */
+  source: "llm_tier3";
+  /** Per-field confidence for the proposed manifest; all 'low' for an LLM proposal. */
+  fieldConfidence?: Record<string, ProposedManifestConfidence>;
+  /** ISO 8601 timestamp the proposal/marker was stored. */
+  proposedAt: string;
+  /** Correlation id from the proposing event (tracing). */
+  correlationId?: string;
+  /** True once the proposed JSON has passed recursive sanitization. */
+  sanitized?: boolean;
+  /** True iff sanitization hit a structural cap and truncated the payload. */
+  truncated?: boolean;
+  /** Sanitized + length-capped failure detail (failure marker only). */
+  error?: string;
+  /**
+   * Identity (Cognito `sub`, falling back to `username`) of the admin/architect
+   * who ACCEPTED the proposal. Additive: set only when `reviewState` advances to
+   * 'accepted' via the human-gated Tier-3 accept step; absent while
+   * 'pending_review'/'failed'.
+   */
+  reviewedBy?: string;
+  /**
+   * ISO 8601 timestamp at which `reviewState` advanced to 'accepted'. Additive:
+   * set alongside {@link reviewedBy} on acceptance; absent otherwise.
+   */
+  reviewedAt?: string;
+}
+
+/**
+ * Classification of a best-effort reachability probe (US-IMP-017b). Redeclared
+ * locally (rather than imported from ../utils/reachability-probe) to keep this
+ * service free of a utility import and consistent with the locally-declared
+ * {@link ProposedManifestConfidence}.
+ */
+export type AgentReachabilityClassification =
+  "reachable" | "unreachable" | "unverifiable_private" | "no_endpoint";
+
+/**
+ * Result of a BACKEND-ONLY best-effort reachability probe of an imported
+ * agent's endpoint (US-IMP-017b). Additive and READ-only downstream: written
+ * ONLY by the `probeImportReachability` resolver, NEVER promoted into
+ * {@link AgentCustomMetadata.manifest} / `invocation` / `state` /
+ * {@link AgentCustomMetadata.governanceAttestation}, and never activates the
+ * agent. The import Lambda runs outside any VPC, so a private/cross-account
+ * target is honestly 'unverifiable_private' rather than a false 'unreachable'.
+ */
+export interface AgentReachabilityMetadata {
+  /** True only when an HTTP response was observed from a PUBLIC endpoint. */
+  reachable: boolean;
+  /** How the endpoint was classified by the probe. */
+  classification: AgentReachabilityClassification;
+  /** Short, secret-free detail (e.g. 'HTTP 200', a network error, the VPC note). */
+  detail?: string;
+  /** ISO 8601 timestamp at which the probe ran. */
+  checkedAt: string;
+}
+
+/**
+ * Record of an imported agent published as a target on Citadel's shared
+ * AgentCore Gateway (US-IMP-031). Additive and READ-only downstream: written
+ * ONLY by the `publishImportToGateway` / `unpublishImportFromGateway` resolvers,
+ * NEVER promoted into {@link AgentCustomMetadata.manifest} / `invocation` /
+ * `state` / {@link AgentCustomMetadata.governanceAttestation}, and never
+ * activates the agent (the record STAYS DRAFT — direct invoke remains the
+ * default). Absent until the agent has been published at least once.
+ *
+ * `targetType` is fixed at 'mcpServer' for now — only invocation.protocol==='MCP'
+ * imports are gateway-publishable; REST/OpenAPI (HTTP_ENDPOINT) publish is
+ * deferred. `credentialProviderArn` is present only when auth was offloaded
+ * (API_KEY/BEARER); a NONE-auth publication carries no provider. `status`
+ * advances 'published' → 'unpublished' when the target is removed; the audit
+ * fields are retained across an unpublish.
+ */
+export interface GatewayPublicationMetadata {
+  status: "published" | "unpublished";
+  targetType: "mcpServer";
+  gatewayId: string;
+  gatewayTargetId: string;
+  /** Present only when auth was offloaded (API_KEY/BEARER); absent for NONE. */
+  credentialProviderArn?: string;
+  /** ISO 8601 timestamp at which the agent was (most recently) published. */
+  publishedAt: string;
+  /** Identity (Cognito `sub`, falling back to `username`) of the publisher. */
+  publishedBy: string;
+}
+
+export interface AgentCustomMetadata {
+  categories: string[];
+  icon: string;
+  state: "active" | "inactive" | "maintenance";
+  appId?: string;
+  manifest?: Record<string, unknown>;
+  orgId?: string;
+  /** AppSync caller identity (Cognito sub/username) recorded at create time. */
+  createdBy?: string;
+  /** Present only on imported agents (US-IMP-001). Absent ⇒ AGENTCORE_RUNTIME. */
+  invocation?: AgentInvocationBlock;
+  /** Present only on imported agents (US-IMP-001). */
+  origin?: AgentOrigin;
+  /**
+   * Governance attestation stamped when an externally-owned agent is imported.
+   * Additive: absent on every record that predates the governance retrofit and
+   * on all non-import create paths. `status` advances 'pending' → 'attested'
+   * once governance has acknowledged the requested authority grant.
+   */
+  governanceAttestation?: {
+    status: "pending" | "attested";
+    enforcementMode: string;
+    authorityRequested: boolean;
+    requestedAt: string;
+    /**
+     * Id of the system-generated Architecture Decision Record recorded when the
+     * agent was imported (US-IMP ADR-on-import). Additive and best-effort:
+     * absent when the import ADR write failed, and on every record that predates
+     * ADR-on-import.
+     */
+    adrId?: string;
+    /**
+     * Identity (Cognito `sub`, falling back to `username`) of the admin/architect
+     * who attested the import. Additive: set only when `status` advances to
+     * 'attested' via the `attestAgentImport` mutation; absent while 'pending'.
+     */
+    attestedBy?: string;
+    /**
+     * ISO 8601 timestamp at which `status` advanced to 'attested'. Additive:
+     * set alongside {@link attestedBy} on attestation; absent while 'pending'.
+     */
+    attestedAt?: string;
+  };
+  /**
+   * UNTRUSTED, LLM-proposed manifest parked for human review (Tier-3 agent
+   * import). Additive and READ-only downstream: written ONLY by the
+   * agent-import-manifest result handler, NEVER promoted automatically into
+   * {@link manifest}, and never alters `invocation` / `state` /
+   * `governanceAttestation`. Absent on every record that has no pending
+   * proposal (the overwhelming majority).
+   */
+  proposedManifest?: ProposedManifestMetadata;
+  /**
+   * BACKEND-ONLY best-effort reachability probe result (US-IMP-017b). Additive
+   * and READ-only downstream: written ONLY by the `probeImportReachability`
+   * resolver, NEVER promoted into {@link manifest} / `invocation` / `state` /
+   * `governanceAttestation`. Absent until a probe has run.
+   */
+  reachability?: AgentReachabilityMetadata;
+  /**
+   * Record of a publication to Citadel's shared AgentCore Gateway (US-IMP-031).
+   * Additive and READ-only downstream: written ONLY by the
+   * `publishImportToGateway` / `unpublishImportFromGateway` resolvers, NEVER
+   * promoted into {@link manifest} / `invocation` / `state` /
+   * `governanceAttestation`. Absent until the agent has been published once.
+   */
+  gatewayPublication?: GatewayPublicationMetadata;
+  /** User-supplied resource tags (CIT-042). Format-validated by normaliseTags. */
+  tags?: Record<string, string>;
+  /** Admin who approved/rejected this agent record. */
+  decidedBy?: string;
+  /** ISO timestamp of the approval/rejection decision. */
+  decidedAt?: string;
+  /** Reason supplied when this agent record was rejected. */
+  statusReason?: string;
+}
+
+/**
+ * Returns the invocation protocol for an agent's metadata, defaulting to
+ * AGENTCORE_RUNTIME for legacy records that carry no invocation block
+ * (back-compat invariant 6). Accepts any object exposing an optional
+ * `invocation` so callers can pass a full AgentCustomMetadata or a partial.
+ */
+export function getInvocationProtocol(meta: {
+  invocation?: AgentInvocationBlock;
+}): AgentInvocationProtocol {
+  return meta.invocation?.protocol ?? "AGENTCORE_RUNTIME";
+}
+
+export interface ToolCustomMetadata {
+  categories: string[];
+  icon: string;
+  state: "active" | "inactive" | "maintenance";
+  integrationBindings?: IntegrationBinding[];
+  dataStoreBindings?: DataStoreBinding[];
+  appId?: string;
+  config?: string; // full tool config JSON (was previously dumped in `description`)
+  createdBy?: string; // AppSync caller identity or 'unknown'
+  orgId?: string;
+  decidedBy?: string; // admin who approved/rejected
+  decidedAt?: string; // ISO timestamp of decision
+  statusReason?: string; // reason for rejection
+  /** User-supplied resource tags (CIT-042). Format-validated by normaliseTags. */
+  tags?: Record<string, string>;
+}
+
+export type ResourceType = "agent" | "tool";
+
+/**
+ * Registry record status values from the SDK.
+ *
+ * The design doc refers to "Published" but the actual SDK enum value is
+ * "APPROVED". We use the SDK constants directly.
+ */
+export const RegistryRecordStatusValues = {
+  DRAFT: "DRAFT",
+  PENDING_APPROVAL: "PENDING_APPROVAL",
+  APPROVED: "APPROVED",
+  REJECTED: "REJECTED",
+  DEPRECATED: "DEPRECATED",
+  CREATING: "CREATING",
+  UPDATING: "UPDATING",
+  CREATE_FAILED: "CREATE_FAILED",
+  UPDATE_FAILED: "UPDATE_FAILED",
+} as const;
+
+export type RegistryRecordStatusValue =
+  (typeof RegistryRecordStatusValues)[keyof typeof RegistryRecordStatusValues];
+
+/**
+ * A lightweight representation of a Registry record returned by get/list
+ * operations. Downstream code should depend on this shape rather than the
+ * raw SDK output so that mapping logic stays centralised.
+ */
+export interface RegistryRecord {
+  recordId: string;
+  name: string;
+  description?: string;
+  status: string;
+  customDescriptorContent?: string;
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+// ---------------------------------------------------------------------------
+// Output types — GraphQL response shapes
+// ---------------------------------------------------------------------------
+
+export interface AgentConfig {
+  agentId: string;
+  name?: string;
+  /** Human-readable description surfaced from the Registry record. */
+  description?: string;
+  orgId: string;
+  config: string;
+  state: string;
+  categories?: string[];
+  createdAt?: string;
+  updatedAt?: string;
+  /**
+   * Raw Registry record status (e.g. "DRAFT", "APPROVED"), present only when
+   * this AgentConfig was built from a Registry record via mapToAgentConfig.
+   * Left undefined on legacy, non-registry rows — the explicit discriminator
+   * clients use to tell registry-backed records from legacy ones.
+   */
+  registryStatus?: string;
+  manifest?: Record<string, unknown>;
+  /**
+   * UNTRUSTED, LLM-proposed manifest surfaced READ-ONLY for review UIs
+   * (Tier-3 agent import). Present only while a proposal is pending/failed;
+   * absent otherwise. Never a trusted/active manifest.
+   */
+  proposedManifest?: ProposedManifestMetadata;
+  /**
+   * BACKEND-ONLY best-effort reachability probe result surfaced READ-ONLY
+   * (US-IMP-017b). Present only once a probe has run; never an active/trusted
+   * field.
+   */
+  reachability?: AgentReachabilityMetadata;
+  /**
+   * Record of a publication to Citadel's shared AgentCore Gateway (US-IMP-031),
+   * surfaced READ-ONLY. Present only once the agent has been published; never an
+   * active/trusted field and never changes the record's DRAFT/activation state.
+   */
+  gatewayPublication?: GatewayPublicationMetadata;
+  /** AppSync caller identity who created this record. Absent on legacy records. */
+  createdBy?: string;
+  /** Admin who approved/rejected this agent record. */
+  decidedBy?: string;
+  /** ISO timestamp of the approval/rejection decision. */
+  decidedAt?: string;
+  /** Reason supplied when this agent record was rejected. */
+  statusReason?: string;
+  /** User-supplied resource tags (CIT-042). Absent on legacy/pre-tag records. */
+  tags?: Record<string, string>;
+}
+
+export interface ToolConfig {
+  toolId: string;
+  orgId: string;
+  config: string;
+  state: string;
+  /**
+   * Raw Registry record status (e.g. "DRAFT", "APPROVED"), present only when
+   * this ToolConfig was built from a Registry record via mapToToolConfig.
+   * Left undefined on legacy, non-registry rows — the explicit discriminator
+   * clients use to tell registry-backed records from legacy ones.
+   */
+  registryStatus?: string;
+  categories?: string[];
+  integrationBindings?: IntegrationBinding[] | null;
+  dataStoreBindings?: DataStoreBinding[] | null;
+  createdAt?: string;
+  updatedAt?: string;
+  /** AppSync caller identity who created this record. Absent on legacy records. */
+  createdBy?: string;
+  /** Admin who approved/rejected this record. */
+  decidedBy?: string;
+  /** ISO timestamp of the approval/rejection decision. */
+  decidedAt?: string;
+  /** Reason supplied when this record was rejected. */
+  statusReason?: string;
+  /** User-supplied resource tags (CIT-042). Absent on legacy/pre-tag records. */
+  tags?: Record<string, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Pending-approval output type (CIT-040)
+// ---------------------------------------------------------------------------
+
+/**
+ * Lightweight view of a registry record awaiting admin approval, combining
+ * both agent and tool record types into a single queue item.
+ */
+export interface PendingApproval {
+  recordId: string;
+  recordType: "agent" | "tool" | "app";
+  name: string;
+  displayName: string;
+  orgId: string;
+  submittedAt: string | undefined;
+  createdBy: string | undefined;
+  status: string;
+  version: number | undefined;
+}
+
+export interface ListPendingApprovalsOptions {
+  limit?: number;
+  nextToken?: string;
+}
+
+export interface ListPendingApprovalsResult {
+  items: PendingApproval[];
+  nextToken?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Input types for CRUD
+// ---------------------------------------------------------------------------
+
+export interface CreateResourceInput {
+  name: string;
+  description?: string;
+  customMetadata: string; // serialised JSON
+  /** Optional caller identity to stamp into customDescriptorContent (agents). */
+  createdBy?: string;
+}
+
+export interface UpdateResourceInput {
+  name?: string;
+  description?: string;
+  customMetadata?: string; // serialised JSON
+}
+
+// ---------------------------------------------------------------------------
+// Service class
+// ---------------------------------------------------------------------------
+
+/**
+ * Options for {@link RegistryService.listResources}.
+ */
+export interface ListResourcesOptions {
+  /**
+   * Remaining-time budget supplier — wire it to the Lambda
+   * `context.getRemainingTimeInMillis`. When the returned value drops below
+   * {@link minRemainingTimeMs}, listResources stops issuing Registry calls
+   * and returns the records completed so far (a partial list) instead of
+   * timing out the caller.
+   */
+  getRemainingTimeMs?: () => number;
+  /**
+   * Floor (ms) below which no further Registry calls are issued.
+   * Defaults to 5000.
+   */
+  minRemainingTimeMs?: number;
+  /**
+   * When supplied, records are filtered through `isRecordVisible(viewer, ...)`
+   * before being returned. Omitting the viewer preserves the existing
+   * behaviour for internal callers that need the full unfiltered list.
+   */
+  viewer?: Viewer;
+}
+
+export class RegistryService {
+  private readonly client: AgentRegistryControlClient;
+  /**
+   * Shared LifecycleManager for REGISTRY_TRANSITIONS (agent-record approval
+   * lifecycle). Stateless — safe as a single static instance across all
+   * RegistryService instances.
+   */
+  private static readonly lifecycleManager = new LifecycleManager(
+    REGISTRY_TRANSITIONS,
+  );
+  private readonly registryId: string;
+
+  /**
+   * Upper bound on concurrent GetRegistryRecord calls issued while
+   * hydrating list summaries (the N+1 fix — see listResources).
+   */
+  private static readonly LIST_DETAIL_CONCURRENCY = 10;
+
+  // ---------------------------------------------------------------------
+  // resolveRecordId LRU cache
+  //
+  // Name-keyed lookups call ListRegistryRecords, which is O(N) over every
+  // record in the registry. At hundreds of agents that becomes the dominant
+  // cost of every binding/transition handler call. A small in-memory LRU
+  // (insertion-order Map with a TTL guard) collapses repeated lookups for
+  // the same name to a single list call within the TTL window.
+  //
+  // Notes:
+  //   * The 12-char fast path bypasses the cache entirely — it's already O(1).
+  //   * Cache lifetime is per-instance. The Lambda warm pool gets the benefit
+  //     across invocations; cold starts pay the full list cost once.
+  //   * Eviction is "oldest insertion first" (not strict LRU on read), but
+  //     reads do refresh recency by re-inserting on hit, so it is effectively
+  //     LRU for the workloads we care about.
+  // ---------------------------------------------------------------------
+  private readonly recordIdCache = new Map<
+    string,
+    { recordId: string; expiresAt: number }
+  >();
+  private readonly RECORD_ID_CACHE_MAX = 500;
+  private readonly RECORD_ID_CACHE_TTL_MS = 60_000;
+
+  constructor(config: RegistryServiceConfig) {
+    this.registryId = config.registryId;
+    this.client = new AgentRegistryControlClient({
+      region: config.region,
+    });
+  }
+
+  // -- resolveRecordId cache helpers ---------------------------------------
+
+  private cacheGet(key: string): string | undefined {
+    const entry = this.recordIdCache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expiresAt) {
+      this.recordIdCache.delete(key);
+      return undefined;
+    }
+    // Refresh recency by re-inserting (Map iteration order is insertion order).
+    this.recordIdCache.delete(key);
+    this.recordIdCache.set(key, entry);
+    return entry.recordId;
+  }
+
+  private cacheSet(key: string, recordId: string): void {
+    if (this.recordIdCache.size >= this.RECORD_ID_CACHE_MAX) {
+      const oldestKey = this.recordIdCache.keys().next().value;
+      if (oldestKey !== undefined) this.recordIdCache.delete(oldestKey);
+    }
+    this.recordIdCache.set(key, {
+      recordId,
+      expiresAt: Date.now() + this.RECORD_ID_CACHE_TTL_MS,
+    });
+  }
+
+  /**
+   * Test-only helper: clear the resolveRecordId cache. Production code
+   * should not need this — the cache is bounded by size and TTL.
+   */
+  clearRecordIdCache(): void {
+    this.recordIdCache.clear();
+  }
+
+  // -- Accessors (useful for testing) --------------------------------------
+
+  /** Returns the registryId this service was initialised with. */
+  getRegistryId(): string {
+    return this.registryId;
+  }
+
+  /** Returns the underlying SDK client (useful for testing / mocking). */
+  getClient(): AgentRegistryControlClient {
+    return this.client;
+  }
+
+  // -- Retry helper ---------------------------------------------------------
+
+  /**
+   * Retries an async operation with exponential backoff for transient errors.
+   * Retries on 5xx status codes and timeout/network errors. Non-retryable
+   * errors are thrown immediately.
+   */
+  private async withRetry<T>(
+    operation: () => Promise<T>,
+    maxAttempts: number = 3,
+  ): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await operation();
+      } catch (err: unknown) {
+        lastError = err;
+        const isTransient = this.isTransientError(err);
+        if (!isTransient || attempt === maxAttempts) {
+          throw err;
+        }
+        const delayMs = Math.pow(2, attempt - 1) * 100; // 100ms, 200ms, 400ms…
+        console.warn(
+          `Transient error on attempt ${attempt}/${maxAttempts}, retrying in ${delayMs}ms: ${
+            err instanceof Error ? err.message : err
+          }`,
+        );
+        await this.sleep(delayMs);
+      }
+    }
+    // Unreachable, but satisfies TypeScript
+    throw lastError;
+  }
+
+  /** Returns true if the error is transient (5xx, timeout, network). */
+  private isTransientError(err: unknown): boolean {
+    const statusCode = (err as AwsErrorLike)?.$metadata?.httpStatusCode;
+    if (statusCode && statusCode >= 500) return true;
+
+    const name = (err as AwsErrorLike)?.name ?? "";
+    if (
+      name === "TimeoutError" ||
+      name === "NetworkingError" ||
+      name === "ECONNRESET" ||
+      name === "ThrottlingException" ||
+      name === "TooManyRequestsException" ||
+      name === "ServiceUnavailableException" ||
+      name === "InternalServerException"
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Promise-based sleep. Extracted for testability. */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // -- CRUD operations (task 3.4) ------------------------------------------
+
+  /**
+   * Creates a new resource (agent or tool) in the Registry.
+   *
+   * The SDK's CreateRegistryRecord does not accept a recordId — the service
+   * generates one. We store custom metadata in a CUSTOM descriptor's `data`
+   * field (GA schema: the old `descriptors.custom.inlineContent` became
+   * `descriptors.custom.data`). GA also requires both a unique `name` and a
+   * `recordType`; the old API's single `name` field is now `displayName`
+   * (non-unique, human-readable) — the sanitized name is sent as BOTH `name`
+   * (uniqueness constraint) and `displayName` (display value) so existing
+   * callers that only ever supplied one name string keep working unchanged.
+   * After creation we issue a GetRegistryRecord to retrieve the full record
+   * (the create response only returns recordArn + status).
+   */
+  async createResource(
+    type: ResourceType,
+    id: string,
+    input: CreateResourceInput,
+  ): Promise<RegistryRecord> {
+    // The Registry rejects names failing ^[a-zA-Z0-9][a-zA-Z0-9_\-./]*$ with
+    // a ValidationException (live-verified: spaces are illegal). Every create
+    // caller — createApp (UI + intake), agent import, agent/tool config —
+    // flows through here, so this is THE shared sanitization point.
+    const safeName = sanitizeRegistryName(input.name);
+    // When the caller supplies a createdBy identity, stamp it into the
+    // custom metadata so it persists alongside orgId for ownership queries.
+    let metadataJson = input.customMetadata;
+    if (input.createdBy) {
+      try {
+        const parsed = JSON.parse(metadataJson);
+        parsed.createdBy = input.createdBy;
+        metadataJson = JSON.stringify(parsed);
+      } catch {
+        // If metadata is unparseable, leave it as-is.
+      }
+    }
+    const createResult = await this.withRetry(() =>
+      this.client.send(
+        new CreateRegistryRecordCommand({
+          registryId: this.registryId,
+          name: safeName,
+          displayName: safeName,
+          description: input.description,
+          recordType: RecordType.CUSTOM,
+          descriptors: {
+            custom: {
+              data: metadataJson,
+            },
+          },
+        }),
+      ),
+    );
+
+    // Extract recordId from the ARN (last segment after '/')
+    const recordArn = createResult.recordArn ?? "";
+    const recordId = recordArn.includes("/")
+      ? recordArn.substring(recordArn.lastIndexOf("/") + 1)
+      : id;
+
+    // Fetch the full record to populate all fields
+    const fullRecord = await this.getResource(type, recordId);
+    if (fullRecord) {
+      return fullRecord;
+    }
+
+    // Fallback: construct from input if get fails
+    return {
+      recordId,
+      name: safeName,
+      description: input.description,
+      status: createResult.status ?? RegistryRecordStatusValues.DRAFT,
+      customDescriptorContent: input.customMetadata,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
+  /**
+   * Retrieves a single resource from the Registry.
+   * Returns `null` if the resource is not found (404).
+   */
+  async getResource(
+    type: ResourceType,
+    id: string,
+  ): Promise<RegistryRecord | null> {
+    // Treat `id` as the Registry recordId. Callers that have a name-only
+    // reference must resolve it via resolveRecordId first.
+    const recordId = id;
+    try {
+      const result: GetRegistryRecordCommandOutput = await this.withRetry(() =>
+        this.client.send(
+          new GetRegistryRecordCommand({
+            registryId: this.registryId,
+            recordId,
+          }),
+        ),
+      );
+
+      const customDescriptorContent = result.descriptors?.custom?.data;
+
+      // Enforce requested type vs descriptor content. Tools store their
+      // config in the `description` field and have no manifest; agents
+      // always have a manifest. Mismatches indicate the caller is reading
+      // a record of the wrong type — throw rather than leaking mis-typed
+      // data to the UI.
+      const meta = customDescriptorContent
+        ? JSON.parse(customDescriptorContent)
+        : {};
+      const inferredKind = inferKindFromParsed(meta);
+      const isAgentOrApp = inferredKind === "agent" || inferredKind === "app";
+      if (type === "agent" && !isAgentOrApp) {
+        throw new TypeMismatchError(
+          `Record ${recordId} exists but is not an agent (no manifest)`,
+        );
+      }
+      if (type === "tool" && isAgentOrApp) {
+        throw new TypeMismatchError(
+          `Record ${recordId} exists but is not a tool (has manifest)`,
+        );
+      }
+
+      return {
+        recordId: result.recordId ?? id,
+        name: result.name ?? "",
+        description: result.description,
+        status: result.status ?? "",
+        customDescriptorContent,
+        createdAt: result.createdAt,
+        updatedAt: result.updatedAt,
+      };
+    } catch (err: unknown) {
+      if (
+        (err as AwsErrorLike).name === "ResourceNotFoundException" ||
+        (err as AwsErrorLike)?.$metadata?.httpStatusCode === 404
+      ) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Upper bound on how long the enumeration fallback in
+   * {@link resolveRecordId} is allowed to run before giving up. Chosen well
+   * under the 30s Lambda timeout so a structured
+   * {@link RecordResolutionTimeoutError} always has time to propagate and
+   * be handled by the caller instead of the invocation hard-timing-out.
+   */
+  private static readonly RESOLVE_FALLBACK_TIME_BUDGET_MS = 8000;
+
+  /**
+   * Upper bound on the number of ListRegistryRecords pages the enumeration
+   * fallback in {@link resolveRecordId} will consume. A second, independent
+   * cap alongside the time budget — protects against a pathological case
+   * where individual list calls stay fast (so the time budget alone would
+   * allow many pages) but the registry has an extreme number of pages.
+   */
+  private static readonly RESOLVE_FALLBACK_MAX_PAGES = 50;
+
+  /**
+   * Extracts the recordId from a Registry record ARN
+   * (`arn:aws:agent-registry:<region>:<account>:registry/<registryId>/record/<recordId>`).
+   * Returns undefined if `id` is not ARN-shaped.
+   */
+  private static extractRecordIdFromArn(id: string): string | undefined {
+    if (!id.startsWith("arn:")) return undefined;
+    const match = /\/record\/([a-zA-Z0-9]{12})$/.exec(id);
+    return match?.[1];
+  }
+
+  /**
+   * Resolves a resource name (toolId/agentId) to its Registry recordId.
+   *
+   * Resolution order (finding ce7daab8 — direct lookup first, bounded
+   * enumeration only as a last resort):
+   *   1. Already a 12-char recordId — O(1), returned as-is.
+   *   2. A Registry record ARN — O(1), the recordId is extracted directly
+   *      from the ARN without any Registry call.
+   *   3. LRU cache hit for a previously-resolved name (see
+   *      {@link RECORD_ID_CACHE_TTL_MS}).
+   *   4. Bounded enumeration fallback: paginates `ListRegistryRecords`
+   *      summaries directly (id/name only — no per-record
+   *      `GetRegistryRecord`, unlike `listResources`, whose per-record
+   *      detail hydration is what triggered the incident's
+   *      'Request rate exceeded' storm) until a name match is found, or
+   *      until the {@link RESOLVE_FALLBACK_TIME_BUDGET_MS} time budget or
+   *      {@link RESOLVE_FALLBACK_MAX_PAGES} page cap is hit, whichever
+   *      comes first. Exhausting either bound throws a structured
+   *      {@link RecordResolutionTimeoutError} rather than continuing to
+   *      retry into the Lambda's own timeout.
+   */
+  async resolveRecordId(type: ResourceType, id: string): Promise<string> {
+    // Fast path 1: already a recordId. Do not cache — already O(1).
+    if (/^[a-zA-Z0-9]{12}$/.test(id)) {
+      return id;
+    }
+
+    // Fast path 2: a Registry record ARN. Do not cache — already O(1) and
+    // the recordId is embedded in the input itself.
+    const arnRecordId = RegistryService.extractRecordIdFromArn(id);
+    if (arnRecordId) {
+      return arnRecordId;
+    }
+
+    // Cache hit?
+    const cacheKey = `${type}:${id}`;
+    const hit = this.cacheGet(cacheKey);
+    if (hit) return hit;
+
+    // Miss: bounded enumeration fallback. Paginate summaries (cheap — no
+    // per-record detail GET) rather than listResources (which issues one
+    // GetRegistryRecord per record and is the mechanism behind the
+    // incident), stopping as soon as a match is found or a bound is hit.
+    const deadline =
+      Date.now() + RegistryService.RESOLVE_FALLBACK_TIME_BUDGET_MS;
+    let nextToken: string | undefined;
+    let pages = 0;
+
+    do {
+      if (
+        Date.now() >= deadline ||
+        pages >= RegistryService.RESOLVE_FALLBACK_MAX_PAGES
+      ) {
+        throw new RecordResolutionTimeoutError(type, id);
+      }
+      pages += 1;
+
+      const result: ListRegistryRecordsCommandOutput = await this.withRetry(
+        () =>
+          this.client.send(
+            new ListRegistryRecordsCommand({
+              registryId: this.registryId,
+              filters: [
+                {
+                  name: RegistryRecordFilterName.RECORD_TYPE,
+                  values: [RecordType.CUSTOM],
+                },
+              ],
+              nextToken,
+            }),
+          ),
+      );
+
+      const nameMatches = (result.registryRecords ?? []).filter(
+        (r) => r.name === id && r.recordId,
+      );
+      if (nameMatches.length > 0) {
+        const resolvedId = await this.pickBestNameMatch(type, nameMatches);
+        if (resolvedId) {
+          this.cacheSet(cacheKey, resolvedId);
+          return resolvedId;
+        }
+      }
+
+      nextToken = result.nextToken;
+    } while (nextToken);
+
+    throw new Error(`Registry record not found for ${type}: ${id}`);
+  }
+
+  /**
+   * Disambiguates a page's exact-name matches for {@link resolveRecordId}'s
+   * enumeration fallback. Summaries never carry descriptor content (see
+   * {@link summaryToRecord}), so a single exact name can legitimately
+   * belong to both an agent and a tool record with no way to tell them
+   * apart from the summary alone. When exactly one match exists, return it
+   * with zero extra calls (the common case, and what preserves the
+   * existing no-per-record-GET bound for a clean name). Only when two or
+   * more summaries share the exact name do we pay for a bounded number of
+   * `getResource` calls (one per colliding candidate — never one per
+   * summary on the page) to find the candidate whose type matches the
+   * caller's requested `type`, preferring it over the first hit. Returns
+   * undefined (not throw) on total lookup failure so the caller's loop can
+   * continue to the next page rather than aborting the whole resolution.
+   */
+  private async pickBestNameMatch(
+    type: ResourceType,
+    nameMatches: RegistryRecordSummary[],
+  ): Promise<string | undefined> {
+    if (nameMatches.length === 1) {
+      return nameMatches[0].recordId;
+    }
+    for (const candidate of nameMatches) {
+      const candidateId = candidate.recordId;
+      if (!candidateId) continue;
+      try {
+        const record = await this.getResource(type, candidateId);
+        if (record) return candidateId;
+      } catch {
+        // TypeMismatchError (or any other getResource failure) means this
+        // candidate is not a `type` record — try the next collision rather
+        // than failing the whole resolution.
+        continue;
+      }
+    }
+    // No candidate matched `type` — fall back to the first summary hit so
+    // behaviour degrades to the pre-fix result rather than a hard failure.
+    return nameMatches[0].recordId;
+  }
+
+  /**
+   * Updates an existing resource in the Registry.
+   *
+   * GA shape: `name` is a plain string (unwrapped — omit to leave unchanged).
+   * `description` and `descriptors.custom.data` use PATCH wrapper objects
+   * (`{ optionalValue: ... }`) — omitting the wrapper entirely leaves the
+   * field unchanged, while an empty wrapper `{}` would unset it (not used
+   * here since callers only ever supply a new value or nothing).
+   */
+  async updateResource(
+    type: ResourceType,
+    id: string,
+    input: UpdateResourceInput,
+  ): Promise<RegistryRecord> {
+    const recordId = id;
+    const result = await this.withRetry(() =>
+      this.client.send(
+        new UpdateRegistryRecordCommand({
+          registryId: this.registryId,
+          recordId,
+          // Renames hit the same name constraint as creates — sanitize with
+          // the shared rule (legal names pass through unchanged).
+          name:
+            input.name != null ? sanitizeRegistryName(input.name) : undefined,
+          description:
+            input.description != null
+              ? { optionalValue: input.description }
+              : undefined,
+          descriptors:
+            input.customMetadata != null
+              ? {
+                  optionalValue: {
+                    custom: {
+                      optionalValue: {
+                        data: { optionalValue: input.customMetadata },
+                      },
+                    },
+                  },
+                }
+              : undefined,
+        }),
+      ),
+    );
+
+    const statusBefore = result.status ?? "";
+    let record: RegistryRecord = {
+      recordId: result.recordId ?? id,
+      name: result.name ?? "",
+      description: result.description,
+      status: statusBefore,
+      customDescriptorContent: result.descriptors?.custom?.data,
+      createdAt: result.createdAt,
+      updatedAt: result.updatedAt,
+    };
+
+    // GA moves a record through UPDATING before it settles on its final
+    // status (decision b9910580). For APPROVED/REJECTED records, any content
+    // edit demotes UPDATING -> DRAFT once the write settles — this is real
+    // approval loss that Citadel must surface, not hide behind the
+    // transient UPDATING snapshot. Wait for the transitional state to clear
+    // and re-fetch so callers see the settled status. When the status was
+    // already stable (no transition), this is a same-value re-fetch and a
+    // no-op for callers.
+    if (statusBefore === "CREATING" || statusBefore === "UPDATING") {
+      await this.waitForStableState(recordId);
+      const settled = await this.getResource(type, recordId);
+      if (settled) {
+        record = settled;
+      }
+    }
+
+    return record;
+  }
+
+  /**
+   * Updates the status of an existing resource in the Registry.
+   */
+  /**
+   * Waits for a registry record to leave transitional states (CREATING, UPDATING).
+   */
+  private async waitForStableState(
+    recordId: string,
+    maxWaitMs = 10000,
+  ): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+      const result = await this.client.send(
+        new GetRegistryRecordCommand({ registryId: this.registryId, recordId }),
+      );
+      const s = result.status as string;
+      if (s !== "CREATING" && s !== "UPDATING") return;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
+  /**
+   * Updates a resource status via `UpdateRegistryRecordStatus`. Accepts only
+   * three target statuses: APPROVED, REJECTED, and DEPRECATED. For the
+   * DRAFT → PENDING_APPROVAL Submit transition, callers must use
+   * {@link submitForApproval} instead, which uses the dedicated SDK operation.
+   *
+   * When currentStatus is supplied (Catalog update path), every transition —
+   * including Archive (APPROVED → DEPRECATED) — is validated against
+   * REGISTRY_TRANSITIONS before the write (decision a3fb5542). Same-state
+   * calls are idempotent no-ops via the isValidTransition shortcut.
+   */
+  async updateResourceStatus(
+    type: ResourceType,
+    id: string,
+    status: RegistryRecordStatusValue,
+    statusReason: string = "Status update via registry service",
+    currentStatus?: string,
+  ): Promise<RegistryRecord> {
+    const recordId = id;
+
+    // Validated-transition gate (agent-record approval lifecycle). Enforced
+    // whenever the caller supplies the record's current status. The Catalog
+    // update path (agent-config-resolver.ts / tool-config-resolver.ts) now
+    // passes existing.status for every non-APPROVED transition — including
+    // Deactivate — so REGISTRY_TRANSITIONS governs it too (decision
+    // a3fb5542), never silently coercing an unvalidated transition. Same-
+    // status calls (e.g. Deactivate issued twice on an already-DRAFT record)
+    // are a no-op per isValidTransition's `current === next` shortcut, then
+    // still forwarded to the registry as an idempotent status write.
+    if (currentStatus !== undefined) {
+      if (
+        !RegistryService.lifecycleManager.isValidTransition(
+          currentStatus,
+          status,
+        )
+      ) {
+        const valid = REGISTRY_TRANSITIONS.transitions[currentStatus] || [];
+        throw new RegistryLifecycleError(
+          `Invalid status transition: ${currentStatus} → ${status}. ` +
+            `Valid transitions from ${currentStatus}: ${valid.join(", ") || "none"}`,
+          "INVALID_TRANSITION",
+        );
+      }
+    }
+
+    // Wait for any in-progress state transition to complete
+    await this.waitForStableState(recordId);
+
+    // Every status change — including APPROVED — goes through
+    // UpdateRegistryRecordStatusCommand directly. SubmitRegistryRecordForApproval
+    // must NEVER be used here: it auto-approves the record on the AgentCore
+    // side, bypassing the human decision this gate exists to enforce.
+    const result = await this.withRetry(() =>
+      this.client.send(
+        new UpdateRegistryRecordStatusCommand({
+          registryId: this.registryId,
+          recordId,
+          status: status as RegistryRecordStatus,
+          statusReason,
+        }),
+      ),
+    );
+
+    return {
+      recordId: result.recordId ?? recordId,
+      name: "",
+      status: result.status ?? status,
+      updatedAt: result.updatedAt,
+    };
+  }
+
+  /**
+   * Submits a DRAFT (or REJECTED-then-DRAFT) registry record for approval via
+   * the dedicated `SubmitRegistryRecordForApproval` operation — the only
+   * legal path from DRAFT towards APPROVED. The AWS registry rejects a
+   * direct `UpdateRegistryRecordStatus(DRAFT -> APPROVED)` call (and even the
+   * two-step DRAFT -> PENDING_APPROVAL -> APPROVED sequence via that same
+   * operation), so activation callers MUST route through this method instead
+   * of {@link updateResourceStatus} for the DRAFT/REJECTED -> active
+   * transition. Mirrors the Python fabricator's `_approve` helper
+   * (arbiter/fabricator/index.py).
+   *
+   * When the registry has autoApproval configured, the record advances
+   * straight to APPROVED synchronously; otherwise it lands on
+   * PENDING_APPROVAL and a human/governance step must approve it later. The
+   * submit response's `status` is not fully trusted on its own — we always
+   * re-fetch the record afterwards so the caller sees the authoritative
+   * post-submit state.
+   */
+  async submitForApproval(recordId: string): Promise<RegistryRecord> {
+    await this.withRetry(() =>
+      this.client.send(
+        new SubmitRegistryRecordForApprovalCommand({
+          registryId: this.registryId,
+          recordId,
+        }),
+      ),
+    );
+
+    const refreshed = await this.client.send(
+      new GetRegistryRecordCommand({
+        registryId: this.registryId,
+        recordId,
+      }),
+    );
+
+    return {
+      recordId: refreshed.recordId ?? recordId,
+      name: refreshed.name ?? "",
+      description: refreshed.description,
+      status: refreshed.status ?? "",
+      customDescriptorContent: refreshed.descriptors?.custom?.data,
+      createdAt: refreshed.createdAt,
+      updatedAt: refreshed.updatedAt,
+    };
+  }
+
+  /**
+   * Deletes a resource from the Registry.
+   */
+  async deleteResource(type: ResourceType, id: string): Promise<void> {
+    const recordId = id;
+    await this.withRetry(() =>
+      this.client.send(
+        new DeleteRegistryRecordCommand({
+          registryId: this.registryId,
+          recordId,
+        }),
+      ),
+    );
+  }
+
+  /**
+   * Lists CUSTOM-descriptor registry record summaries in a SINGLE pass of
+   * `ListRegistryRecords` pagination — deliberately does NOT follow up with
+   * a `GetRegistryRecord` per record (unlike `listResources`, which issues
+   * one detail GET per summary just to apply its type filter).
+   *
+   * Summaries carry `recordId`/`name`/`status` but never
+   * `customDescriptorContent` (org/manifest data), so this is only suitable
+   * for cheap id<->name lookups (e.g. batch display-name resolution). Callers
+   * needing manifest content (org validation, bindings, etc.) must follow up
+   * with `getResource` for the specific records they actually need — but
+   * critically, only for the deduped subset they care about, not the full
+   * registry.
+   */
+  async listResourceSummaries(): Promise<RegistryRecordSummary[]> {
+    const summaries: RegistryRecordSummary[] = [];
+    let nextToken: string | undefined;
+    do {
+      const result: ListRegistryRecordsCommandOutput = await this.withRetry(
+        () =>
+          this.client.send(
+            new ListRegistryRecordsCommand({
+              registryId: this.registryId,
+              filters: [
+                {
+                  name: RegistryRecordFilterName.RECORD_TYPE,
+                  values: [RecordType.CUSTOM],
+                },
+              ],
+              nextToken,
+            }),
+          ),
+      );
+      if (result.registryRecords) {
+        summaries.push(...result.registryRecords);
+      }
+      nextToken = result.nextToken;
+    } while (nextToken);
+    return summaries;
+  }
+
+  /**
+   * Lists registry records with STATUS=PENDING_APPROVAL across both agent
+   * and tool record types (CIT-040). Issues a single
+   * `ListRegistryRecordsCommand` with STATUS + RECORD_TYPE=CUSTOM filters,
+   * then hydrates each summary via `GetRegistryRecordCommand` to read
+   * `customDescriptorContent` — needed to discriminate agent vs tool (the
+   * manifest-presence heuristic) and to extract `orgId` / `createdBy`.
+   *
+   * Pagination: the SDK's `maxResults` / `nextToken` are passed through
+   * directly; callers control page size via `limit`.
+   */
+  async listPendingApprovals(
+    options?: ListPendingApprovalsOptions,
+  ): Promise<ListPendingApprovalsResult> {
+    const result: ListRegistryRecordsCommandOutput = await this.withRetry(() =>
+      this.client.send(
+        new ListRegistryRecordsCommand({
+          registryId: this.registryId,
+          filters: [
+            {
+              name: RegistryRecordFilterName.RECORD_TYPE,
+              values: [RecordType.CUSTOM],
+            },
+            {
+              name: RegistryRecordFilterName.STATUS,
+              values: [RegistryRecordStatusValues.PENDING_APPROVAL],
+            },
+          ],
+          maxResults: options?.limit,
+          nextToken: options?.nextToken,
+        }),
+      ),
+    );
+
+    const summaries = result.registryRecords ?? [];
+    const items: PendingApproval[] = [];
+
+    // Hydrate each summary with a detail GET to read descriptor content.
+    // Bounded concurrency mirrors the listResources pattern.
+    const outcomes: Array<PendingApproval | null> = new Array(
+      summaries.length,
+    ).fill(null);
+    let cursor = 0;
+
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const i = cursor;
+        cursor += 1;
+        if (i >= summaries.length) return;
+        const rec = summaries[i];
+        const recId = rec.recordId ?? "";
+        if (!recId) continue;
+        try {
+          const detail = await this.withRetry(() =>
+            this.client.send(
+              new GetRegistryRecordCommand({
+                registryId: this.registryId,
+                recordId: recId,
+              }),
+            ),
+          );
+          const descriptorContent = detail.descriptors?.custom?.data;
+          const meta = descriptorContent ? JSON.parse(descriptorContent) : {};
+          const recordType = resolveKind({
+            customDescriptorContent: descriptorContent,
+            recordId: recId,
+          });
+          outcomes[i] = {
+            recordId: detail.recordId ?? recId,
+            recordType,
+            name: detail.name ?? rec.name ?? "",
+            displayName: detail.displayName ?? detail.name ?? rec.name ?? "",
+            orgId: meta.orgId ?? "",
+            submittedAt: detail.updatedAt?.toISOString(),
+            createdBy: meta.createdBy,
+            status: detail.status ?? rec.status ?? "",
+            version:
+              recordType !== "tool"
+                ? (meta.manifest?.version ?? undefined)
+                : undefined,
+          };
+        } catch (err) {
+          console.warn("listPendingApprovals: detail GET failed, skipping", {
+            recordId: recId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    };
+
+    const workerCount = Math.min(
+      RegistryService.LIST_DETAIL_CONCURRENCY,
+      Math.max(summaries.length, 1),
+    );
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    for (const item of outcomes) {
+      if (item) items.push(item);
+    }
+
+    return {
+      items,
+      nextToken: result.nextToken,
+    };
+  }
+
+  /**
+   * Batch-resolves a set of agent references — each may be a 12-char
+   * Registry recordId OR a legacy human-readable name — to their full
+   * `RegistryRecord`s, keyed by the ORIGINAL reference string passed in.
+   *
+   * Cost profile (the N+1 fix): at most ONE `listResourceSummaries` call
+   * total (shared across every legacy-name reference in the batch, and only
+   * issued at all if at least one reference isn't already a 12-char id),
+   * plus exactly one `getResource` detail GET per UNIQUE resolved recordId
+   * (deduplicated — repeated bindings to the same agent cost one GET, not
+   * one per binding).
+   *
+   * Per-reference failures (unresolvable name, missing record, transient
+   * Registry error) are isolated: the failing key is simply absent from the
+   * returned map so callers can fall back gracefully, matching this
+   * codebase's "never throw on a display-only lookup" convention.
+   */
+  async getResourcesByRefs(
+    type: ResourceType,
+    refs: string[],
+  ): Promise<Map<string, RegistryRecord>> {
+    const uniqueRefs = Array.from(new Set(refs.filter((r) => !!r)));
+    const result = new Map<string, RegistryRecord>();
+    if (uniqueRefs.length === 0) return result;
+
+    const isRecordId = (r: string) => /^[a-zA-Z0-9]{12}$/.test(r);
+    const needsNameResolution = uniqueRefs.some((r) => !isRecordId(r));
+
+    // Single shared summary list for every legacy-name reference in the
+    // batch — NOT one list call per reference.
+    let nameToRecordId: Map<string, string> | undefined;
+    if (needsNameResolution) {
+      const summaries = await this.listResourceSummaries();
+      nameToRecordId = new Map(
+        summaries
+          .filter((s) => s.recordId && s.name)
+          .map((s) => [s.name as string, s.recordId as string]),
+      );
+    }
+
+    // ref -> resolved recordId (or undefined if unresolvable).
+    const refToRecordId = new Map<string, string | undefined>();
+    for (const ref of uniqueRefs) {
+      if (isRecordId(ref)) {
+        refToRecordId.set(ref, ref);
+      } else {
+        refToRecordId.set(ref, nameToRecordId?.get(ref));
+      }
+    }
+
+    // Dedupe by resolved recordId so an agent bound under multiple refs (or
+    // a batch with duplicate bindings) is fetched exactly once.
+    const uniqueRecordIds = Array.from(
+      new Set(
+        Array.from(refToRecordId.values()).filter((id): id is string => !!id),
+      ),
+    );
+    const recordIdToRecord = new Map<string, RegistryRecord>();
+    await Promise.all(
+      uniqueRecordIds.map(async (recordId) => {
+        try {
+          const record = await this.getResource(type, recordId);
+          if (record) recordIdToRecord.set(recordId, record);
+        } catch (err) {
+          console.warn("getResourcesByRefs: getResource failed, dropping ref", {
+            type,
+            recordId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }),
+    );
+
+    for (const [ref, recordId] of refToRecordId.entries()) {
+      if (!recordId) continue;
+      const record = recordIdToRecord.get(recordId);
+      if (record) result.set(ref, record);
+    }
+
+    return result;
+  }
+
+  /**
+   * Helper to map a RegistryRecordSummary to our RegistryRecord shape.
+   * Note: summaries from ListRegistryRecords do not include custom
+   * descriptor content — callers needing that must follow up with getResource.
+   */
+  private summaryToRecord(rec: RegistryRecordSummary): RegistryRecord {
+    return {
+      recordId: rec.recordId ?? "",
+      name: rec.name ?? "",
+      description: rec.description,
+      status: rec.status ?? "",
+      // Summaries don't include descriptor content
+      customDescriptorContent: undefined,
+      createdAt: rec.createdAt,
+      updatedAt: rec.updatedAt,
+    };
+  }
+
+  /**
+   * Lists all resources of a given type from the Registry.
+   * Handles pagination automatically, returning all records.
+   *
+   * Uses a RECORD_TYPE=CUSTOM filter since all our resources use CUSTOM
+   * descriptors. The `type` parameter is reserved for future use when the
+   * Registry supports finer-grained filtering.
+   *
+   * N+1 fix (live incident: 340 records × sequential GetRegistryRecord —
+   * each carrying SDK retries — blew the 30s resolver budget): detail
+   * fetches now run in PARALLEL with bounded concurrency
+   * ({@link RegistryService.LIST_DETAIL_CONCURRENCY}). A summary-only fast
+   * path is NOT possible for the current callers — the projection evidence:
+   *  - mapToAgentConfig/mapToToolConfig read `orgId` (the tenant filter in
+   *    listAgentConfigsRegistry / listToolConfigsRegistry) from
+   *    customDescriptorContent, which list summaries do not carry;
+   *  - the agent-vs-tool classification below is the inlineContent
+   *    `manifest` discriminator;
+   *  - findProjectAgentRecords / agent-import dedupe / governance workload
+   *    checks all read customDescriptorContent.
+   * So every record still needs its detail — fetched concurrently.
+   *
+   * When {@link ListResourcesOptions.getRemainingTimeMs} is supplied (wire
+   * it to the Lambda context.getRemainingTimeInMillis), the fetch
+   * short-circuits once the remaining budget drops below
+   * {@link ListResourcesOptions.minRemainingTimeMs}: no further Registry
+   * calls are issued and the records completed so far are returned as a
+   * PARTIAL list (with a warning) instead of timing out the resolver.
+   * Budget-skipped records are dropped entirely — NOT pushed as summaries —
+   * because a summary maps to orgId '' (system-shared), which would surface
+   * another tenant's records to every caller.
+   */
+  async listResources(
+    type: ResourceType,
+    options?: ListResourcesOptions,
+  ): Promise<RegistryRecord[]> {
+    const minRemainingTimeMs = options?.minRemainingTimeMs ?? 5000;
+    const budgetLow = (): boolean =>
+      options?.getRemainingTimeMs !== undefined &&
+      options.getRemainingTimeMs() < minRemainingTimeMs;
+
+    const records: RegistryRecord[] = [];
+    let nextToken: string | undefined;
+    let truncated = false;
+
+    do {
+      if (budgetLow()) {
+        truncated = true;
+        break;
+      }
+
+      const result: ListRegistryRecordsCommandOutput = await this.withRetry(
+        () =>
+          this.client.send(
+            new ListRegistryRecordsCommand({
+              registryId: this.registryId,
+              filters: [
+                {
+                  name: RegistryRecordFilterName.RECORD_TYPE,
+                  values: [RecordType.CUSTOM],
+                },
+              ],
+              nextToken,
+            }),
+          ),
+      );
+
+      const summaries = result.registryRecords ?? [];
+
+      // Per-summary outcome, index-aligned so output order matches summary
+      // order regardless of GET completion order.
+      type DetailOutcome =
+        | { kind: "full"; record: RegistryRecord }
+        | { kind: "summary" } // GET failed — fall back to the summary shape
+        | { kind: "filtered" } // wrong type for this listing — drop
+        | { kind: "skipped" }; // time budget exhausted — drop (see note above)
+      const outcomes: DetailOutcome[] = new Array(summaries.length);
+
+      let cursor = 0;
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          const i = cursor;
+          cursor += 1;
+          if (i >= summaries.length) return;
+          const rec = summaries[i];
+          const recId = rec.recordId ?? "";
+          if (!recId) {
+            outcomes[i] = { kind: "summary" };
+            continue;
+          }
+          if (budgetLow()) {
+            truncated = true;
+            outcomes[i] = { kind: "skipped" };
+            continue;
+          }
+          try {
+            // Call SDK directly — do NOT call getResource/resolveRecordId
+            // here, which would recurse back into listResources for short
+            // ids.
+            const detail: GetRegistryRecordCommandOutput = await this.withRetry(
+              () =>
+                this.client.send(
+                  new GetRegistryRecordCommand({
+                    registryId: this.registryId,
+                    recordId: recId,
+                  }),
+                ),
+            );
+            const full: RegistryRecord = {
+              recordId: detail.recordId ?? recId,
+              name: detail.name ?? rec.name ?? "",
+              description: detail.description,
+              status: detail.status ?? rec.status ?? "",
+              customDescriptorContent: detail.descriptors?.custom?.data,
+              createdAt: detail.createdAt,
+              updatedAt: detail.updatedAt,
+            };
+            // Filter by type using authoritative kind inference:
+            // agents and apps both carry a `manifest` in
+            // customDescriptorContent; tools do not. The shared
+            // inferKindFromParsed helper applies the canonical decision
+            // tree (app-only fields vs agent-only shape).
+            const meta = full.customDescriptorContent
+              ? JSON.parse(full.customDescriptorContent)
+              : {};
+            const inferredKind = inferKindFromParsed(meta);
+            const isAgentOrApp =
+              inferredKind === "agent" || inferredKind === "app";
+            const typeMatches = type === "agent" ? isAgentOrApp : !isAgentOrApp;
+            outcomes[i] = typeMatches
+              ? { kind: "full", record: full }
+              : { kind: "filtered" };
+          } catch {
+            outcomes[i] = { kind: "summary" };
+          }
+        }
+      };
+
+      const workerCount = Math.min(
+        RegistryService.LIST_DETAIL_CONCURRENCY,
+        Math.max(summaries.length, 1),
+      );
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+      for (let i = 0; i < summaries.length; i++) {
+        const outcome = outcomes[i];
+        if (outcome === undefined) continue;
+        switch (outcome.kind) {
+          case "full":
+            records.push(outcome.record);
+            break;
+          case "summary":
+            records.push(this.summaryToRecord(summaries[i]));
+            break;
+          case "filtered":
+          case "skipped":
+            break;
+        }
+      }
+
+      nextToken = result.nextToken;
+    } while (nextToken && !truncated);
+
+    if (truncated) {
+      console.warn(
+        `listResources(${type}): remaining time budget below ${minRemainingTimeMs}ms — returning partial list of ${records.length} records`,
+      );
+    }
+
+    // When a viewer is supplied, filter hydrated records through the
+    // visibility policy before returning so callers never see records
+    // their persona is not authorised for.
+    if (options?.viewer) {
+      const viewer = options.viewer;
+      return records.filter((record) => {
+        const meta = record.customDescriptorContent
+          ? JSON.parse(record.customDescriptorContent)
+          : {};
+        return isRecordVisible(viewer, {
+          status: record.status,
+          orgId: meta.orgId,
+          createdBy: meta.createdBy,
+        });
+      });
+    }
+
+    return records;
+  }
+
+  /**
+   * Searches for resources by query string using the Registry's name filter.
+   *
+   * GA shape: the old top-level `name` param is now expressed as a
+   * structured `filters` entry (`RegistryRecordFilterName.NAME`), combined
+   * with the existing `RECORD_TYPE=CUSTOM` filter (multiple filter entries
+   * AND together per the GA filter semantics). Handles pagination
+   * automatically.
+   */
+  async searchResources(
+    type: ResourceType,
+    query: string,
+    viewer?: Viewer,
+  ): Promise<RegistryRecord[]> {
+    const records: RegistryRecord[] = [];
+    let nextToken: string | undefined;
+
+    do {
+      const result: ListRegistryRecordsCommandOutput = await this.withRetry(
+        () =>
+          this.client.send(
+            new ListRegistryRecordsCommand({
+              registryId: this.registryId,
+              filters: [
+                {
+                  name: RegistryRecordFilterName.RECORD_TYPE,
+                  values: [RecordType.CUSTOM],
+                },
+                { name: RegistryRecordFilterName.NAME, values: [query] },
+              ],
+              nextToken,
+            }),
+          ),
+      );
+
+      if (result.registryRecords) {
+        for (const rec of result.registryRecords) {
+          records.push(this.summaryToRecord(rec));
+        }
+      }
+
+      nextToken = result.nextToken;
+    } while (nextToken);
+
+    // When a viewer is supplied, filter through the visibility policy.
+    // Search results are summary-only (no customDescriptorContent), so
+    // orgId/createdBy are unavailable — status-level filtering still applies.
+    if (viewer) {
+      return records.filter((record) => {
+        const meta = record.customDescriptorContent
+          ? JSON.parse(record.customDescriptorContent)
+          : {};
+        return isRecordVisible(viewer, {
+          status: record.status,
+          orgId: meta.orgId,
+          createdBy: meta.createdBy,
+        });
+      });
+    }
+
+    return records;
+  }
+
+  // -- State mapping (task 3.2) ---------------------------------------------
+
+  /**
+   * Maps an internal application state to the corresponding Registry status.
+   *
+   * | Internal    | Registry     |
+   * |-------------|--------------|
+   * | active      | APPROVED     |
+   * | maintenance | DEPRECATED   |
+   * | inactive    | throws — see below |
+   *
+   * Decision 3d5843e9 (supersedes a3fb5542; finding 462c17ad): the AWS
+   * registry's UpdateRegistryRecordStatus operation rejects DRAFT as a
+   * target. 'inactive' therefore can no longer map to DRAFT — doing so would
+   * either throw at the registry call (dishonest UX: the mapping "succeeds"
+   * but the write fails) or, worse, invite a caller to swallow that error and
+   * silently substitute a different transition. Instead this throws a
+   * structured error immediately so every caller is forced through the
+   * explicit, documented deprecate path rather than deactivate.
+   *
+   * 'maintenance' is repurposed as the deprecate-intent input value (finding
+   * 462c17ad remediation): it is not sent by any current frontend write path
+   * (frontend only ever sends 'active'/'inactive' on update; 'maintenance' is
+   * a READ-only display state derived from DRAFT via toInternalState), so
+   * reusing it here as the one available AgentState/ToolState enum value for
+   * "deprecate" carries no schema change and no collision with any existing
+   * caller. See agent-config-resolver.ts / tool-config-resolver.ts's
+   * deprecate-intent handling for the call site.
+   *
+   * Unknown internal states also throw — there is no more safe default
+   * status to fall back to now that DRAFT is off the table.
+   */
+  toRegistryStatus(internalState: string): RegistryRecordStatusValue {
+    switch (internalState) {
+      case "active":
+        return RegistryRecordStatusValues.APPROVED;
+      case "maintenance":
+        return RegistryRecordStatusValues.DEPRECATED;
+      case "inactive":
+        throw new RegistryLifecycleError(
+          "inactive is not a registry-backed transition; use deprecate",
+          "INVALID_TRANSITION",
+        );
+      default:
+        throw new RegistryLifecycleError(
+          `Unknown internal state "${internalState}" has no registry-backed transition; use deprecate`,
+          "INVALID_TRANSITION",
+        );
+    }
+  }
+
+  /**
+   * Maps a Registry record status to the internal application state.
+   *
+   * Every RegistryRecordStatus value is mapped to the 3-value AgentState
+   * enum (active | inactive | maintenance):
+   *
+   * | Registry          | Internal    |
+   * |-------------------|-------------|
+   * | APPROVED          | active      |
+   * | UPDATING          | active      |
+   * | PENDING_APPROVAL  | active      |
+   * | DRAFT             | maintenance |
+   * | CREATING          | maintenance |
+   * | DEPRECATED        | inactive    |
+   * | REJECTED          | inactive    |
+   * | CREATE_FAILED     | inactive    |
+   * | UPDATE_FAILED     | inactive    |
+   *
+   * PENDING_APPROVAL surfaces as 'active' because approval is pending:
+   * submission resolves through registry auto-approval when configured, or
+   * an admin decision. Reflecting the caller's activation intent avoids UI
+   * flicker while the decision is outstanding.
+   *
+   * Unknown Registry statuses default to 'inactive' with a warning log.
+   */
+  toInternalState(
+    registryStatus: RegistryRecordStatusValue | string | undefined,
+  ): string {
+    // Map every RegistryRecordStatus value to the 3-value AgentState enum
+    // (active | inactive | maintenance). PENDING_APPROVAL surfaces as 'active'
+    // because approval is pending (registry auto-approval when configured, or
+    // an admin decision) and reflecting the caller's activation intent avoids
+    // UI flicker while the decision is outstanding.
+    switch (registryStatus) {
+      case RegistryRecordStatusValues.APPROVED:
+      case RegistryRecordStatusValues.UPDATING:
+      case RegistryRecordStatusValues.PENDING_APPROVAL:
+        return "active";
+      case RegistryRecordStatusValues.DRAFT:
+      case RegistryRecordStatusValues.CREATING:
+        return "maintenance";
+      case RegistryRecordStatusValues.DEPRECATED:
+      case RegistryRecordStatusValues.REJECTED:
+      case RegistryRecordStatusValues.CREATE_FAILED:
+      case RegistryRecordStatusValues.UPDATE_FAILED:
+        return "inactive";
+      default:
+        console.warn(
+          `Unknown registry status "${registryStatus}", mapping to 'inactive'`,
+        );
+        return "inactive";
+    }
+  }
+
+  // -- Metadata serialization (task 3.3) ------------------------------------
+
+  /**
+   * Serializes agent or tool custom metadata to a JSON string for Registry
+   * writes.
+   */
+  serializeCustomMetadata(
+    metadata: AgentCustomMetadata | ToolCustomMetadata,
+  ): string {
+    return JSON.stringify(metadata);
+  }
+
+  /**
+   * Deserializes a JSON string from a Registry record's custom metadata
+   * field, merging with safe defaults.
+   *
+   * Returns `defaults` when `json` is null, empty, or malformed.
+   * Never throws — logs a warning on malformed JSON.
+   */
+  deserializeCustomMetadata<T>(
+    json: string | null | undefined,
+    defaults: T,
+  ): T {
+    if (json == null || json === "") {
+      return defaults;
+    }
+
+    try {
+      const parsed = JSON.parse(json);
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed)
+      ) {
+        console.warn(
+          "Custom metadata JSON is not a plain object, returning defaults",
+        );
+        return defaults;
+      }
+      return { ...defaults, ...parsed };
+    } catch (err) {
+      console.warn(
+        `Failed to parse custom metadata JSON, returning defaults: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return defaults;
+    }
+  }
+
+  // -- Record mapping (task 3.6) --------------------------------------------
+
+  private static readonly AGENT_METADATA_DEFAULTS: AgentCustomMetadata = {
+    categories: [],
+    icon: "",
+    state: "active",
+    appId: undefined,
+    manifest: undefined,
+    orgId: undefined,
+    createdBy: undefined,
+    invocation: undefined,
+    origin: undefined,
+    governanceAttestation: undefined,
+    proposedManifest: undefined,
+    reachability: undefined,
+    gatewayPublication: undefined,
+  };
+
+  private static readonly TOOL_METADATA_DEFAULTS: ToolCustomMetadata = {
+    categories: [],
+    icon: "",
+    state: "active",
+    integrationBindings: undefined,
+    dataStoreBindings: undefined,
+    appId: undefined,
+    config: undefined,
+    createdBy: undefined,
+    orgId: undefined,
+  };
+
+  /**
+   * Sanitises bindings read from custom_metadata so that GraphQL responses
+   * never carry entries whose required string fields are null/empty. Mirrors
+   * sanitizeIntegrationBindings / sanitizeDataStoreBindings in
+   * tool-config-resolver.ts so both code paths agree on the response shape.
+   * Returns null when no valid binding remains, matching the schema's
+   * "[Binding]" (optional list) shape.
+   */
+  private static sanitizeIntegrationBindings(
+    bindings: unknown,
+  ): IntegrationBinding[] | null {
+    if (!Array.isArray(bindings) || bindings.length === 0) return null;
+    const cleaned = bindings.filter(
+      (
+        b:
+          | { integrationId?: unknown; integrationType?: unknown }
+          | null
+          | undefined,
+      ) =>
+        b &&
+        typeof b.integrationId === "string" &&
+        b.integrationId.length > 0 &&
+        typeof b.integrationType === "string" &&
+        b.integrationType.length > 0,
+    );
+    return cleaned.length > 0 ? (cleaned as IntegrationBinding[]) : null;
+  }
+
+  private static sanitizeDataStoreBindings(
+    bindings: unknown,
+  ): DataStoreBinding[] | null {
+    if (!Array.isArray(bindings) || bindings.length === 0) return null;
+    const cleaned = bindings.filter(
+      (
+        b:
+          { dataStoreId?: unknown; dataStoreType?: unknown } | null | undefined,
+      ) =>
+        b &&
+        typeof b.dataStoreId === "string" &&
+        b.dataStoreId.length > 0 &&
+        typeof b.dataStoreType === "string" &&
+        b.dataStoreType.length > 0,
+    );
+    return cleaned.length > 0 ? (cleaned as DataStoreBinding[]) : null;
+  }
+
+  /**
+   * Resolves the value projected into a GraphQL AWSJSON `config` field.
+   *
+   * Data-contract invariant (Agent Tools error-boundary incident): every
+   * value projected into AWSJSON `config` MUST be valid JSON representing an
+   * object. AWSJSON double-encodes bare strings, so plain-text descriptions
+   * (e.g. 'Fetches weather data' on summary-fallback rows where the detail
+   * GET failed and customDescriptorContent is undefined) or '' poison
+   * consumers that parse twice.
+   *
+   * Resolution order: the first candidate that parses as JSON to a plain
+   * (non-null, non-array) object is returned BYTE-IDENTICAL; otherwise '{}'.
+   * Plain-text descriptions are never projected here — they keep flowing
+   * through the record's description/name fields.
+   */
+  private static toValidConfigJson(
+    ...candidates: Array<string | undefined>
+  ): string {
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string" || candidate === "") continue;
+      try {
+        const parsed: unknown = JSON.parse(candidate);
+        if (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          !Array.isArray(parsed)
+        ) {
+          return candidate;
+        }
+      } catch {
+        // Not JSON (plain-text description) — try the next candidate.
+      }
+    }
+    return "{}";
+  }
+
+  /**
+   * Inject `name` into a config JSON string when it is missing or empty.
+   * This ensures the frontend ToolCard always has a human-readable name
+   * to display instead of falling back to the raw record GUID.
+   */
+  private static ensureConfigName(
+    configJson: string,
+    recordName: string,
+  ): string {
+    if (!recordName) return configJson;
+    try {
+      const parsed = JSON.parse(configJson);
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        !Array.isArray(parsed)
+      ) {
+        if (
+          !parsed.name ||
+          (typeof parsed.name === "string" && parsed.name.trim() === "")
+        ) {
+          parsed.name = recordName;
+          return JSON.stringify(parsed);
+        }
+      }
+    } catch {
+      // If configJson is unparseable, wrap the name in a minimal config.
+      return JSON.stringify({ name: recordName });
+    }
+    return configJson;
+  }
+
+  /**
+   * Inject `description` into a config JSON string when it is missing or empty.
+   * This ensures the frontend picker (which reads config.description) displays
+   * the agent's description without a frontend-side code change.
+   */
+  private static ensureConfigDescription(
+    configJson: string,
+    description: string | undefined,
+  ): string {
+    if (!description) return configJson;
+    try {
+      const parsed = JSON.parse(configJson);
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        !Array.isArray(parsed)
+      ) {
+        if (
+          !parsed.description ||
+          (typeof parsed.description === "string" &&
+            parsed.description.trim() === "")
+        ) {
+          parsed.description = description;
+          return JSON.stringify(parsed);
+        }
+      }
+    } catch {
+      return JSON.stringify({ description });
+    }
+    return configJson;
+  }
+
+  /**
+   * Maps a Registry record to the AgentConfig GraphQL response shape.
+   */
+  mapToAgentConfig(record: RegistryRecord): AgentConfig {
+    const meta = this.deserializeCustomMetadata<AgentCustomMetadata>(
+      record.customDescriptorContent ?? null,
+      RegistryService.AGENT_METADATA_DEFAULTS,
+    );
+
+    // Resolve best description: record-level > manifest-level > config-level.
+    const configJson = RegistryService.toValidConfigJson(record.description);
+    let configDescription: string | undefined;
+    try {
+      const parsed = JSON.parse(configJson);
+      if (typeof parsed?.description === "string" && parsed.description) {
+        configDescription = parsed.description;
+      }
+    } catch {
+      // ignore
+    }
+    const manifestDescription =
+      typeof (meta.manifest as Record<string, unknown> | undefined)
+        ?.description === "string"
+        ? ((meta.manifest as Record<string, unknown>).description as string)
+        : undefined;
+    const description =
+      record.description && !record.description.startsWith("{")
+        ? record.description
+        : (manifestDescription ?? configDescription ?? undefined);
+
+    // Inject description into the config JSON so the frontend picker
+    // (which reads config.description) displays it without a frontend change.
+    const enrichedConfig = RegistryService.ensureConfigDescription(
+      configJson,
+      description,
+    );
+
+    return {
+      agentId: record.recordId,
+      name: record.name ?? "",
+      description,
+      orgId: meta.orgId ?? "",
+      // AWSJSON contract: config must be a JSON object — a plain-text
+      // description falls back to '{}' (see toValidConfigJson).
+      config: enrichedConfig,
+      state: this.toInternalState(record.status),
+      categories: meta.categories,
+      createdAt: record.createdAt?.toISOString(),
+      updatedAt: record.updatedAt?.toISOString(),
+      // Explicit, non-heuristic discriminator (finding 414f8013): the raw
+      // Registry status, present only on registry-backed records. Legacy
+      // rows built outside this mapper leave the field undefined/null.
+      registryStatus: record.status ?? null,
+      manifest: meta.manifest,
+      // Surface the UNTRUSTED proposed manifest READ-ONLY when present so review
+      // UIs can read it. This never promotes it into `manifest` or activates it.
+      ...(meta.proposedManifest
+        ? { proposedManifest: meta.proposedManifest }
+        : {}),
+      // Surface the best-effort reachability probe result READ-ONLY when present
+      // (US-IMP-017b). Never an active/trusted field.
+      ...(meta.reachability ? { reachability: meta.reachability } : {}),
+      // Surface the gateway publication record READ-ONLY when present
+      // (US-IMP-031). Never an active/trusted field; never changes DRAFT state.
+      ...(meta.gatewayPublication
+        ? { gatewayPublication: meta.gatewayPublication }
+        : {}),
+      // Surface createdBy when present (CIT-043 ownership visibility).
+      ...(meta.createdBy ? { createdBy: meta.createdBy } : {}),
+      // Surface decision audit fields when present.
+      ...(meta.decidedBy ? { decidedBy: meta.decidedBy } : {}),
+      ...(meta.decidedAt ? { decidedAt: meta.decidedAt } : {}),
+      ...(meta.statusReason ? { statusReason: meta.statusReason } : {}),
+      // Surface user-supplied tags when present (CIT-042).
+      ...(meta.tags ? { tags: meta.tags } : {}),
+    };
+  }
+
+  /**
+   * Maps a Registry record to the ToolConfig GraphQL response shape.
+   */
+  mapToToolConfig(record: RegistryRecord): ToolConfig {
+    const meta = this.deserializeCustomMetadata<ToolCustomMetadata>(
+      record.customDescriptorContent ?? null,
+      RegistryService.TOOL_METADATA_DEFAULTS,
+    );
+
+    // Ensure the config JSON always carries a human-readable `name`.
+    // Registry records store the tool name at the record level
+    // (record.name), but the frontend ToolCard reads it from
+    // `config.name`. When the persisted config payload lacks a name
+    // (legacy records, fabricator-created records whose
+    // customDescriptorContent.config was never populated), inject
+    // record.name so the UI never falls back to displaying the raw GUID.
+    const rawConfig = RegistryService.toValidConfigJson(
+      meta.config,
+      record.description,
+    );
+    const config = RegistryService.ensureConfigName(rawConfig, record.name);
+
+    return {
+      toolId: record.recordId,
+      orgId: meta.orgId ?? "",
+      config,
+      state: this.toInternalState(record.status),
+      categories: meta.categories,
+      integrationBindings: RegistryService.sanitizeIntegrationBindings(
+        meta.integrationBindings,
+      ),
+      dataStoreBindings: RegistryService.sanitizeDataStoreBindings(
+        meta.dataStoreBindings,
+      ),
+      createdAt: record.createdAt?.toISOString(),
+      updatedAt: record.updatedAt?.toISOString(),
+      // Explicit, non-heuristic discriminator (finding 414f8013): the raw
+      // Registry status, present only on registry-backed records. Legacy
+      // rows built outside this mapper leave the field undefined/null.
+      registryStatus: record.status ?? null,
+      // Surface createdBy when present (CIT-043 ownership visibility).
+      ...(meta.createdBy ? { createdBy: meta.createdBy } : {}),
+      // Surface decision audit fields when present (CIT-215).
+      ...(meta.decidedBy ? { decidedBy: meta.decidedBy } : {}),
+      ...(meta.decidedAt ? { decidedAt: meta.decidedAt } : {}),
+      ...(meta.statusReason ? { statusReason: meta.statusReason } : {}),
+      // Surface user-supplied tags when present (CIT-042).
+      ...(meta.tags ? { tags: meta.tags } : {}),
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// decideRecord — shared status-only approve/reject helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Decision outcomes that `decideRecord` accepts.
+ */
+export type RecordDecision = "APPROVED" | "REJECTED";
+
+/** Set of statuses that represent an admin decision. */
+export const DECISION_STATUSES = new Set<string>(["APPROVED", "REJECTED"]);
+
+/**
+ * Input to `decideRecord`.
+ *
+ * `expectedStatus` is the record's current status; the helper validates the
+ * transition against REGISTRY_TRANSITIONS before touching the registry.
+ */
+export interface DecideRecordInput {
+  recordType: ResourceType;
+  recordId: string;
+  decision: RecordDecision;
+  reason?: string;
+  decidedBy: string;
+  expectedStatus: string;
+  /** Optional audit-trail discriminator so the decision row distinguishes agent/app/tool. */
+  citadelKind?: CitadelKind;
+}
+
+/**
+ * Output from `decideRecord` — the post-transition registry record plus the
+ * decision audit fields the caller should persist to its own data store.
+ */
+export interface DecideRecordResult {
+  record: RegistryRecord;
+  decidedBy: string;
+  decidedAt: string;
+  statusReason: string;
+  /** Optional audit-trail discriminator persisted on the decision row. */
+  citadelKind?: CitadelKind;
+}
+
+/**
+ * Performs a **status-only** approve or reject on a registry record.
+ *
+ * This helper is the single canonical path for every resolver
+ * (registry-agent-record-resolver, tool-config-resolver,
+ * agent-config-resolver) to approve or reject a record. It:
+ *   1. Validates the transition via REGISTRY_TRANSITIONS.
+ *   2. Requires a non-empty reason when rejecting.
+ *   3. Calls `updateResourceStatus` — never `updateResource` — so the
+ *      registry does not demote the record back to DRAFT (the root cause of
+ *      the approval-status-first defect).
+ *   4. Returns the decision audit fields; callers persist them to their own
+ *      DDB/manifest store.
+ *
+ * The caller is responsible for the admin-role gate (it needs the raw
+ * AppSync event, which this service-layer helper intentionally does not
+ * depend on) and for persisting decision metadata after a successful return.
+ */
+export async function decideRecord(
+  registryService: RegistryService,
+  input: DecideRecordInput,
+): Promise<DecideRecordResult> {
+  // Lifecycle validation
+  const lifecycle = new LifecycleManager(REGISTRY_TRANSITIONS);
+  if (!lifecycle.isValidTransition(input.expectedStatus, input.decision)) {
+    const valid = REGISTRY_TRANSITIONS.transitions[input.expectedStatus] || [];
+    throw new RegistryLifecycleError(
+      `Invalid status transition: ${input.expectedStatus} → ${input.decision}. ` +
+        `Valid transitions from ${input.expectedStatus}: ${valid.join(", ") || "none"}`,
+      "INVALID_TRANSITION",
+    );
+  }
+
+  // Rejection requires a reason
+  if (input.decision === "REJECTED" && !(input.reason ?? "").trim()) {
+    throw new Error(
+      "ValidationError: statusReason is required to reject a record",
+    );
+  }
+
+  const decidedAt = new Date().toISOString();
+  const statusReason = (input.reason ?? "").trim();
+
+  // Status-only transition — no content write, so the registry cannot
+  // demote the record back to DRAFT.
+  const record = await registryService.updateResourceStatus(
+    input.recordType,
+    input.recordId,
+    input.decision as RegistryRecordStatusValue,
+    statusReason || "Status update via registry service",
+    input.expectedStatus,
+  );
+
+  return {
+    record,
+    decidedBy: input.decidedBy,
+    decidedAt,
+    statusReason,
+    ...(input.citadelKind ? { citadelKind: input.citadelKind } : {}),
+  };
+}

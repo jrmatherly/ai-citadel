@@ -1,0 +1,76 @@
+{
+  "name": "3-layer-architecture",
+  "version": "1.0.0",
+  "description": "Scalable 3-layer application architecture",
+  "private": true,
+  "workspaces": [
+    "backend"
+  ],
+  "scripts": {
+    "install:all": "npm install && npm run install:service && npm run install:backend && npm run install:frontend",
+    "install:service": "python3 -m pip install -r service/agent_intake_single/requirements.txt",
+    "install:backend": "cd backend && npm install",
+    "install:frontend": "cd frontend && npm install",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm start",
+    "build:backend": "cd backend && npm run build",
+    "build:frontend": "npm run build --prefix frontend",
+    "test:service": "python3 -m pytest service/ -q",
+    "test:backend": "cd backend && npm test",
+    "test:frontend": "npm test --prefix frontend -- --watchAll=false",
+    "test:integration:backend": "cd backend && npm run test:integration",
+    "test:integration:frontend": "npm run test:integration --prefix frontend",
+    "lint:backend": "cd backend && npm run lint",
+    "lint:fix:backend": "cd backend && npm run lint:fix",
+    "format:backend": "cd backend && npm run format",
+    "verify:doc-claims": "node scripts/verify-doc-claims.js",
+    "prepare": "node -e \"try{require('husky')}catch(e){process.exit(0)}\" && husky || node -e \"process.exit(0)\""
+  },
+  "devDependencies": {
+    "audit-ci": "^7.1.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0"
+  },
+  "lint-staged": {
+    "backend/**/*.{ts,js}": [
+      "eslint --fix --max-warnings 0",
+      "prettier --write"
+    ]
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "esbuild": "^0.28.2"
+  },
+  "overrides": {
+    "dompurify": "^3.4.12",
+    "js-yaml": ">=4.3.2 <5",
+    "browserslist": ">=4.28.8 <5",
+    "fast-uri": ">=3.1.9 <4",
+    "@azure/msal-node": ">=7.1.0 <8",
+    "moment": ">=2.31.0 <3",
+    "ip-address": ">=10.7.4 <11",
+    "shell-quote": "^1.9.0",
+    "brace-expansion": ">=5.0.12 <6",
+    "toml": ">=5.0.1 <6",
+    "fflate": "^0.8.3",
+    "aws-cdk-lib": {
+      "minimatch": {
+        "brace-expansion": ">=5.0.12 <6"
+      }
+    },
+    "jest": {
+      "minimatch": {
+        "brace-expansion": ">=1.1.21 <2"
+      }
+    },
+    "glob": {
+      "minimatch": {
+        "brace-expansion": ">=1.1.21 <2"
+      }
+    },
+    "basic-ftp": ">=6.2.1 <7",
+    "handlebars": ">=4.7.10 <5"
+  }
+}
